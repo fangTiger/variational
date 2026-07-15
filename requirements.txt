@@ -1,0 +1,11 @@
+# Variational 跨所对冲积分 BOT 依赖
+
+# Extended（x10 / Starknet）官方交易 SDK —— 对冲腿
+# 注意：Extended 跑在 Starknet 上，必须用 -starknet 后缀的包，而非 x10-python-trading
+x10-python-trading-starknet>=2.4.0
+
+# Variational 私有 API 客户端（基于捕获会话 Cookie）
+httpx>=0.27.0
+
+# 环境变量加载
+python-dotenv>=1.0.0
