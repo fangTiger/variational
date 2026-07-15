@@ -1,0 +1,22 @@
+# 侦察抓取的前端打包代码（体积大、随前端更新变化，可用 fetch_bundle.py 复现）
+tools/recon/captured/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+# 日志
+log/
+
+# IDE
+.idea/
+.vscode/
+
+# 密钥/会话（绝不入库）
+secrets/
+*.session
+cookies.json
