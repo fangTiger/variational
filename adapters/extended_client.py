@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from decimal import Decimal
 
 from x10.clients.rest.rest_api_client import RestApiClient
@@ -31,31 +30,16 @@ from x10.models.order import OrderSide, OrderType, TimeInForce
 from x10.signing.order_object import create_order_object
 from x10.utils.order import get_price_with_slippage
 
+from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
 
-@dataclass
-class MarketPrice:
-    """某标的的买一/卖一价。"""
-
-    market: str
-    bid: Decimal
-    ask: Decimal
-
-    @property
-    def mid(self) -> Decimal:
-        return (self.bid + self.ask) / 2
+# 统一 Side 与 SDK OrderSide 的映射
+_SIDE_TO_SDK = {Side.BUY: OrderSide.BUY, Side.SELL: OrderSide.SELL}
 
 
-@dataclass
-class Position:
-    """持仓快照（方向已归一化：正=多，负=空）。"""
+class ExtendedClient(ExchangeAdapter):
+    """Extended（x10 / Starknet）对冲腿适配器（异步）。"""
 
-    market: str
-    signed_size: Decimal  # 有符号数量：>0 多头，<0 空头，0 无仓位
-    raw: object = None    # 原始 SDK 模型，便于取更多字段
-
-
-class ExtendedClient:
-    """Extended 对冲腿适配器（异步）。"""
+    name = "extended"
 
     def __init__(self, rest_client: RestApiClient) -> None:
         self._client = rest_client
@@ -129,28 +113,29 @@ class ExtendedClient:
 
     async def market_order(
         self,
-        market_name: str,
-        side: OrderSide,
+        market: str,
+        side: Side,
         amount: Decimal,
         *,
         reduce_only: bool = False,
     ):
         """以 IOC 市价单开/平仓（带滑点保护）。"""
-        market = self._market(market_name)
-        stats = await self._client.info.get_market_statistics(market_name=market_name)
-        best = stats.data.ask_price if side == OrderSide.BUY else stats.data.bid_price
+        sdk_side = _SIDE_TO_SDK[side]
+        market_obj = self._market(market)
+        stats = await self._client.info.get_market_statistics(market_name=market)
+        best = stats.data.ask_price if sdk_side == OrderSide.BUY else stats.data.bid_price
         price = get_price_with_slippage(
-            side=side,
+            side=sdk_side,
             price=best,
-            min_price_change=market.trading_config.min_price_change,
+            min_price_change=market_obj.trading_config.min_price_change,
             slippage=self._client.config.defaults.market_price_slippage,
         )
         order = create_order_object(
             account=self._client.stark_account,
             order_type=OrderType.MARKET,
             starknet_domain=self._client.config.signing.starknet_domain,
-            market=market,
-            side=side,
+            market=market_obj,
+            side=sdk_side,
             amount_of_synthetic=amount,
             price=price,
             time_in_force=TimeInForce.IOC,
@@ -159,33 +144,7 @@ class ExtendedClient:
         )
         return await self._client.orders.place_order(order=order)
 
-    async def hedge(self, market_name: str, target_signed_size: Decimal):
-        """把某标的持仓调整到目标有符号数量（对冲引擎再平衡用）。
-
-        target_signed_size > 0 表示目标净多，< 0 净空。返回调整用的下单结果或 None。
-        """
-        current = await self.get_position(market_name)
-        delta = target_signed_size - current.signed_size
-        if delta == 0:
-            return None
-        side = OrderSide.BUY if delta > 0 else OrderSide.SELL
-        # 缩小方向（reduce_only）与扩大方向区分，避免误开反向仓
-        reduce_only = abs(target_signed_size) < abs(current.signed_size) and (
-            target_signed_size * current.signed_size >= 0
-        )
-        return await self.market_order(
-            market_name, side, abs(delta), reduce_only=reduce_only
-        )
-
-    async def close_position(self, market_name: str):
-        """市价平掉某标的全部仓位。"""
-        pos = await self.get_position(market_name)
-        if pos.signed_size == 0:
-            return None
-        side = OrderSide.SELL if pos.signed_size > 0 else OrderSide.BUY
-        return await self.market_order(
-            market_name, side, abs(pos.signed_size), reduce_only=True
-        )
+    # hedge / close_position 复用基类通用实现
 
     async def close(self) -> None:
         await self._client.close()
