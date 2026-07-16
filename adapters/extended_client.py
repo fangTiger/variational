@@ -101,9 +101,17 @@ class ExtendedClient(ExchangeAdapter):
         return Position(market=market_name, signed_size=signed, raw=pos)
 
     async def get_balance(self):
-        """账户余额（原始模型，字段待实盘确认）。"""
-        resp = await self._client.account.get_balance()
-        return resp.data
+        """账户余额（原始模型）。
+
+        账户未入金时 /user/balance 可能 404，此时回退到 get_account（含账户状态/vault）。
+        入金后应优先返回真正的余额模型。
+        """
+        try:
+            resp = await self._client.account.get_balance()
+            return resp.data
+        except Exception:  # noqa: BLE001 未入金时 balance 端点 404，回退账户信息
+            resp = await self._client.account.get_account()
+            return resp.data
 
     async def set_leverage(self, market_name: str, leverage: Decimal) -> None:
         """设置某标的杠杆。"""

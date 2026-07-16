@@ -21,9 +21,10 @@ Variational Omni 网页端调用同源 `/api/*` 私有接口，**认证靠 SIWE 
 | API 基址 (`m_`) | `/api`（同源，实际 `https://omni.variational.io/api/...`，反代到后端 `omni-client-api.prod.*`） |
 | 默认超时 (`l_`) | 30000 ms |
 | 固定请求头 | `content-type: application/json`、`vr-connected-address: <钱包地址>` |
-| 认证 | httpOnly 会话 Cookie（`/auth/login` 成功后由 Set-Cookie 种下，浏览器/客户端自动带上） |
+| 认证 | 会话 Cookie **`vr-token`**（JWT，有效期 **7 天**）+ `vr-connected-address` Cookie/头 |
 | 会话状态响应头 | `x-omni-auth: r` → 表示需刷新；连续 401 + 该头达阈值触发重新登录 |
-| 防护 | Cloudflare：响应 `cf-mitigated: challenge` 表示被挑战；403 + `cf-ray` + "access restricted" 表示被封 |
+| 防护 | Cloudflare：`cf-mitigated: challenge` 表示被挑战；403 "Just a moment..." 为托管挑战 |
+| **Cloudflare 关键约束（实测）** | `cf_clearance` 通行证**绑定 IP+UA**：从异 IP 复用 Cookie 会被弹挑战 403。→ bot 必须与浏览器**同公网 IP** 运行，Cookie 须含 `cf_clearance` |
 | 请求器 | `Gi(method, path, body, headers)`；`GET=Ki`、`POST=Lt`；底层 `fetch(\`${'/api'}${path}\`, {...})` |
 
 ---

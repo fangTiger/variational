@@ -6,6 +6,22 @@
 
 ---
 
+## 零、最重要的前提：bot 必须和浏览器"同一个公网 IP"运行 ⚠️
+
+实测确认：Variational 用 **Cloudflare** 防护，会话里的 `cf_clearance` 通行证**绑定
+「获取它时的 IP + 浏览器 UA」**。从别的 IP 拿这份 Cookie 去请求，会被直接弹挑战（HTTP 403
+"Just a moment..."）。
+
+**结论**：
+- bot 必须跑在**你登录浏览器的那台机器/那个网络**上（同一公网 IP）；
+- 导出的 Cookie **必须包含 `cf_clearance`**（以及 `vr-token`、`vr-connected-address`）；
+- IP 一变（重启路由/开 VPN/换网络）`cf_clearance` 就失效，要重新导出；
+- 长期 7×24 更稳的方案是用 Playwright 无头浏览器自动过挑战（后续再上）。
+
+`vr-token` 是有效期 **7 天**的 JWT；到期需重新登录导出。
+
+---
+
 ## 一、安全须知（先读）
 
 - **会话 Cookie 等同于你账户的临时登录凭证**，能下单/平仓。像对待私钥一样保管。
