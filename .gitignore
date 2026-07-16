@@ -23,3 +23,4 @@ cookies.json
 
 # 运行数据快照
 data/*.jsonl
+data/*.json

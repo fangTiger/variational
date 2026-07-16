@@ -107,7 +107,28 @@ Variational Omni 网页端调用同源 `/api/*` 私有接口，**认证靠 SIWE 
 
 ---
 
-## 6. 尚待实盘验证的点
+## 5.5 实测确认的字段（2026-07-16，curl_cffi 过 Cloudflare 后）
+
+**架构验证成功**：curl_cffi（Chrome TLS 指纹伪装）+ 捕获的会话 Cookie（同 IP + 同 UA）
+可稳定读取 `/api/*`，无需 Playwright。`x-omni-auth: r` 是正常已认证响应头（非失效信号）。
+
+已确认的真实字段/参数：
+- **BTC 永续标识**：`underlying=BTC` + `instrument_type=perpetual_future`。
+- `GET /funding/v2?underlying=BTC&instrument_type=perpetual_future`
+  → `{predicted_funding_rate, next_funding_time, funding_interval_s}`；BTC 周期 28800s(8h)。
+- `GET /points/summary` → `{total_points, self_points, referral_points, rank}`。
+- `GET /points/next_drop_ts` → `{next_drop_ts}`（每周五 0:00 UTC）。
+- `GET /portfolio/trade_volume` → `{last_30d, all_time, own, referred, total, current_tier{id,name,points_rate}, boosted_tier}`。
+- `GET /referrals/summary` → `{status, trade_volume{current,goal}, referred_by{address,code,points_boost}}`。
+- `GET /points/history` → 每周窗口数组 `{total_points, self_points, referral_points, start_window, end_window}`。
+- `GET /metadata/supported_assets` → 按符号索引的 dict（509 标的），每项数组含
+  `{asset, price, index_price, funding_rate, funding_interval_s, open_interest{long,short}, ...}`。
+- `GET /metadata/config` → `{min_order_notional:0.1, futures_taker_fee:0.0, transfer_fee:0.1,
+  default_margin_params{futures_initial_margin:0.2, futures_maintenance_margin:0.1}, ...}`
+  → **默认最大杠杆 5x（初始保证金 0.2）**，维持保证金 0.1。
+- 仍 404/403：`/points/multiplier_info`（路径/方法待定，非关键）、`/v1/profile/account`（403，可能需额外头）。
+
+## 6. 尚待验证的点（需一个真实持仓 / 一次真实下单）
 
 以下需在**有真实会话 Cookie**时抓一次真实请求/响应确认（阶段二开头做）：
 1. `/auth/login` 的 Set-Cookie 具体名称与属性、有效期。

@@ -164,40 +164,64 @@ class VariationalClient(ExchangeAdapter):
         """全部持仓（原始结构）。"""
         return await self._get("/positions")
 
-    async def get_funding(self) -> Any:
-        """资金费率。"""
-        return await self._get("/funding/v2")
+    async def get_funding(
+        self, underlying: str = "BTC", instrument_type: str = "perpetual_future"
+    ) -> Any:
+        """资金费率。/funding/v2 需要 underlying + instrument_type 两个查询参数。
+
+        返回形如 {predicted_funding_rate, next_funding_time, funding_interval_s}。
+        费率为每 funding_interval_s（BTC=28800s=8h）的百分比；正=多头付空头。
+        """
+        return await self._get(
+            f"/funding/v2?underlying={underlying}&instrument_type={instrument_type}"
+        )
+
+    async def get_funding_rate(
+        self, underlying: str = "BTC", instrument_type: str = "perpetual_future"
+    ) -> Decimal:
+        """便捷方法：直接返回预测资金费率（Decimal）。"""
+        data = await self.get_funding(underlying, instrument_type)
+        return Decimal(str(data["predicted_funding_rate"]))
 
     async def get_open_orders(self) -> Any:
         """当前挂单。"""
         return await self._get("/orders/v2")
 
     async def get_points_summary(self) -> Any:
-        """积分汇总（本项目重点指标）。"""
+        """积分汇总：{total_points, self_points, referral_points, rank}。"""
         return await self._get("/points/summary")
 
-    async def get_points_multiplier(self) -> Any:
-        """积分加成信息。"""
-        return await self._get("/points/multiplier_info")
+    async def get_total_points(self) -> Decimal:
+        """便捷方法：账户累计总积分。"""
+        data = await self.get_points_summary()
+        return Decimal(str(data["total_points"]))
 
     async def get_config(self) -> Any:
-        """平台配置（含标的元数据）。"""
+        """平台配置（费用/保证金/精度）。"""
         return await self._get("/metadata/config")
+
+    async def get_supported_assets(self) -> Any:
+        """全部支持标的（按符号索引的 dict，含 price/index_price/funding 等）。"""
+        return await self._get("/metadata/supported_assets")
 
     # ---- 统一接口实现 ----
 
-    async def get_position(self, market: str) -> Position:
-        """获取某标的持仓并归一化为有符号数量。
+    async def get_position(self, underlying: str = "BTC") -> Position:
+        """获取某标的持仓并归一化为有符号数量（qty 本身带符号：>0 多，<0 空）。
 
-        TODO(实盘确认): 核对 /positions 响应里数量/方向/标的的字段名。
+        market 参数传 underlying（如 "BTC"）。当前账户无持仓时返回 signed_size=0。
+        TODO(有持仓后确认): /positions 填充后核对 instrument/qty 的确切字段与嵌套。
+        前端侦察显示结构含 position_info.instrument 与 qty。
         """
         data = await self.get_positions()
         items = data if isinstance(data, list) else (data or {}).get("positions", [])
         for p in items:
-            if p.get("instrument") == market or p.get("market") == market:
-                qty = Decimal(str(p.get("qty", p.get("size", "0"))))
-                return Position(market=market, signed_size=qty, raw=p)
-        return Position(market=market, signed_size=Decimal(0))
+            info = p.get("position_info", p)
+            instrument = str(info.get("instrument", info.get("underlying", "")))
+            if underlying.upper() in instrument.upper():
+                qty = Decimal(str(info.get("qty", info.get("size", "0"))))
+                return Position(market=underlying, signed_size=qty, raw=p)
+        return Position(market=underlying, signed_size=Decimal(0))
 
     async def get_market_price(self, market: str) -> MarketPrice:
         """获取买一/卖一价。
