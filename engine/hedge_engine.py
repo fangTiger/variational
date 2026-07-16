@@ -28,7 +28,7 @@ class HedgeConfig:
     """
 
     market: str = "BTC-USD"                     # hedge 腿标的名（Extended 口径）
-    primary_market: str = "BTC-PERP"            # primary 腿标的名（Variational 口径）
+    primary_market: str = "BTC"                 # primary 腿 underlying（Variational 口径，非 BTC-PERP）
     poll_interval: float = 15.0                 # 轮询间隔（秒）
 
     # ---- 阶段 A 资金/杠杆 ----
