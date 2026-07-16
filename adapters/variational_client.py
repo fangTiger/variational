@@ -17,12 +17,15 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import httpx
+# curl_cffi 提供 Chrome TLS 指纹伪装，用于绕过 Cloudflare 的 TLS 指纹检测。
+from curl_cffi.requests import AsyncSession
 
 from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
 
 BASE_URL = "https://omni.variational.io/api"
 DEFAULT_TIMEOUT = 30.0
+# TLS 指纹伪装目标（curl_cffi）。"chrome" 取最新 Chrome 指纹；可用 VARIATIONAL_IMPERSONATE 覆盖。
+DEFAULT_IMPERSONATE = "chrome"
 # 默认 UA 对齐常见 Chrome。⚠️ Cloudflare 的 cf_clearance 绑定「获取它时的 UA」，
 # 必须与你导出 Cookie 的那个浏览器 UA 一致，否则会被弹挑战。
 # 如与你的浏览器不同，用 VARIATIONAL_USER_AGENT 环境变量覆盖。
@@ -97,34 +100,46 @@ class VariationalClient(ExchangeAdapter):
 
     name = "variational"
 
-    def __init__(self, session: Session, *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        session: Session,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        impersonate: str | None = None,
+    ) -> None:
         self._session = session
-        self._http = httpx.AsyncClient(
-            base_url=BASE_URL,
+        self._impersonate = (
+            impersonate or os.getenv("VARIATIONAL_IMPERSONATE") or DEFAULT_IMPERSONATE
+        )
+        self._timeout = timeout
+        self._headers = {
+            "user-agent": session.user_agent or USER_AGENT,
+            "content-type": "application/json",
+            "accept": "*/*",
+            "referer": "https://omni.variational.io/portfolio?tab=positions",
+            "vr-connected-address": session.wallet_address,
+        }
+        self._http = AsyncSession(
             timeout=timeout,
             cookies=session.cookies,
-            headers={
-                "user-agent": session.user_agent or USER_AGENT,
-                "content-type": "application/json",
-                "accept": "*/*",
-                "referer": "https://omni.variational.io/portfolio?tab=positions",
-                "vr-connected-address": session.wallet_address,
-            },
+            headers=self._headers,
+            impersonate=self._impersonate,
         )
 
     async def connect(self) -> None:
         """无需握手；调只读接口自检会话是否有效。"""
         await self.get_positions()
 
-    # ---- 底层请求器（对应前端 Gi/Ki/Lt）----
+    # ---- 底层请求器（对应前端 Gi/Ki/Lt，走 curl_cffi Chrome 指纹）----
 
     async def _request(self, method: str, path: str, body: dict | None = None) -> Any:
-        resp = await self._http.request(method, path, json=body)
-        if resp.headers.get("x-omni-auth") == "r" or resp.status_code == 401:
+        resp = await self._http.request(method, BASE_URL + path, json=body)
+        headers = resp.headers
+        if headers.get("x-omni-auth") == "r" or resp.status_code == 401:
             raise VariationalAuthError("会话已失效，请重新捕获 Cookie")
-        if resp.headers.get("cf-mitigated") == "challenge":
+        if headers.get("cf-mitigated") == "challenge" or resp.status_code == 403:
             raise VariationalAuthError("触发 Cloudflare 挑战，需重新过验证")
-        if not resp.is_success:
+        if not (200 <= resp.status_code < 300):
             data = _safe_json(resp)
             msg = (data or {}).get("message") if isinstance(data, dict) else resp.text[:200]
             raise VariationalRequestError(resp.status_code, msg or "", data)
@@ -199,7 +214,7 @@ class VariationalClient(ExchangeAdapter):
         return await self._post("/orders/cancel", {"rfq_id": rfq_id})
 
     async def close(self) -> None:
-        await self._http.aclose()
+        await self._http.close()
 
 
 def _parse_cookie_header(cookie_str: str) -> dict[str, str]:
@@ -213,11 +228,11 @@ def _parse_cookie_header(cookie_str: str) -> dict[str, str]:
     return out
 
 
-def _safe_json(resp: httpx.Response) -> Any:
-    """尽力解析 JSON，失败返回 None。"""
-    if "application/json" in resp.headers.get("content-type", ""):
+def _safe_json(resp: Any) -> Any:
+    """尽力解析 JSON，失败返回 None（兼容 curl_cffi Response）。"""
+    if "application/json" in (resp.headers.get("content-type") or ""):
         try:
             return resp.json()
-        except ValueError:
+        except Exception:  # noqa: BLE001 curl_cffi 解析失败
             return None
     return None

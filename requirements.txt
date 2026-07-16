@@ -4,8 +4,8 @@
 # 注意：Extended 跑在 Starknet 上，必须用 -starknet 后缀的包，而非 x10-python-trading
 x10-python-trading-starknet>=2.4.0
 
-# Variational 私有 API 客户端（基于捕获会话 Cookie）
-httpx>=0.27.0
+# Variational 私有 API 客户端：curl_cffi 提供 Chrome TLS 指纹伪装，绕过 Cloudflare 指纹检测
+curl_cffi>=0.7.0
 
 # 环境变量加载
 python-dotenv>=1.0.0
