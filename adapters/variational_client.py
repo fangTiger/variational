@@ -156,8 +156,13 @@ class VariationalClient(ExchangeAdapter):
             raise VariationalAuthError("被拒 (HTTP 403)，可能是 Cloudflare 拦截")
         if not (200 <= resp.status_code < 300):
             data = _safe_json(resp)
-            msg = (data or {}).get("message") if isinstance(data, dict) else resp.text[:200]
-            raise VariationalRequestError(resp.status_code, msg or "", data)
+            msg = ""
+            if isinstance(data, dict):
+                # Variational 错误体用 error_message 字段（不是 message）
+                msg = data.get("error_message") or data.get("message") or ""
+            if not msg:
+                msg = (resp.text or "")[:300]
+            raise VariationalRequestError(resp.status_code, msg, data)
         return _safe_json(resp)
 
     async def _get(self, path: str) -> Any:
