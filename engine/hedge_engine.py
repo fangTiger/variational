@@ -22,14 +22,35 @@ logger = get_logger("hedge_engine")
 
 @dataclass
 class HedgeConfig:
-    """对冲引擎配置。"""
+    """对冲引擎配置（默认值 = 策略阶段 A）。
+
+    详见 docs/superpowers/specs/2026-07-16-交易策略与分阶段放大.md
+    """
 
     market: str = "BTC-USD"                     # hedge 腿标的名（Extended 口径）
     primary_market: str = "BTC-PERP"            # primary 腿标的名（Variational 口径）
     poll_interval: float = 15.0                 # 轮询间隔（秒）
+
+    # ---- 阶段 A 资金/杠杆 ----
+    capital_per_leg_usd: Decimal = Decimal("300")   # 每腿投入资金
+    leverage: Decimal = Decimal("3")                # 杠杆（实用区间 3-5x，默认甜点 3x）
+    # 方向：优先在"资金费为正"的一侧做空以收取资金费（覆盖磨损/求正 carry）
+    prefer_earn_funding: bool = True
+
     # 再平衡阈值：净 delta 占单腿名义比例，超过才动手（减少交易磨损）
     rebalance_threshold_ratio: Decimal = Decimal("0.02")
     dry_run: bool = True                        # 只算不下单
+
+    @property
+    def target_notional_usd(self) -> Decimal:
+        """每腿目标名义仓位 = 资金 × 杠杆。"""
+        return self.capital_per_leg_usd * self.leverage
+
+    def target_size(self, price: Decimal) -> Decimal:
+        """按当前价把目标名义仓位换算成合约数量。"""
+        if price <= 0:
+            raise ValueError("price 必须为正")
+        return self.target_notional_usd / price
 
 
 @dataclass
