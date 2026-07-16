@@ -135,10 +135,13 @@ class VariationalClient(ExchangeAdapter):
     async def _request(self, method: str, path: str, body: dict | None = None) -> Any:
         resp = await self._http.request(method, BASE_URL + path, json=body)
         headers = resp.headers
-        if headers.get("x-omni-auth") == "r" or resp.status_code == 401:
-            raise VariationalAuthError("会话已失效，请重新捕获 Cookie")
-        if headers.get("cf-mitigated") == "challenge" or resp.status_code == 403:
+        # 注意：x-omni-auth: r 是正常已认证响应上的头（前端用它重置重试计数），不是失效信号。
+        if headers.get("cf-mitigated") == "challenge":
             raise VariationalAuthError("触发 Cloudflare 挑战，需重新过验证")
+        if resp.status_code == 401:
+            raise VariationalAuthError("会话被拒绝 (HTTP 401)，请重新捕获 Cookie")
+        if resp.status_code == 403:
+            raise VariationalAuthError("被拒 (HTTP 403)，可能是 Cloudflare 拦截")
         if not (200 <= resp.status_code < 300):
             data = _safe_json(resp)
             msg = (data or {}).get("message") if isinstance(data, dict) else resp.text[:200]
