@@ -258,9 +258,13 @@ class VariationalClient(ExchangeAdapter):
         }
 
     async def request_quote(self, underlying: str, side: str, qty: Decimal) -> Any:
-        """询价（非执行）。side ∈ {buy, sell}。返回含 quote_id/bid/ask/mark_price。"""
+        """询价。side ∈ {buy, sell}。返回含 quote_id/bid/ask/mark_price/margin_requirements。
+
+        用 /quotes/indicative：它按用户注册可执行报价（含保证金计算），其 quote_id 可用于
+        /quotes/accept 成交。/quotes/simple 是无状态价格预览，quote_id 不可成交。
+        """
         body = {"instrument": self._instrument(underlying), "qty": str(qty), "side": side}
-        return await self._post("/quotes/simple", body)
+        return await self._post("/quotes/indicative", body)
 
     async def accept_quote(
         self, *, quote_id: str, side: str, max_slippage: float, is_reduce_only: bool
