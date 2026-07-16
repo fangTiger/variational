@@ -126,7 +126,21 @@ Variational Omni 网页端调用同源 `/api/*` 私有接口，**认证靠 SIWE 
 - `GET /metadata/config` → `{min_order_notional:0.1, futures_taker_fee:0.0, transfer_fee:0.1,
   default_margin_params{futures_initial_margin:0.2, futures_maintenance_margin:0.1}, ...}`
   → **默认最大杠杆 5x（初始保证金 0.2）**，维持保证金 0.1。
-- 仍 404/403：`/points/multiplier_info`（路径/方法待定，非关键）、`/v1/profile/account`（403，可能需额外头）。
+- 仍 404：`/points/multiplier_info`（路径/方法待定，非关键）。
+
+### ⚠️ 重大限制：交易被地区封锁（2026-07-16 实测）
+
+**下单 `/quotes/accept` 返回应用层 403**：`{"error_message":"the requested action is not
+permitted in a restricted jurisdiction"}`。即**当前 IP 所在地区禁止交易**。表现：
+- ✅ 读取正常：`/positions`、`/quotes/simple`(询价)、`/points/*`、`/funding/v2`、`/portfolio`。
+- ❌ 交易被拒：`/quotes/accept`(成交)、`/v1/profile/account`、`/portfolio/summary` 等受限接口 403。
+- 会话有效（x-omni-auth: r 在），纯 IP 地理封锁，非账户封禁（该账户历史成交 $851k）。
+
+**结论**：bot 的交易腿必须从**未受限地区的 IP** 运行（VPN/代理到允许的地区）。且因
+cf_clearance 绑 IP，**捕获 Cookie 的浏览器与运行 bot 必须同在该 VPN 出口 IP**。
+下单请求体已确认可用：`/quotes/simple {instrument:{underlying,instrument_type:perpetual_future,
+settlement_asset:USDC,funding_interval_s:3600}, qty, side}` → quote_id →
+`/quotes/accept {quote_id, side, max_slippage, is_reduce_only}`。
 
 ## 6. 尚待验证的点（需一个真实持仓 / 一次真实下单）
 

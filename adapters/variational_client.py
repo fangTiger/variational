@@ -36,7 +36,11 @@ USER_AGENT = (
 
 
 class VariationalAuthError(Exception):
-    """会话失效（401 / x-omni-auth 提示刷新 / Cloudflare 挑战），需重新捕获 Cookie。"""
+    """会话失效（401 / Cloudflare 挑战），需重新捕获 Cookie。"""
+
+
+class VariationalJurisdictionError(Exception):
+    """当前 IP 所在地区被禁止执行该操作（下单等）。读取不受影响。"""
 
 
 class VariationalRequestError(Exception):
@@ -111,6 +115,8 @@ class VariationalClient(ExchangeAdapter):
         self._impersonate = (
             impersonate or os.getenv("VARIATIONAL_IMPERSONATE") or DEFAULT_IMPERSONATE
         )
+        # 市价单可接受的最大滑点（accept 按 quote_id 锁价成交，实际滑点≈0，宽松值仅保证成交）
+        self._max_slippage = os.getenv("VARIATIONAL_MAX_SLIPPAGE") or "0.1"
         self._timeout = timeout
         self._headers = {
             "user-agent": session.user_agent or USER_AGENT,
@@ -141,6 +147,12 @@ class VariationalClient(ExchangeAdapter):
         if resp.status_code == 401:
             raise VariationalAuthError("会话被拒绝 (HTTP 401)，请重新捕获 Cookie")
         if resp.status_code == 403:
+            data = _safe_json(resp)
+            emsg = (data or {}).get("error_message", "") if isinstance(data, dict) else ""
+            if "jurisdiction" in emsg.lower() or "restricted" in emsg.lower():
+                raise VariationalJurisdictionError(
+                    f"当前 IP 地区被禁止该操作：{emsg or '(restricted jurisdiction)'}"
+                )
             raise VariationalAuthError("被拒 (HTTP 403)，可能是 Cloudflare 拦截")
         if not (200 <= resp.status_code < 300):
             data = _safe_json(resp)
@@ -230,11 +242,48 @@ class VariationalClient(ExchangeAdapter):
         """
         raise NotImplementedError("待抓包确认报价接口字段后实现")
 
+    @staticmethod
+    def _instrument(underlying: str) -> dict:
+        """构造永续 instrument 描述符（实测确认的固定结构，funding_interval_s 恒为 3600）。"""
+        return {
+            "funding_interval_s": 3600,
+            "instrument_type": "perpetual_future",
+            "settlement_asset": "USDC",
+            "underlying": underlying,
+        }
+
+    async def request_quote(self, underlying: str, side: str, qty: Decimal) -> Any:
+        """询价（非执行）。side ∈ {buy, sell}。返回含 quote_id/bid/ask/mark_price。"""
+        body = {"instrument": self._instrument(underlying), "qty": str(qty), "side": side}
+        return await self._post("/quotes/simple", body)
+
+    async def accept_quote(
+        self, *, quote_id: str, side: str, max_slippage: str, is_reduce_only: bool
+    ) -> Any:
+        """接受报价成交（真正下单）。返回含 rfq_id。"""
+        body = {
+            "quote_id": quote_id,
+            "side": side,
+            "max_slippage": max_slippage,
+            "is_reduce_only": is_reduce_only,
+        }
+        return await self._post("/quotes/accept", body)
+
     async def market_order(
         self, market: str, side: Side, amount: Decimal, *, reduce_only: bool = False
     ):
-        """RFQ 市价成交：询价 → accept。字段待抓包确认，确认前禁止实盘。"""
-        raise NotImplementedError("待抓包确认 /quotes/simple + /quotes/accept 请求体后实现")
+        """RFQ 市价成交：/quotes/simple 询价 → /quotes/accept 成交。
+
+        market 传 underlying（如 "BTC"）。amount 为合约数量（BTC 个数）。
+        """
+        s = "buy" if side is Side.BUY else "sell"
+        quote = await self.request_quote(market, s, amount)
+        return await self.accept_quote(
+            quote_id=quote["quote_id"],
+            side=s,
+            max_slippage=self._max_slippage,
+            is_reduce_only=reduce_only,
+        )
 
     async def cancel_order(self, rfq_id: str) -> Any:
         """撤单。"""
