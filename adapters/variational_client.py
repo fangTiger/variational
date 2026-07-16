@@ -115,8 +115,8 @@ class VariationalClient(ExchangeAdapter):
         self._impersonate = (
             impersonate or os.getenv("VARIATIONAL_IMPERSONATE") or DEFAULT_IMPERSONATE
         )
-        # 市价单可接受的最大滑点（accept 按 quote_id 锁价成交，实际滑点≈0，宽松值仅保证成交）
-        self._max_slippage = os.getenv("VARIATIONAL_MAX_SLIPPAGE") or "0.1"
+        # 市价单最大滑点（f64 数字，分数：0.01=1%）。accept 按 quote_id 锁价成交，实际滑点≈0。
+        self._max_slippage = float(os.getenv("VARIATIONAL_MAX_SLIPPAGE") or "0.01")
         self._timeout = timeout
         self._headers = {
             "user-agent": session.user_agent or USER_AGENT,
@@ -263,13 +263,13 @@ class VariationalClient(ExchangeAdapter):
         return await self._post("/quotes/simple", body)
 
     async def accept_quote(
-        self, *, quote_id: str, side: str, max_slippage: str, is_reduce_only: bool
+        self, *, quote_id: str, side: str, max_slippage: float, is_reduce_only: bool
     ) -> Any:
-        """接受报价成交（真正下单）。返回含 rfq_id。"""
+        """接受报价成交（真正下单）。max_slippage 必须是 JSON 数字(f64)。返回含 rfq_id。"""
         body = {
             "quote_id": quote_id,
             "side": side,
-            "max_slippage": max_slippage,
+            "max_slippage": float(max_slippage),
             "is_reduce_only": is_reduce_only,
         }
         return await self._post("/quotes/accept", body)

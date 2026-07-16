@@ -31,7 +31,7 @@ async def _raw_accept(var: VariationalClient, quote_id: str, side: str, slippage
     body = {
         "quote_id": quote_id,
         "side": side,
-        "max_slippage": slippage,
+        "max_slippage": float(slippage),  # 服务端要求 f64 数字
         "is_reduce_only": reduce_only,
     }
     r = await var._http.request("POST", BASE_URL + "/quotes/accept", json=body)
