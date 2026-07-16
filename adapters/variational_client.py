@@ -23,9 +23,12 @@ from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
 
 BASE_URL = "https://omni.variational.io/api"
 DEFAULT_TIMEOUT = 30.0
+# 默认 UA 对齐常见 Chrome。⚠️ Cloudflare 的 cf_clearance 绑定「获取它时的 UA」，
+# 必须与你导出 Cookie 的那个浏览器 UA 一致，否则会被弹挑战。
+# 如与你的浏览器不同，用 VARIATIONAL_USER_AGENT 环境变量覆盖。
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 )
 
 
@@ -52,27 +55,41 @@ class Session:
 
     cookies: dict[str, str]
     wallet_address: str
+    user_agent: str | None = None  # 须与导出 Cookie 的浏览器 UA 一致
 
     @classmethod
     def from_env(cls) -> "Session":
-        """从环境变量加载：VARIATIONAL_COOKIE（"k=v; k2=v2"）+ VARIATIONAL_WALLET_ADDRESS。"""
+        """从环境变量加载。
+
+        VARIATIONAL_COOKIE（"k=v; k2=v2"，须含 cf_clearance 与 vr-token）
+        VARIATIONAL_WALLET_ADDRESS
+        VARIATIONAL_USER_AGENT（可选，默认对齐 Chrome/149）
+        """
         cookie_str = os.getenv("VARIATIONAL_COOKIE", "")
         addr = os.getenv("VARIATIONAL_WALLET_ADDRESS", "")
         if not cookie_str or not addr:
             raise VariationalAuthError(
                 "缺少 VARIATIONAL_COOKIE / VARIATIONAL_WALLET_ADDRESS 环境变量"
             )
-        return cls(cookies=_parse_cookie_header(cookie_str), wallet_address=addr)
+        return cls(
+            cookies=_parse_cookie_header(cookie_str),
+            wallet_address=addr,
+            user_agent=os.getenv("VARIATIONAL_USER_AGENT") or None,
+        )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Session":
-        """从 JSON 文件加载：{"cookies": {...}, "wallet_address": "0x..."}。"""
+        """从 JSON 文件加载：{"cookies": {...}, "wallet_address": "0x...", "user_agent": "..."}。"""
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         cookies = data["cookies"]
         # 兼容 Cookie-Editor 导出的数组格式
         if isinstance(cookies, list):
             cookies = {c["name"]: c["value"] for c in cookies}
-        return cls(cookies=cookies, wallet_address=data["wallet_address"])
+        return cls(
+            cookies=cookies,
+            wallet_address=data["wallet_address"],
+            user_agent=data.get("user_agent"),
+        )
 
 
 class VariationalClient(ExchangeAdapter):
@@ -87,8 +104,10 @@ class VariationalClient(ExchangeAdapter):
             timeout=timeout,
             cookies=session.cookies,
             headers={
-                "user-agent": USER_AGENT,
+                "user-agent": session.user_agent or USER_AGENT,
                 "content-type": "application/json",
+                "accept": "*/*",
+                "referer": "https://omni.variational.io/portfolio?tab=positions",
                 "vr-connected-address": session.wallet_address,
             },
         )
@@ -113,6 +132,10 @@ class VariationalClient(ExchangeAdapter):
 
     async def _get(self, path: str) -> Any:
         return await self._request("GET", path)
+
+    async def raw(self, path: str) -> Any:
+        """对任意只读端点发 GET，返回原始 JSON（侦察/监控用）。"""
+        return await self._get(path)
 
     async def _post(self, path: str, body: dict | None = None) -> Any:
         return await self._request("POST", path, body)
