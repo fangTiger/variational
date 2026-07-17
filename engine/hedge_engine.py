@@ -101,41 +101,33 @@ class HedgeEngine:
         """执行一轮：读持仓 → 风控 → 必要时再平衡。"""
         state = HedgeState()
 
-        # 1. 读两腿持仓（容错，单腿失败不抛出，交给风控裁决）
-        primary_ok = hedge_ok = True
+        # 1. 读两腿持仓。
+        # 关键安全原则：只有两腿都能读到才动仓。任一腿读取失败就跳过本轮——
+        # 因为此时无法可靠操作那条腿，贸然平另一腿会造成裸仓（比不动更危险）。
+        # primary(Variational) 若是会话失效，抛出交给 run_forever 做 Cookie 自愈。
+        read_error = None
         try:
             state.primary = await self.primary.get_position(self.config.primary_market)
-        except Exception as exc:  # noqa: BLE001 单腿故障需被风控接管
-            primary_ok = False
+        except Exception as exc:  # noqa: BLE001
+            if type(exc).__name__ == "VariationalAuthError":
+                raise  # 交给 run_forever：重读 .env 新 Cookie 后下轮继续
             logger.error("读取 primary 持仓失败：%s", exc)
+            read_error = "primary"
         try:
             state.hedge = await self.hedge.get_position(self.config.market)
         except Exception as exc:  # noqa: BLE001
-            hedge_ok = False
             logger.error("读取 hedge 持仓失败：%s", exc)
+            read_error = "hedge"
 
-        p_size = state.primary.signed_size if state.primary else Decimal(0)
-        h_size = state.hedge.signed_size if state.hedge else Decimal(0)
+        if read_error:
+            state.action_taken = f"跳过本轮（{read_error} 读取失败，不动仓以避免裸仓）"
+            logger.warning(state.action_taken)
+            return state
+
+        p_size = state.primary.signed_size
+        h_size = state.hedge.signed_size
         state.net_delta = p_size + h_size
-
-        # 2. 风控裁决
-        assessment = self.risk.assess(
-            primary_size=p_size,
-            hedge_size=h_size,
-            primary_ok=primary_ok,
-            hedge_ok=hedge_ok,
-        )
-        logger.info(
-            "primary=%s hedge=%s net_delta=%s → 风控:%s(%s)",
-            p_size, h_size, state.net_delta, assessment.action.value, assessment.reason,
-        )
-
-        if assessment.action is RiskAction.FLATTEN:
-            state.action_taken = await self._emergency_flatten()
-            return state
-        if assessment.action is RiskAction.PAUSE:
-            state.action_taken = "暂停再平衡"
-            return state
+        logger.info("primary=%s hedge=%s net_delta=%s", p_size, h_size, state.net_delta)
 
         # 2.5 主保护：任一腿逼近清仓价 → 两腿一起平（delta 中性，一起平净损失仅磨损）
         if p_size != 0 or h_size != 0:

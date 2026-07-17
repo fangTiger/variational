@@ -89,16 +89,35 @@ def test_no_rebalance_within_threshold() -> None:
     assert hedge.orders == []
 
 
-def test_single_leg_failure_triggers_flatten() -> None:
-    """单腿断连 → 风控裁决 FLATTEN。"""
-    primary = FakeAdapter("primary", size=Decimal("1"))
-    hedge = FakeAdapter("hedge", size=Decimal("-1"))
+def test_single_leg_failure_skips_cycle() -> None:
+    """单腿读取失败 → 跳过本轮不动仓（避免误平另一腿造成裸仓）。"""
+    primary = FakeAdapter("primary", size=Decimal("-1"))
+    hedge = FakeAdapter("hedge", size=Decimal("1"))
     hedge.fail = True
-    engine = HedgeEngine(primary, hedge, HedgeConfig(dry_run=True))
+    engine = HedgeEngine(primary, hedge, HedgeConfig(dry_run=False))
 
     state = asyncio.run(engine.run_once())
 
-    assert "紧急平仓" in state.action_taken
+    assert "跳过本轮" in state.action_taken
+    assert primary.orders == [] and hedge.orders == []  # 未动任何仓
+
+
+def test_primary_auth_error_propagates_for_selfheal() -> None:
+    """primary 会话失效应向上抛出，交给 run_forever 做 Cookie 自愈。"""
+
+    class _VarAuthAdapter(FakeAdapter):
+        async def get_position(self, market):
+            raise type("VariationalAuthError", (Exception,), {})("会话失效")
+
+    primary = _VarAuthAdapter("primary")
+    hedge = FakeAdapter("hedge", size=Decimal("1"))
+    engine = HedgeEngine(primary, hedge, HedgeConfig(dry_run=False))
+
+    import pytest
+
+    with pytest.raises(Exception) as ei:
+        asyncio.run(engine.run_once())
+    assert type(ei.value).__name__ == "VariationalAuthError"
 
 
 def test_flatten_both_when_leg_near_liquidation() -> None:
