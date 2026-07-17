@@ -80,6 +80,10 @@ class ExchangeAdapter(ABC):
     async def close(self) -> None:
         """释放连接资源。"""
 
+    async def get_free_margin_ratio(self) -> Decimal | None:
+        """可用保证金 / 权益（0~1）。用于自动降险；无法获取返回 None。"""
+        return None
+
     # ---- 通用逻辑（子类一般无需重写）----
 
     async def hedge(self, market: str, target_signed_size: Decimal):

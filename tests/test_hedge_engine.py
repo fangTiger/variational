@@ -13,9 +13,10 @@ from engine.risk import RiskAction, RiskManager
 class FakeAdapter(ExchangeAdapter):
     """可控的假适配器，记录下单意图。"""
 
-    def __init__(self, name: str, size: Decimal = Decimal(0)) -> None:
+    def __init__(self, name: str, size: Decimal = Decimal(0), free_margin=None) -> None:
         self.name = name
         self._size = size
+        self._free_margin = free_margin  # None=不提供
         self.orders: list[tuple] = []
         self.fail = False
 
@@ -29,6 +30,9 @@ class FakeAdapter(ExchangeAdapter):
         if self.fail:
             raise RuntimeError("模拟断连")
         return Position(market, self._size)
+
+    async def get_free_margin_ratio(self):
+        return self._free_margin
 
     async def market_order(self, market, side: Side, amount, *, reduce_only=False):
         self.orders.append((market, side, amount, reduce_only))
@@ -91,6 +95,32 @@ def test_single_leg_failure_triggers_flatten() -> None:
     state = asyncio.run(engine.run_once())
 
     assert "紧急平仓" in state.action_taken
+
+
+def test_margin_derisk_reduces_both_legs() -> None:
+    """瓶颈腿可用保证金过低 → 两腿各按比例 reduce_only 减仓。"""
+    primary = FakeAdapter("primary", size=Decimal("-1"))            # 空 1
+    hedge = FakeAdapter("hedge", size=Decimal("1"), free_margin=Decimal("0.05"))  # 多 1，保证金告急
+    cfg = HedgeConfig(dry_run=False, min_free_margin_ratio=Decimal("0.10"),
+                      derisk_fraction=Decimal("0.5"))
+    engine = HedgeEngine(primary, hedge, cfg)
+
+    state = asyncio.run(engine.run_once())
+
+    assert "降险" in state.action_taken
+    # 两腿各减 50%：primary 空→买回0.5(reduce_only)，hedge 多→卖0.5(reduce_only)
+    assert primary.orders == [("BTC", Side.BUY, Decimal("0.5"), True)]
+    assert hedge.orders == [("BTC-USD", Side.SELL, Decimal("0.5"), True)]
+
+
+def test_no_derisk_when_margin_healthy() -> None:
+    """保证金充足 → 不降险，正常再平衡逻辑。"""
+    primary = FakeAdapter("primary", size=Decimal("-1"))
+    hedge = FakeAdapter("hedge", size=Decimal("1"), free_margin=Decimal("0.5"))
+    engine = HedgeEngine(primary, hedge, HedgeConfig(dry_run=False))
+    state = asyncio.run(engine.run_once())
+    assert "降险" not in state.action_taken
+    assert primary.orders == [] and hedge.orders == []  # 已中性，无操作
 
 
 def test_risk_manager_flatten_on_disconnect() -> None:

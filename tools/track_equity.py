@@ -20,53 +20,13 @@ ensure_ssl_cert()
 
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
-import json  # noqa: E402
-import time  # noqa: E402
 from decimal import Decimal  # noqa: E402
-from pathlib import Path  # noqa: E402
 
 from adapters.extended_client import ExtendedClient  # noqa: E402
 from adapters.variational_client import Session, VariationalClient  # noqa: E402
-from tracking.monitor import compute_funding_view  # noqa: E402
+from tracking.track_equity_util import load_snapshots, snapshot_and_append  # noqa: E402
 
-UNDERLYING = "BTC"
-EXT_MARKET = "BTC-USD"
-_FILE = Path(__file__).resolve().parent.parent / "data" / "equity_track.jsonl"
 _SECONDS_PER_YEAR = Decimal(365 * 24 * 3600)
-
-
-async def _snapshot(var: VariationalClient, ext: ExtendedClient) -> dict:
-    port = await var.raw("/portfolio")
-    var_bal = Decimal(str(port["balance"]))
-    var_upnl = Decimal(str(port.get("upnl", "0")))
-    var_equity = var_bal + var_upnl
-
-    bal = await ext.get_balance()
-    ext_equity = Decimal(str(getattr(bal, "equity", 0)))
-
-    stats = await ext._client.info.get_market_statistics(market_name=EXT_MARKET)
-    var_rate = await var.get_funding_rate(UNDERLYING)
-    fv = compute_funding_view(var_rate, Decimal(str(stats.data.funding_rate)))
-
-    vp = await var.get_position(UNDERLYING)
-    ep = await ext.get_position(EXT_MARKET)
-    mark = Decimal(str(stats.data.mark_price))
-    notional = abs(vp.signed_size) * mark
-
-    pts = await var.get_points_summary()
-
-    return {
-        "ts": time.time(),
-        "btc": float(mark),
-        "notional": float(notional),
-        "net_delta": float(vp.signed_size + ep.signed_size),
-        "var_equity": float(var_equity),
-        "ext_equity": float(ext_equity),
-        "total_equity": float(var_equity + ext_equity),
-        "points_total": float(pts["total_points"]),
-        "carry_pct_8h": float(fv.carry_short_var_pct_8h),
-        "annualized_pct_est": float(fv.annualized_pct),
-    }
 
 
 def _report(snaps: list[dict]) -> None:
@@ -92,22 +52,21 @@ def _report(snaps: list[dict]) -> None:
     # 实际年化 carry ≈ (总权益变化 / 名义) / 持有年数
     annualized_real = eq_change / notional * (_SECONDS_PER_YEAR / span) * 100
     pts_change = Decimal(str(cur["points_total"])) - Decimal(str(first["points_total"]))
+    caveat = ""
+    if hours < 6:
+        caveat = ("\n  ⚠️ 持有不足 6h：该年化数被两腿估值噪声主导（非资金费），"
+                  "无参考意义。资金费匀速滴入、噪声有界，需持有 >12-24h 才可信。")
     print(
         f"\n自首条快照起：持有 {hours:.1f}h\n"
-        f"  总权益变化 ${eq_change:+.4f} → **实测年化 carry {annualized_real:+.1f}%**\n"
+        f"  总权益变化 ${eq_change:+.4f} → 实测年化 carry {annualized_real:+.1f}%\n"
         f"  积分变化 {pts_change:+.4f}\n"
-        f"  （与估算 {cur['annualized_pct_est']:+.1f}% 对比，校准资金费单位）"
+        f"  （与估算 {cur['annualized_pct_est']:+.1f}% 对比，校准资金费单位）{caveat}"
     )
 
 
 async def _run_once(var: VariationalClient, ext: ExtendedClient) -> None:
-    snap = await _snapshot(var, ext)
-    _FILE.parent.mkdir(exist_ok=True)
-    with _FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(snap, ensure_ascii=False) + "\n")
-
-    snaps = [json.loads(l) for l in _FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
-    _report(snaps)
+    await snapshot_and_append(var, ext)
+    _report(load_snapshots())
 
 
 async def _main(interval: float | None) -> None:

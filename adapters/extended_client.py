@@ -113,6 +113,15 @@ class ExtendedClient(ExchangeAdapter):
             resp = await self._client.account.get_account()
             return resp.data
 
+    async def get_free_margin_ratio(self) -> Decimal | None:
+        """可用交易保证金 / 权益。Extended 是对冲的保证金瓶颈腿。"""
+        bal = await self.get_balance()
+        equity = Decimal(str(getattr(bal, "equity", 0) or 0))
+        avail = Decimal(str(getattr(bal, "available_for_trade", 0) or 0))
+        if equity <= 0:
+            return None
+        return avail / equity
+
     async def set_leverage(self, market_name: str, leverage: Decimal) -> None:
         """设置某标的杠杆。"""
         await self._client.account.update_leverage(market_name=market_name, leverage=leverage)
