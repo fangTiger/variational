@@ -41,10 +41,12 @@ class HedgeConfig:
     rebalance_threshold_ratio: Decimal = Decimal("0.02")
     dry_run: bool = True                        # 只算不下单
 
-    # ---- 自动降险（保证金保护）----
-    # 对冲瓶颈腿(Extended)可用保证金率低于此值时，按比例减小两腿以恢复健康度
-    min_free_margin_ratio: Decimal = Decimal("0.10")
-    derisk_fraction: Decimal = Decimal("0.35")  # 每次降险减掉两腿的比例
+    # ---- 保护（高仓位策略：放宽按比例降险，改为逼近清仓价即两腿一起平）----
+    # 主保护：任一腿标记价距其清仓价 < 此比例 → 两腿一起平（delta 中性，净损失仅磨损）
+    flatten_proximity: Decimal = Decimal("0.08")
+    # 次级：可用保证金率降险，默认 0 = 关闭（放宽）；设 >0 才启用按比例减仓
+    min_free_margin_ratio: Decimal = Decimal("0")
+    derisk_fraction: Decimal = Decimal("0.35")
 
     @property
     def target_notional_usd(self) -> Decimal:
@@ -135,6 +137,13 @@ class HedgeEngine:
             state.action_taken = "暂停再平衡"
             return state
 
+        # 2.5 主保护：任一腿逼近清仓价 → 两腿一起平（delta 中性，一起平净损失仅磨损）
+        if p_size != 0 or h_size != 0:
+            flat = await self._check_liquidation_and_flatten()
+            if flat:
+                state.action_taken = flat
+                return state
+
         # 3. 保证金自动降险（瓶颈腿可用保证金过低 → 按比例减小两腿）
         if p_size != 0 or h_size != 0:
             derisked = await self._check_margin_and_derisk(p_size, h_size)
@@ -162,6 +171,35 @@ class HedgeEngine:
                 await res
         except Exception as exc:  # noqa: BLE001
             logger.warning("快照回调异常：%s", exc)
+
+    async def _check_liquidation_and_flatten(self) -> str | None:
+        """任一腿标记价距其清仓价 < flatten_proximity 时，两腿一起平仓。"""
+        legs = [
+            (self.primary, self.config.primary_market),
+            (self.hedge, self.config.market),
+        ]
+        for adapter, market in legs:
+            try:
+                info = await adapter.get_liquidation_info(market)
+            except Exception as exc:  # noqa: BLE001 清仓信息查询失败不阻断
+                logger.warning("查询 %s 清仓信息失败：%s", adapter.name, exc)
+                continue
+            if not info:
+                continue
+            mark, liq = info
+            if mark <= 0:
+                continue
+            proximity = abs(mark - liq) / mark
+            if proximity < self.config.flatten_proximity:
+                msg = (f"⚠️ {adapter.name} 逼近清仓价（标记 {mark:.0f} / 清仓 {liq:.0f}，"
+                       f"距 {proximity:.1%} < {self.config.flatten_proximity:.0%}）→ 两腿一起平仓")
+                if self.config.dry_run:
+                    logger.warning("[dry_run] %s", msg)
+                    return f"[dry_run] {msg}"
+                logger.warning(msg)
+                await self._emergency_flatten()
+                return msg
+        return None
 
     async def _check_margin_and_derisk(self, p_size: Decimal, h_size: Decimal) -> str | None:
         """瓶颈腿(hedge/Extended)可用保证金率过低时，按比例减小两腿。返回动作说明或 None。"""

@@ -113,6 +113,19 @@ class ExtendedClient(ExchangeAdapter):
             resp = await self._client.account.get_account()
             return resp.data
 
+    async def get_liquidation_info(self, market: str) -> tuple[Decimal, Decimal] | None:
+        """从持仓读取 (mark_price, liquidation_price)。Extended SDK 直接提供。"""
+        resp = await self._client.account.get_positions(market_names=[market])
+        items = resp.data or []
+        if not items:
+            return None
+        p = items[0]
+        liq = Decimal(str(getattr(p, "liquidation_price", 0) or 0))
+        mark = Decimal(str(getattr(p, "mark_price", 0) or 0))
+        if liq <= 0 or mark <= 0:
+            return None
+        return mark, liq
+
     async def get_free_margin_ratio(self) -> Decimal | None:
         """可用交易保证金 / 权益。Extended 是对冲的保证金瓶颈腿。"""
         bal = await self.get_balance()

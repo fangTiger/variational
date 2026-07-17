@@ -241,11 +241,44 @@ class VariationalClient(ExchangeAdapter):
         return Position(market=underlying, signed_size=Decimal(0))
 
     async def get_market_price(self, market: str) -> MarketPrice:
-        """获取买一/卖一价。
+        """获取买一/卖一价（用一次极小询价拿 bid/ask）。"""
+        q = await self.request_quote(market, "buy", Decimal("0.0001"))
+        return MarketPrice(market, Decimal(str(q["bid"])), Decimal(str(q["ask"])))
 
-        TODO(实盘确认): /quotes/indicative 或公开 metadata/stats 的报价字段。
+    async def get_liquidation_info(
+        self, market: str, maint: Decimal = Decimal("0.1")
+    ) -> tuple[Decimal, Decimal] | None:
+        """计算 (mark, liquidation_price)。Variational 不直接给清仓价，用维持保证金(10%)推算。
+
+        清仓条件：equity + s·(P−M) = maint·|s|·P  → P = (s·M − E) / (s − maint·|s|)
+        （s 为有符号数量，空头 s<0；E=balance+upnl；M=标记价）
         """
-        raise NotImplementedError("待抓包确认报价接口字段后实现")
+        data = await self.get_positions()
+        items = data if isinstance(data, list) else []
+        pos = None
+        for p in items:
+            info = p.get("position_info", p)
+            underlying = str(info.get("instrument", {}).get("underlying", "") if isinstance(info.get("instrument"), dict) else "")
+            if market.upper() in underlying.upper():
+                pos = p
+                break
+        if not pos:
+            return None
+        info = pos["position_info"]
+        s = Decimal(str(info["qty"]))
+        if s == 0:
+            return None
+        price_info = pos.get("price_info", {})
+        mark = Decimal(str(price_info.get("underlying_price") or info.get("avg_entry_price")))
+        port = await self.raw("/portfolio")
+        equity = Decimal(str(port["balance"])) + Decimal(str(port.get("upnl", "0")))
+        denom = s - maint * abs(s)
+        if denom == 0:
+            return None
+        liq = (s * mark - equity) / denom
+        if liq <= 0:
+            return None
+        return mark, liq
 
     @staticmethod
     def _instrument(underlying: str) -> dict:

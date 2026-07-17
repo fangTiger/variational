@@ -84,6 +84,13 @@ class ExchangeAdapter(ABC):
         """可用保证金 / 权益（0~1）。用于自动降险；无法获取返回 None。"""
         return None
 
+    async def get_liquidation_info(self, market: str) -> tuple[Decimal, Decimal] | None:
+        """返回 (mark_price, liquidation_price)。无持仓/无法获取返回 None。
+
+        用于"逼近清仓价即两腿一起平"的保护。
+        """
+        return None
+
     # ---- 通用逻辑（子类一般无需重写）----
 
     async def hedge(self, market: str, target_signed_size: Decimal):

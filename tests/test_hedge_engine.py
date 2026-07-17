@@ -13,12 +13,16 @@ from engine.risk import RiskAction, RiskManager
 class FakeAdapter(ExchangeAdapter):
     """可控的假适配器，记录下单意图。"""
 
-    def __init__(self, name: str, size: Decimal = Decimal(0), free_margin=None) -> None:
+    def __init__(self, name: str, size: Decimal = Decimal(0), free_margin=None, liq_info=None) -> None:
         self.name = name
         self._size = size
         self._free_margin = free_margin  # None=不提供
+        self._liq_info = liq_info        # (mark, liq) 或 None
         self.orders: list[tuple] = []
         self.fail = False
+
+    async def get_liquidation_info(self, market):
+        return self._liq_info
 
     async def connect(self) -> None:
         pass
@@ -95,6 +99,30 @@ def test_single_leg_failure_triggers_flatten() -> None:
     state = asyncio.run(engine.run_once())
 
     assert "紧急平仓" in state.action_taken
+
+
+def test_flatten_both_when_leg_near_liquidation() -> None:
+    """任一腿逼近清仓价 → 两腿一起平仓（主保护）。"""
+    # hedge 腿标记 100、清仓 94 → 距 6% < 8% 阈值
+    primary = FakeAdapter("primary", size=Decimal("-1"))
+    hedge = FakeAdapter("hedge", size=Decimal("1"), liq_info=(Decimal("100"), Decimal("94")))
+    engine = HedgeEngine(primary, hedge, HedgeConfig(dry_run=False))
+
+    state = asyncio.run(engine.run_once())
+
+    assert "逼近清仓价" in state.action_taken
+    # 两腿都被平：primary 空→买回1，hedge 多→卖1
+    assert any(o[3] for o in primary.orders)  # reduce_only 平仓
+    assert any(o[3] for o in hedge.orders)
+
+
+def test_no_flatten_when_liquidation_far() -> None:
+    """距清仓价很远（>8%）→ 不触发平仓。"""
+    primary = FakeAdapter("primary", size=Decimal("-1"), liq_info=(Decimal("100"), Decimal("150")))
+    hedge = FakeAdapter("hedge", size=Decimal("1"), liq_info=(Decimal("100"), Decimal("50")))
+    engine = HedgeEngine(primary, hedge, HedgeConfig(dry_run=False))
+    state = asyncio.run(engine.run_once())
+    assert "逼近清仓价" not in state.action_taken
 
 
 def test_margin_derisk_reduces_both_legs() -> None:

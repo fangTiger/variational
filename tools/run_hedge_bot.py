@@ -40,7 +40,7 @@ def _reload_primary() -> VariationalClient:
     return VariationalClient(Session.from_env())
 
 
-async def _main(live: bool, interval: float) -> None:
+async def _main(live: bool, interval: float, flatten_proximity: float, min_free_margin: float) -> None:
     try:
         from dotenv import load_dotenv
 
@@ -51,7 +51,14 @@ async def _main(live: bool, interval: float) -> None:
     var = VariationalClient(Session.from_env())
     ext = ExtendedClient.from_env()
 
-    config = HedgeConfig(dry_run=not live, poll_interval=interval)
+    from decimal import Decimal
+
+    config = HedgeConfig(
+        dry_run=not live,
+        poll_interval=interval,
+        flatten_proximity=Decimal(str(flatten_proximity)),
+        min_free_margin_ratio=Decimal(str(min_free_margin)),
+    )
     engine = HedgeEngine(var, ext, config)
 
     # 每轮记录权益快照（用引擎当前的 primary/hedge，兼容 Cookie 自愈换过的对象）
@@ -76,9 +83,13 @@ async def _main(live: bool, interval: float) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="自动对冲守护进程")
     p.add_argument("--live", action="store_true", help="真实交易（默认 dry_run）")
-    p.add_argument("--interval", type=float, default=60, help="轮询间隔秒（默认60）")
+    p.add_argument("--interval", type=float, default=20, help="轮询间隔秒（默认20，高仓位建议更快）")
+    p.add_argument("--flatten-proximity", type=float, default=0.08,
+                   help="任一腿距清仓价小于此比例即两腿一起平（默认0.08=8%）")
+    p.add_argument("--min-free-margin", type=float, default=0.0,
+                   help="Extended可用保证金率低于此值按比例减仓，0=关闭（默认0）")
     args = p.parse_args()
-    asyncio.run(_main(args.live, args.interval))
+    asyncio.run(_main(args.live, args.interval, args.flatten_proximity, args.min_free_margin))
 
 
 if __name__ == "__main__":
