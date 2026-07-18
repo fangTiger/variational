@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import os
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from x10.clients.rest.rest_api_client import RestApiClient
 from x10.config import get_config_by_name
@@ -84,6 +84,14 @@ class ExtendedClient(ExchangeAdapter):
         if market_name not in self._markets:
             raise KeyError(f"Extended 不支持标的 {market_name}")
         return self._markets[market_name]
+
+    def _round_qty(self, market: str, amount: Decimal) -> Decimal:
+        """按标的数量步长取整（向下），并保证不低于最小下单量。"""
+        tc = self._market(market).trading_config
+        step = Decimal(str(tc.min_order_size_change))
+        min_size = Decimal(str(tc.min_order_size))
+        q = (Decimal(str(amount)) / step).to_integral_value(rounding=ROUND_DOWN) * step
+        return q if q >= min_size else min_size
 
     # ---- 只读 ----
 
@@ -164,6 +172,7 @@ class ExtendedClient(ExchangeAdapter):
     ):
         """以 IOC 市价单开/平仓（带滑点保护）。"""
         sdk_side = _SIDE_TO_SDK[side]
+        amount = self._round_qty(market, amount)
         market_obj = self._market(market)
         stats = await self._client.info.get_market_statistics(market_name=market)
         best = stats.data.ask_price if sdk_side == OrderSide.BUY else stats.data.bid_price
@@ -194,6 +203,7 @@ class ExtendedClient(ExchangeAdapter):
     async def place_limit_order(self, market: str, side: Side, amount: Decimal, price: Decimal,
                                 *, post_only: bool = True):
         """挂限价单（默认 post_only=maker）。返回下单结果（含订单 id）。"""
+        amount = self._round_qty(market, amount)
         market_obj = self._market(market)
         order = create_order_object(
             account=self._client.stark_account,
