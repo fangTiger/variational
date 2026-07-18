@@ -20,11 +20,11 @@
 
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 
 from x10.clients.rest.rest_api_client import RestApiClient
 from x10.config import get_config_by_name
-from x10.core.env_config import EnvConfig
 from x10.core.stark_account import StarkPerpetualAccount
 from x10.models.order import OrderSide, OrderType, TimeInForce
 from x10.signing.order_object import create_order_object
@@ -48,17 +48,30 @@ class ExtendedClient(ExchangeAdapter):
     # ---- 构造 ----
 
     @classmethod
-    def from_env(cls) -> "ExtendedClient":
-        """从环境变量（X10_*）构造客户端。"""
-        env = EnvConfig.parse()
-        env.validate_private_api_credentials()
+    def from_env(cls, prefix: str = "X10") -> "ExtendedClient":
+        """从环境变量构造客户端，支持多账户前缀。
+
+        prefix="X10"      → farm 对冲账户（X10_API_KEY 等）
+        prefix="X10_GRID" → 网格账户（X10_GRID_API_KEY 等），与 farm 完全独立
+        读取 {prefix}_CLIENT_CONFIG_NAME/API_KEY/PUBLIC_KEY/PRIVATE_KEY/VAULT_ID。
+        """
+        def g(key: str) -> str | None:
+            return os.getenv(f"{prefix}_{key}")
+
+        cfg_name = (g("CLIENT_CONFIG_NAME") or "TESTNET").upper()
+        api_key, public, private, vault = g("API_KEY"), g("PUBLIC_KEY"), g("PRIVATE_KEY"), g("VAULT_ID")
+        missing = [f"{prefix}_{k}" for k, v in
+                   [("API_KEY", api_key), ("PUBLIC_KEY", public), ("PRIVATE_KEY", private), ("VAULT_ID", vault)]
+                   if not v]
+        if missing:
+            raise RuntimeError(f"缺少环境变量：{missing}")
         stark_account = StarkPerpetualAccount(
-            api_key=env.api_key,
-            public_key=env.public_key,
-            private_key=env.private_key,
-            vault=env.vault_id,
+            api_key=api_key,
+            public_key=public.lower(),
+            private_key=private.lower(),
+            vault=int(vault),
         )
-        rest = RestApiClient(get_config_by_name(env.client_config_name), stark_account)
+        rest = RestApiClient(get_config_by_name(cfg_name), stark_account)
         return cls(rest)
 
     async def connect(self) -> None:

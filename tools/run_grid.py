@@ -46,7 +46,8 @@ async def _main(args) -> None:
     except ImportError:
         pass
 
-    ext = ExtendedClient.from_env()
+    ext = ExtendedClient.from_env(prefix=args.account)
+    print(f"网格账户前缀：{args.account}")
     config = GridConfig(
         dry_run=not args.live,
         spacing_pct=args.spacing,
@@ -72,6 +73,8 @@ def main() -> None:
     p.add_argument("--unit", type=float, default=50.0, help="每格名义USD")
     p.add_argument("--max-inv", type=float, default=400.0, help="最大库存名义USD")
     p.add_argument("--adx-off", type=float, default=30.0, help="ADX急停阈值")
+    p.add_argument("--account", default="X10_GRID",
+                   help="账户环境变量前缀（默认X10_GRID网格账户；用X10则跑farm账户）")
     args = p.parse_args()
     asyncio.run(_main(args))
 
