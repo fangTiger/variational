@@ -1,10 +1,11 @@
-"""实盘网格引擎（Extended，BTC）。
+"""实盘限价单网格引擎（Extended，BTC）。
 
-复用回测验证过的逻辑：几何格子、逐格成交、regime 急停、库存上限。
-执行用市价单（回测显示费率影响很小），dry_run 默认只算不下单。
+真正的网格：在盘口挂一排限价单——当前价下方挂买单、上方挂卖单（几何等距）。
+成交即翻单：买单成交→在上一格挂卖单止盈；卖单成交→在下一格挂买单。maker 费。
+regime 急停：强趋势/突破 → 撤所有单 + 市价平库存。库存上限封趋势亏损。
 
-安全：live 启动时若账户已有该标的持仓（非本引擎所开，可能是 farm 的对冲腿），
-拒绝启动——防止与 farm 撞车。
+安全：专用账户；重启自动接管账户已有持仓与挂单（对账后续挂）。
+dry_run 只打印意图不真正挂单。
 """
 
 from __future__ import annotations
@@ -23,14 +24,15 @@ logger = get_logger("grid_engine")
 @dataclass
 class GridConfig:
     market: str = "BTC-USD"
-    spacing_pct: float = 0.02            # 格距（回测最优区间 1.5-2.5%）
+    spacing_pct: float = 0.02            # 格距
     unit_usd: float = 50.0               # 每格名义
-    max_inventory_usd: float = 400.0     # 最大库存名义（封趋势亏损）
+    max_inventory_usd: float = 150.0     # 最大库存名义
+    levels_per_side: int = 4             # 上下各挂几格
     adx_period: int = 14
-    adx_off: float = 30.0                # ADX 超此值急停
-    donchian_period: int = 48            # 通道突破周期（小时）
-    candle_lookback: int = 200           # 每轮取多少根小时K线算指标
-    poll_interval: float = 60.0
+    adx_off: float = 30.0
+    donchian_period: int = 48
+    candle_lookback: int = 200
+    poll_interval: float = 30.0
     dry_run: bool = True
 
 
@@ -38,106 +40,190 @@ class GridEngine:
     def __init__(self, ext, config: GridConfig | None = None, fng_provider=None) -> None:
         self.ext = ext
         self.config = config or GridConfig()
-        self._fng_provider = fng_provider  # 可选：返回当前恐惧贪婪值的可调用
-        self._last_level: int | None = None
+        self._fng_provider = fng_provider
+        self._orders: dict[int, dict] = {}   # level -> {"id":..., "side": Side}
         self._running = False
 
     @property
     def _log_step(self) -> float:
         return math.log(1 + self.config.spacing_pct)
 
+    def _level_price(self, level: int) -> Decimal:
+        return Decimal(str(math.exp(level * self._log_step)))
+
+    def _price_level(self, price: float) -> int:
+        return round(math.log(price) / self._log_step)
+
     async def connect(self) -> None:
         await self.ext.connect()
-        # 专用账户模型：账户里的持仓即网格自己的库存，重启后自动接管。
-        # 仅当持仓名义远超库存上限(可能是 farm 腿/外部仓)时才拒绝，防误用共享账户。
         pos = await self.ext.get_position(self.config.market)
         if not self.config.dry_run and pos.signed_size != 0:
             stats = await self.ext._client.info.get_market_statistics(market_name=self.config.market)
             notional = abs(float(pos.signed_size)) * float(stats.data.mark_price)
             if notional > 2 * self.config.max_inventory_usd:
                 raise RuntimeError(
-                    f"账户已有 {self.config.market} 持仓 {pos.signed_size}（≈${notional:.0f}，"
-                    f"远超库存上限${self.config.max_inventory_usd}）。疑似 farm 腿/外部仓，请先平掉。"
-                )
-            logger.warning("接管账户已有持仓 %s 作为网格库存（重启接管）", pos.signed_size)
-        logger.info("网格引擎连接完成（dry_run=%s，起始持仓=%s）", self.config.dry_run, pos.signed_size)
+                    f"账户已有持仓 {pos.signed_size}(≈${notional:.0f})远超库存上限，疑似外部仓，请先平掉。")
+            logger.warning("接管账户已有持仓 %s 作为网格库存", pos.signed_size)
+        # 接管账户上已存在的本网格挂单（重启对账）
+        await self._adopt_open_orders()
+        logger.info("网格引擎连接完成（dry_run=%s，持仓=%s，接管挂单=%d）",
+                    self.config.dry_run, pos.signed_size, len(self._orders))
 
-    async def _indicators(self):
-        """取近端K线，算 ADX 与 Donchian 通道，返回最新值 + 现价。"""
+    async def _adopt_open_orders(self) -> None:
+        """把交易所上已有的挂单按格价归入本引擎状态（重启接管）。"""
+        try:
+            orders = await self.ext.get_open_orders(self.config.market)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询挂单失败：%s", exc)
+            return
+        for o in orders:
+            price = float(getattr(o, "price", 0) or 0)
+            if price <= 0:
+                continue
+            lv = self._price_level(price)
+            side = Side.BUY if "BUY" in str(getattr(o, "side", "")).upper() else Side.SELL
+            self._orders[lv] = {"id": getattr(o, "id", None), "side": side}
+
+    async def _inv(self) -> tuple[Decimal, float]:
+        pos = await self.ext.get_position(self.config.market)
+        stats = await self.ext._client.info.get_market_statistics(market_name=self.config.market)
+        price = float(stats.data.mark_price)
+        return pos.signed_size, price
+
+    async def run_once(self) -> str:
+        # 指标 + regime
         r = await self.ext._client.info.get_candles_history(
             market_name=self.config.market, candle_type="trades",
-            interval="PT1H", limit=self.config.candle_lookback,
-        )
+            interval="PT1H", limit=self.config.candle_lookback)
         candles = sorted(r.data, key=lambda k: int(k.timestamp))
-        highs = [float(k.high) for k in candles]
-        lows = [float(k.low) for k in candles]
+        highs = [float(k.high) for k in candles]; lows = [float(k.low) for k in candles]
         closes = [float(k.close) for k in candles]
         a = adx(highs, lows, closes, self.config.adx_period)
         up, lo = donchian_prev(highs, lows, self.config.donchian_period)
-        return closes[-1], a[-1], up[-1], lo[-1]
-
-    async def run_once(self) -> str:
-        price, adx_val, dc_up, dc_lo = await self._indicators()
+        price = closes[-1]
         fng = self._fng_provider() if self._fng_provider else None
-        mode = decide_mode(
-            adx_val=adx_val, close=price, donchian_up=dc_up, donchian_lo=dc_lo,
-            fng=fng, adx_off=self.config.adx_off,
-        )
+        mode = decide_mode(adx_val=a[-1], close=price, donchian_up=up[-1], donchian_lo=lo[-1],
+                           fng=fng, adx_off=self.config.adx_off)
 
-        pos = await self.ext.get_position(self.config.market)
-        inv = pos.signed_size          # BTC，本引擎的净库存
-        inv_usd = abs(float(inv) * price)
-        level = round(math.log(price) / self._log_step)
-        if self._last_level is None:
-            self._last_level = level
-
-        logger.info("price=%.0f ADX=%s mode=%s inv=%s(≈$%.0f) level=%d",
-                    price, f"{adx_val:.1f}" if adx_val else None, mode.value, inv, inv_usd, level)
+        inv, mark = await self._inv()
+        inv_usd = float(inv) * mark
+        logger.info("price=%.0f ADX=%s mode=%s inv=%s(≈$%.0f) 挂单=%d",
+                    price, f"{a[-1]:.1f}" if a[-1] else None, mode.value, inv, inv_usd, len(self._orders))
 
         if mode is GridMode.OFF:
-            self._last_level = level
-            if inv != 0:
-                side = Side.SELL if inv > 0 else Side.BUY
-                return await self._trade(side, abs(inv), reduce_only=True, why="急停平库存")
-            return "OFF（无库存）"
+            return await self._go_off(inv)
 
-        # NEUTRAL：逐格成交
-        actions = []
-        if level < self._last_level:            # 跌 → 买
-            for lv in range(self._last_level - 1, level - 1, -1):
-                if inv_usd >= self.config.max_inventory_usd and inv > 0:
-                    actions.append("库存已达上限，停止买入")
-                    break
-                lp = math.exp(lv * self._log_step)
-                q = Decimal(str(self.config.unit_usd / lp))
-                actions.append(await self._trade(Side.BUY, q, why=f"跌破{lv}格买"))
-        elif level > self._last_level:          # 涨 → 卖
-            for lv in range(self._last_level + 1, level + 1):
-                if inv_usd >= self.config.max_inventory_usd and inv < 0:
-                    actions.append("库存已达下限，停止卖出")
-                    break
-                lp = math.exp(lv * self._log_step)
-                q = Decimal(str(self.config.unit_usd / lp))
-                actions.append(await self._trade(Side.SELL, q, why=f"涨过{lv}格卖"))
-        self._last_level = level
-        return "；".join(actions) if actions else "无格子触发"
+        # 1) 处理成交：已挂但盘口消失的单=成交，翻到反向一格
+        await self._handle_fills(inv_usd)
+        # 2) 维护阶梯：当前价上下各挂 N 格
+        return await self._maintain_ladder(price, inv_usd)
 
-    async def _trade(self, side: Side, qty: Decimal, *, reduce_only: bool = False, why: str = "") -> str:
-        msg = f"{why}：{side.value} {qty:.6f} BTC"
+    async def _open_ids(self) -> set:
+        orders = await self.ext.get_open_orders(self.config.market)
+        return {getattr(o, "id", None) for o in orders}
+
+    async def _handle_fills(self, inv_usd: float) -> None:
+        """跟踪单从盘口消失=成交：买成交→上一格挂卖；卖成交→下一格挂买。"""
+        if self.config.dry_run:
+            return
+        open_ids = await self._open_ids()
+        for lv in list(self._orders.keys()):
+            rec = self._orders[lv]
+            if rec["id"] in open_ids:
+                continue
+            # 成交
+            self._orders.pop(lv, None)
+            if rec["side"] is Side.BUY:      # 买成交 → 上一格挂卖止盈
+                await self._place(lv + 1, Side.SELL, inv_usd, why=f"{lv}买成交→挂卖")
+            else:                             # 卖成交 → 下一格挂买
+                await self._place(lv - 1, Side.BUY, inv_usd, why=f"{lv}卖成交→挂买")
+
+    async def _maintain_ladder(self, price: float, inv_usd: float) -> str:
+        center = self._price_level(price)
+        n = self.config.levels_per_side
+        acted = []
+        # 下方挂买（_place 内部按库存上限守卫）
+        for lv in range(center - 1, center - n - 1, -1):
+            if lv not in self._orders:
+                m = await self._place(lv, Side.BUY, inv_usd, why="补买格")
+                if m:
+                    acted.append(m)
+        # 上方挂卖
+        for lv in range(center + 1, center + n + 1):
+            if lv not in self._orders:
+                m = await self._place(lv, Side.SELL, inv_usd, why="补卖格")
+                if m:
+                    acted.append(m)
+        # 撤掉远离区间的陈单
+        for lv in list(self._orders.keys()):
+            if lv < center - n - 2 or lv > center + n + 2:
+                await self._cancel(lv, why="撤陈单")
+        return "；".join(acted) if acted else "阶梯已就位"
+
+    def _within_cap(self, side: Side, inv_usd: float) -> bool:
+        """严格库存上限：现有挂单全部成交后，长/短库存名义仍不超上限。"""
+        unit = self.config.unit_usd
+        maxinv = self.config.max_inventory_usd
+        n_buy = sum(1 for r in self._orders.values() if r["side"] is Side.BUY)
+        n_sell = sum(1 for r in self._orders.values() if r["side"] is Side.SELL)
+        if side is Side.BUY:
+            return inv_usd + (n_buy + 1) * unit <= maxinv
+        return -inv_usd + (n_sell + 1) * unit <= maxinv
+
+    async def _place(self, level: int, side: Side, inv_usd: float, why: str = "") -> str | None:
+        if not self._within_cap(side, inv_usd):
+            return None  # 超库存上限，不挂
+        lp = self._level_price(level)
+        qty = Decimal(str(self.config.unit_usd)) / lp
+        msg = f"{why}：{side.value} {qty:.6f}@{lp:.0f}(格{level})"
         if self.config.dry_run:
             logger.info("[dry_run] %s", msg)
-            return f"[dry_run] {msg}"
-        r = await self.ext.market_order(self.config.market, side, qty, reduce_only=reduce_only)
-        logger.info("%s → %s", msg, str(r)[:120])
-        return msg
+            self._orders[level] = {"id": f"dry-{level}", "side": side}
+            return msg
+        try:
+            res = await self.ext.place_limit_order(self.config.market, side, qty, lp)
+            oid = getattr(getattr(res, "data", None), "id", None) or getattr(res, "id", None)
+            self._orders[level] = {"id": oid, "side": side}
+            logger.info("%s → id=%s", msg, oid)
+            return msg
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("挂单失败 %s：%s", msg, exc)
+            return None
+
+    async def _cancel(self, level: int, why: str = "") -> None:
+        rec = self._orders.pop(level, None)
+        if not rec:
+            return
+        if self.config.dry_run:
+            logger.info("[dry_run] %s：撤 格%d", why, level)
+            return
+        try:
+            await self.ext.cancel_order(rec["id"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("撤单失败 格%d：%s", level, exc)
+
+    async def _go_off(self, inv: Decimal) -> str:
+        # 撤所有挂单
+        for lv in list(self._orders.keys()):
+            await self._cancel(lv, why="急停撤单")
+        # 平库存
+        if inv != 0:
+            side = Side.SELL if inv > 0 else Side.BUY
+            if self.config.dry_run:
+                logger.warning("[dry_run] 急停平库存 %s %s", side.value, abs(inv))
+            else:
+                await self.ext.market_order(self.config.market, side, abs(inv), reduce_only=True)
+                logger.warning("急停已平库存 %s %s", side.value, abs(inv))
+        return "OFF：已撤单+平库存"
 
     async def run_forever(self) -> None:
         import asyncio
 
         self._running = True
         await self.connect()
-        logger.info("网格引擎启动（dry_run=%s，格距%.1f%%，库存上限$%.0f）",
-                    self.config.dry_run, self.config.spacing_pct * 100, self.config.max_inventory_usd)
+        logger.info("网格引擎启动（dry_run=%s，格距%.1f%%，每边%d格，库存上限$%.0f）",
+                    self.config.dry_run, self.config.spacing_pct * 100,
+                    self.config.levels_per_side, self.config.max_inventory_usd)
         while self._running:
             try:
                 await self.run_once()

@@ -189,5 +189,32 @@ class ExtendedClient(ExchangeAdapter):
 
     # hedge / close_position 复用基类通用实现
 
+    # ---- 限价单（网格用）----
+
+    async def place_limit_order(self, market: str, side: Side, amount: Decimal, price: Decimal,
+                                *, post_only: bool = True):
+        """挂限价单（默认 post_only=maker）。返回下单结果（含订单 id）。"""
+        market_obj = self._market(market)
+        order = create_order_object(
+            account=self._client.stark_account,
+            order_type=OrderType.LIMIT,
+            starknet_domain=self._client.config.signing.starknet_domain,
+            market=market_obj,
+            side=_SIDE_TO_SDK[side],
+            amount_of_synthetic=amount,
+            price=market_obj.trading_config.round_price(price),
+            time_in_force=TimeInForce.GTT,
+            reduce_only=False,
+            post_only=post_only,
+        )
+        return await self._client.orders.place_order(order=order)
+
+    async def cancel_order(self, order_id) -> None:
+        await self._client.orders.cancel_order(order_id=order_id)
+
+    async def get_open_orders(self, market: str) -> list:
+        r = await self._client.account.get_open_orders(market_names=[market])
+        return r.data or []
+
     async def close(self) -> None:
         await self._client.close()
