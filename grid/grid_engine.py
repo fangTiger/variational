@@ -48,13 +48,18 @@ class GridEngine:
 
     async def connect(self) -> None:
         await self.ext.connect()
-        # live 安全检查：账户不能已有该标的持仓（防与 farm 撞车）
+        # 专用账户模型：账户里的持仓即网格自己的库存，重启后自动接管。
+        # 仅当持仓名义远超库存上限(可能是 farm 腿/外部仓)时才拒绝，防误用共享账户。
         pos = await self.ext.get_position(self.config.market)
         if not self.config.dry_run and pos.signed_size != 0:
-            raise RuntimeError(
-                f"账户已有 {self.config.market} 持仓 {pos.signed_size}（可能是 farm 对冲腿）。"
-                f"网格需从空仓起步，请先平掉再启动，避免撞车。"
-            )
+            stats = await self.ext._client.info.get_market_statistics(market_name=self.config.market)
+            notional = abs(float(pos.signed_size)) * float(stats.data.mark_price)
+            if notional > 2 * self.config.max_inventory_usd:
+                raise RuntimeError(
+                    f"账户已有 {self.config.market} 持仓 {pos.signed_size}（≈${notional:.0f}，"
+                    f"远超库存上限${self.config.max_inventory_usd}）。疑似 farm 腿/外部仓，请先平掉。"
+                )
+            logger.warning("接管账户已有持仓 %s 作为网格库存（重启接管）", pos.signed_size)
         logger.info("网格引擎连接完成（dry_run=%s，起始持仓=%s）", self.config.dry_run, pos.signed_size)
 
     async def _indicators(self):
