@@ -184,6 +184,43 @@ async def _rollback_xaut(var: VariationalClient, qty: Decimal) -> None:
     print(f"   XAUT 已回滚：{_format_result(result) if result else '无'}")
 
 
+# /positions 为最终一致：成交后立即读可能仍为旧值，以下两个辅助函数容忍读写延迟。
+_CONFIRM_TRIES = 5
+_DELTA_TRIES = 6
+_POLL_DELAY_S = 1.5
+
+
+async def _confirm_leg_filled(
+    var: VariationalClient, leg: GoldLeg, qty: Decimal
+) -> bool:
+    """尽力确认某腿已在持仓反映（容忍延迟）；确认失败不抛错，仅告警。
+
+    RFQ accept 返回 rfq_id 即代表所报 qty 已成交，故这里只用于日志确认，
+    不作为第二腿的下单依据（第二腿按已知 qty 配平）。
+    """
+    for _ in range(_CONFIRM_TRIES):
+        size = abs((await _get_position(var, leg)).signed_size)
+        if size >= qty * Decimal("0.99"):
+            print(f"   已确认 {leg.underlying} 成交 qty≈{size}")
+            return True
+        await asyncio.sleep(_POLL_DELAY_S)
+    print(f"⚠️ {leg.underlying} 成交后暂未在持仓反映（读写延迟），按已报 qty 继续配平")
+    return False
+
+
+async def _await_net_delta(
+    var: VariationalClient, step: Decimal
+) -> tuple[Decimal, Decimal, Decimal]:
+    """轮询净 delta，容忍 /positions 读写延迟；中性即返回，否则返回最后一次读数。"""
+    result = await _net_delta(var)
+    for _ in range(_DELTA_TRIES):
+        if abs(result[2]) <= step:
+            return result
+        await asyncio.sleep(_POLL_DELAY_S)
+        result = await _net_delta(var)
+    return result
+
+
 async def cmd_status(var: VariationalClient) -> None:
     xau_size, xaut_size, net = await _net_delta(var)
     try:
@@ -245,10 +282,10 @@ async def cmd_open(var: VariationalClient, notional: Decimal) -> None:
         ) from exc
     print(f"   成交：{_format_result(r1)}")
 
-    filled_qty = abs((await _get_position(var, first_leg)).signed_size)
-    if filled_qty <= 0:
-        raise SystemExit("❌ XAUT 开仓后未读到成交仓位，请人工检查")
-    print(f"   读回 XAUT 成交 qty={filled_qty}")
+    # RFQ accept 返回 rfq_id 即代表所报 qty 已全量成交；不依赖即时读仓（/positions 有延迟），
+    # 第二腿直接按已知 qty 配平，确保等盎司。成交确认仅作日志，延迟不致命。
+    filled_qty = qty
+    await _confirm_leg_filled(var, first_leg, qty)
 
     print(f">>> [2/2] Variational 开多 {second_leg.underlying} {filled_qty} …")
     try:
@@ -273,7 +310,7 @@ async def cmd_open(var: VariationalClient, notional: Decimal) -> None:
             ) from rollback_exc
         raise SystemExit("已回滚，未留裸仓。") from exc
 
-    xau_size, xaut_size, net = await _net_delta(var)
+    xau_size, xaut_size, net = await _await_net_delta(var, step)
     neutral = abs(net) <= step
     print(
         f"\n开仓完成：XAU={xau_size} XAUT={xaut_size} 净delta={net} "

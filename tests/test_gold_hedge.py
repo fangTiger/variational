@@ -237,11 +237,17 @@ def test_gold_net_delta_uses_exact_positions() -> None:
 class FakeGoldVariational:
     """记录黄金模块下单意图的假 Variational 客户端。"""
 
-    def __init__(self, *, fail_second_leg: bool = False) -> None:
+    def __init__(
+        self, *, fail_second_leg: bool = False, hide_writes_for: int = 0
+    ) -> None:
         self.fail_second_leg = fail_second_leg
         self.sizes = {"XAU": Decimal("0"), "XAUT": Decimal("0")}
         self.orders: list[tuple[str, Side, Decimal, bool, str, int]] = []
         self.position_requests: list[tuple[str, bool]] = []
+        # 模拟 /positions 读写延迟：下单后的前 N 次读仓仍返回旧值(0)。
+        self._hide_writes_for = hide_writes_for
+        self._reads_after_write = 0
+        self._has_written = False
 
     async def request_quote(
         self,
@@ -264,6 +270,10 @@ class FakeGoldVariational:
     async def get_position(self, underlying: str, *, exact: bool = False) -> Position:
         self.position_requests.append((underlying, exact))
         assert exact is True
+        # 写入后前 N 次读仍返回旧值 0，模拟最终一致延迟。
+        if self._has_written and self._reads_after_write < self._hide_writes_for:
+            self._reads_after_write += 1
+            return Position(underlying, Decimal("0"))
         return Position(underlying, self.sizes[underlying])
 
     async def market_order(
@@ -280,6 +290,7 @@ class FakeGoldVariational:
         self.orders.append(
             (market, side, amount, reduce_only, instrument_type, funding_interval_s)
         )
+        self._has_written = True
         if (
             self.fail_second_leg
             and market == "XAU"
@@ -305,6 +316,29 @@ class FakeGoldVariational:
 
     async def get_points_summary(self):
         return {"total_points": "123.4", "rank": 56}
+
+
+def test_open_survives_position_read_lag_without_naked_leg(monkeypatch) -> None:
+    """回归：第一腿成交后 /positions 读到 0（读写延迟）时，不得 SystemExit 留裸仓；
+    第二腿必须按已报 qty 照常开出，最终两腿齐全。"""
+    from tools import hedge_gold
+
+    monkeypatch.setattr(hedge_gold, "_POLL_DELAY_S", 0)
+    # 下单后前 8 次读仓返回 0，覆盖成交确认的全部重试，模拟严重延迟
+    var = FakeGoldVariational(hide_writes_for=8)
+
+    # 不应抛 SystemExit（旧代码会在“未读到成交仓位”处退出并留裸 XAUT）
+    asyncio.run(hedge_gold.cmd_open(var, Decimal("300")))
+
+    # 两腿都应开出，且无 reduce_only 回滚单（说明没被误判为失败）
+    opened = [(m, s, ro) for (m, s, _a, ro, _it, _fi) in var.orders]
+    assert opened == [
+        ("XAUT", Side.SELL, False),
+        ("XAU", Side.BUY, False),
+    ]
+    # 真实内部仓位两腿等盎司、净中性
+    assert var.sizes["XAU"] == -var.sizes["XAUT"]
+    assert var.sizes["XAU"] > 0
 
 
 def test_open_orders_thin_leg_first_and_rolls_back_when_second_leg_fails() -> None:
