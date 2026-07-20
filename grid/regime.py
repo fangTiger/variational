@@ -114,34 +114,30 @@ def donchian_prev(highs: list[float], lows: list[float], period: int) -> tuple[l
 def decide_mode(
     *,
     adx_val: float | None,
-    close: float,
-    donchian_up: float | None,
-    donchian_lo: float | None,
+    close: float | None = None,
+    donchian_up: float | None = None,
+    donchian_lo: float | None = None,
     fng: int | None = None,
-    adx_off: float = 30.0,
-    adx_resume: float = 27.0,
+    adx_off: float = 999.0,
+    adx_resume: float = 999.0,
     prev_mode: "GridMode | None" = None,
     fng_extreme_low: int = 15,
     fng_extreme_high: int = 85,
 ) -> GridMode:
-    """急停开关：强趋势或通道突破 → OFF；否则 NEUTRAL。
+    """急停开关（2026-07-21 改版：只保留可选的 ADX 熔断，去掉通道突破/情绪急停）。
 
-    - ADX > adx_off：趋势太强，停。
-    - ADX 迟滞：已 OFF 时须回落到 adx_resume 以下才恢复，防止在阈值附近反复撤/挂单。
-      不传 prev_mode 时无迟滞（兼容旧调用）。
-    - close 突破前 N 根通道上/下沿：趋势启动，停。
-    - 恐惧贪婪极值 + 趋势偏强：更保守地停（极端情绪常伴随剧烈单边）。
+    网格初衷是持续挂单等成交。原"通道突破 → 撤全网格 + 平库存"会在每次拉盘刷新
+    N 小时新高时把整排单撤光，与网格连续性正面冲突，故移除；情绪极值急停一并移除。
+    趋势风险改由库存上限（grid_engine._within_cap）+ 格距承担。
+
+    - adx_val is None：预热不足，保守 OFF（仅冷启动瞬时）。
+    - ADX 熔断为**可选**：默认 adx_off=999 即禁用；如需强趋势保护把 adx_off/adx_resume 调低。
+      迟滞：已 OFF 时须回落到 adx_resume 以下才恢复。
+    - donchian_up/lo、fng 参数保留仅为兼容与日志，**不再触发 OFF**。
     """
     if adx_val is None:
         return GridMode.OFF  # 预热不足，保守不开
     threshold = adx_resume if prev_mode is GridMode.OFF else adx_off
     if adx_val > threshold:
-        return GridMode.OFF
-    if donchian_up is not None and close > donchian_up:
-        return GridMode.OFF
-    if donchian_lo is not None and close < donchian_lo:
-        return GridMode.OFF
-    # 情绪极值 + ADX 偏高（>20）时更保守
-    if fng is not None and adx_val > 20 and (fng <= fng_extreme_low or fng >= fng_extreme_high):
         return GridMode.OFF
     return GridMode.NEUTRAL

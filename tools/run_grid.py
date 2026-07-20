@@ -74,11 +74,12 @@ def main() -> None:
     p.add_argument("--spacing", type=float, default=0.02, help="格距（默认2%）")
     p.add_argument("--unit", type=float, default=50.0, help="每格名义USD")
     p.add_argument("--max-inv", type=float, default=400.0, help="最大库存名义USD")
-    p.add_argument("--adx-off", type=float, default=30.0, help="ADX急停阈值")
-    p.add_argument("--adx-resume", type=float, default=27.0,
-                   help="ADX恢复阈值(迟滞：急停后须回落到此值以下才恢复)")
+    p.add_argument("--adx-off", type=float, default=999.0,
+                   help="ADX熔断阈值(默认999=禁用；调低才启用强趋势保护)")
+    p.add_argument("--adx-resume", type=float, default=999.0,
+                   help="ADX恢复阈值(迟滞：熔断后须回落到此值以下才恢复)")
     p.add_argument("--donchian", type=int, default=48,
-                   help="Donchian通道周期(小时)，突破即急停")
+                   help="Donchian通道周期(小时)，仅供日志，不再触发急停")
     p.add_argument("--account", default="X10_GRID",
                    help="账户环境变量前缀（默认X10_GRID网格账户；用X10则跑farm账户）")
     args = p.parse_args()

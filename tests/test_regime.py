@@ -29,46 +29,40 @@ def test_ema_and_donchian_produce_values() -> None:
     assert up[-1] is not None and lo[-1] is not None
 
 
-def test_killswitch_off_in_strong_trend() -> None:
+def test_default_keeps_quoting_even_in_trend_and_breakout() -> None:
+    """新策略（2026-07-21）：默认不再因通道突破/强趋势急停——网格持续挂单。"""
     highs, lows, closes = _synthetic()
     a = adx(highs, lows, closes)
     up, lo = donchian_prev(highs, lows, 20)
-    # 趋势段应急停
-    assert decide_mode(adx_val=a[95], close=closes[95], donchian_up=up[95], donchian_lo=lo[95]) is GridMode.OFF
-    # 震荡段应中性
-    assert decide_mode(adx_val=a[50], close=closes[50], donchian_up=up[50], donchian_lo=lo[50]) is GridMode.NEUTRAL
+    # 强趋势段：默认仍中性（不再 ADX 急停）
+    assert decide_mode(adx_val=a[95], close=closes[95], donchian_up=up[95], donchian_lo=lo[95]) is GridMode.NEUTRAL
+    # 价格突破通道上沿：默认不再急停
+    assert decide_mode(adx_val=15, close=110, donchian_up=105, donchian_lo=95) is GridMode.NEUTRAL
+    # 情绪极值：默认不再急停
+    assert decide_mode(adx_val=24, close=100, donchian_up=105, donchian_lo=95, fng=90) is GridMode.NEUTRAL
 
 
 def test_warmup_defaults_off() -> None:
-    # 指标预热不足(None) → 保守 OFF
+    # 指标预热不足(None) → 保守 OFF（仅冷启动瞬时）
     assert decide_mode(adx_val=None, close=100, donchian_up=None, donchian_lo=None) is GridMode.OFF
 
 
-def test_breakout_triggers_off() -> None:
-    # ADX 低但价格突破通道上沿 → OFF
-    assert decide_mode(adx_val=15, close=110, donchian_up=105, donchian_lo=95) is GridMode.OFF
-
-
-def test_adx_hysteresis() -> None:
-    """ADX 迟滞：>30 触发 OFF，回落到 <27 才恢复，27-30 之间保持原状态。"""
-    kw = dict(close=100, donchian_up=105, donchian_lo=95)
-    # 中性时 28 不触发（阈值 30）
-    assert decide_mode(adx_val=28, prev_mode=GridMode.NEUTRAL, **kw) is GridMode.NEUTRAL
-    # 中性时 31 触发 OFF
-    assert decide_mode(adx_val=31, prev_mode=GridMode.NEUTRAL, **kw) is GridMode.OFF
-    # 已 OFF 时 28 仍保持 OFF（须 <27 才恢复）
-    assert decide_mode(adx_val=28, prev_mode=GridMode.OFF, **kw) is GridMode.OFF
+def test_adx_brake_is_opt_in() -> None:
+    """ADX 熔断改为可选：默认禁用（阈值 999），显式调低才生效，迟滞照旧。"""
+    # 默认极高阈值 → 即便 ADX=60 也不停
+    assert decide_mode(adx_val=60, close=100, donchian_up=105, donchian_lo=95) is GridMode.NEUTRAL
+    # 显式开启熔断：中性时 31>30 触发 OFF
+    assert decide_mode(adx_val=31, adx_off=30, adx_resume=27, prev_mode=GridMode.NEUTRAL) is GridMode.OFF
+    # 已 OFF 时 28 仍 OFF（须 <27 才恢复）
+    assert decide_mode(adx_val=28, adx_off=30, adx_resume=27, prev_mode=GridMode.OFF) is GridMode.OFF
     # 已 OFF 时 26 恢复中性
-    assert decide_mode(adx_val=26, prev_mode=GridMode.OFF, **kw) is GridMode.NEUTRAL
-    # 不传 prev_mode（旧调用方式）行为不变：阈值 30
-    assert decide_mode(adx_val=28, **kw) is GridMode.NEUTRAL
+    assert decide_mode(adx_val=26, adx_off=30, adx_resume=27, prev_mode=GridMode.OFF) is GridMode.NEUTRAL
 
 
 if __name__ == "__main__":
     test_adx_low_in_range_high_in_trend()
     test_ema_and_donchian_produce_values()
-    test_killswitch_off_in_strong_trend()
+    test_default_keeps_quoting_even_in_trend_and_breakout()
     test_warmup_defaults_off()
-    test_breakout_triggers_off()
-    test_adx_hysteresis()
+    test_adx_brake_is_opt_in()
     print("✅ regime 测试通过")

@@ -29,8 +29,8 @@ class GridConfig:
     max_inventory_usd: float = 150.0     # 最大库存名义
     levels_per_side: int = 4             # 上下各挂几格
     adx_period: int = 14
-    adx_off: float = 30.0
-    adx_resume: float = 27.0             # 迟滞：OFF 后 ADX 须回落到此值以下才恢复
+    adx_off: float = 999.0               # 默认禁用 ADX 熔断（只靠库存上限控风险）
+    adx_resume: float = 999.0            # 迟滞：OFF 后 ADX 须回落到此值以下才恢复
     donchian_period: int = 48
     candle_lookback: int = 200
     poll_interval: float = 30.0
