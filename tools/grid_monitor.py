@@ -60,10 +60,13 @@ async def _snapshot() -> dict:
         highs = [float(k.high) for k in candles]
         lows = [float(k.low) for k in candles]
         closes = [float(k.close) for k in candles]
+        # 与实盘 launchd 参数一致：ADX 急停已禁用(1h ADX 长期徘徊致停机过半)，
+        # 急停只靠 96h Donchian 突破 + 库存上限 + 情绪极值
         a = adx(highs, lows, closes)
-        up, lo = donchian_prev(highs, lows, 48)
+        up, lo = donchian_prev(highs, lows, 96)
         price = closes[-1]
-        mode = decide_mode(adx_val=a[-1], close=price, donchian_up=up[-1], donchian_lo=lo[-1])
+        mode = decide_mode(adx_val=a[-1], close=price, donchian_up=up[-1], donchian_lo=lo[-1],
+                           adx_off=999.0)
         inv = float(pos.signed_size)
     finally:
         await ext.close()

@@ -55,6 +55,7 @@ async def _main(args) -> None:
         max_inventory_usd=args.max_inv,
         adx_off=args.adx_off,
         adx_resume=args.adx_resume,
+        donchian_period=args.donchian,
         poll_interval=args.interval,
     )
     engine = GridEngine(ext, config, fng_provider=_current_fng)
@@ -76,6 +77,8 @@ def main() -> None:
     p.add_argument("--adx-off", type=float, default=30.0, help="ADX急停阈值")
     p.add_argument("--adx-resume", type=float, default=27.0,
                    help="ADX恢复阈值(迟滞：急停后须回落到此值以下才恢复)")
+    p.add_argument("--donchian", type=int, default=48,
+                   help="Donchian通道周期(小时)，突破即急停")
     p.add_argument("--account", default="X10_GRID",
                    help="账户环境变量前缀（默认X10_GRID网格账户；用X10则跑farm账户）")
     args = p.parse_args()
