@@ -317,14 +317,23 @@ class VariationalClient(ExchangeAdapter):
         underlying: str,
         instrument_type: str = "perpetual_future",
         funding_interval_s: int = 3600,
+        kind: str | None = None,
     ) -> dict:
-        """构造永续 instrument 描述符；默认值保持原 BTC 流程不变。"""
-        return {
+        """构造永续 instrument 描述符；默认值保持原 BTC 流程不变。
+
+        RWA 永续（perpetual_rwa_future，如 XAU）后端 schema 额外要求 kind 字段，
+        取值 = 该资产的 asset_class（黄金=commodity），与前端构造一致；
+        缺失会被后端拒绝：HTTP 400 missing field `kind`。非 RWA 传 None 即不带该字段。
+        """
+        instrument = {
             "funding_interval_s": funding_interval_s,
             "instrument_type": instrument_type,
             "settlement_asset": "USDC",
             "underlying": underlying,
         }
+        if kind is not None:
+            instrument["kind"] = kind
+        return instrument
 
     async def request_quote(
         self,
@@ -334,17 +343,20 @@ class VariationalClient(ExchangeAdapter):
         *,
         instrument_type: str = "perpetual_future",
         funding_interval_s: int = 3600,
+        kind: str | None = None,
     ) -> Any:
         """询价。side ∈ {buy, sell}。返回含 quote_id/bid/ask/mark_price/margin_requirements。
 
         用 /quotes/indicative：它按用户注册可执行报价（含保证金计算），其 quote_id 可用于
         /quotes/accept 成交。/quotes/simple 是无状态价格预览，quote_id 不可成交。
+        kind：RWA 永续需传（如 XAU=commodity），其余传 None。
         """
         body = {
             "instrument": self._instrument(
                 underlying,
                 instrument_type=instrument_type,
                 funding_interval_s=funding_interval_s,
+                kind=kind,
             ),
             "qty": str(qty),
             "side": side,
@@ -372,10 +384,12 @@ class VariationalClient(ExchangeAdapter):
         reduce_only: bool = False,
         instrument_type: str = "perpetual_future",
         funding_interval_s: int = 3600,
+        kind: str | None = None,
     ):
         """RFQ 市价成交：/quotes/simple 询价 → /quotes/accept 成交。
 
         market 传 underlying（如 "BTC"）。amount 为合约数量（BTC 个数）。
+        kind：RWA 永续需传（如 XAU=commodity），其余传 None。
         """
         s = "buy" if side is Side.BUY else "sell"
         quote = await self.request_quote(
@@ -384,6 +398,7 @@ class VariationalClient(ExchangeAdapter):
             amount,
             instrument_type=instrument_type,
             funding_interval_s=funding_interval_s,
+            kind=kind,
         )
         return await self.accept_quote(
             quote_id=quote["quote_id"],

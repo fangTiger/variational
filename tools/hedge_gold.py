@@ -42,19 +42,24 @@ class GoldLeg:
     open_side: Side
     instrument_type: str
     funding_interval_s: int
+    kind: str | None = None  # RWA 永续必填（XAU=commodity），非 RWA 为 None
 
 
 XAU_LEG = GoldLeg(
     underlying="XAU",
     open_side=Side.BUY,
+    # RWA 永续的 instrument 标识不含 funding_interval（后端会忽略该字段），此值无实际作用。
     instrument_type="perpetual_rwa_future",
     funding_interval_s=14400,
+    kind="commodity",  # RWA schema 必需，缺失后端 400 missing field `kind`
 )
 XAUT_LEG = GoldLeg(
     underlying="XAUT",
     open_side=Side.SELL,
     instrument_type="perpetual_future",
-    funding_interval_s=14400,
+    # instrument 标识用的 funding_interval 恒为 3600（同 BTC），
+    # 非 supported_assets 里的结算周期 14400；用 14400 会 400 unsupported instrument。
+    funding_interval_s=3600,
 )
 
 
@@ -128,6 +133,7 @@ async def _quote_xau_basis(var: VariationalClient) -> tuple[Decimal, Decimal]:
         FALLBACK_QTY_STEP,
         instrument_type=XAU_LEG.instrument_type,
         funding_interval_s=XAU_LEG.funding_interval_s,
+        kind=XAU_LEG.kind,
     )
     mark = _mark_from_quote(quote)
     if mark is None or mark <= 0:
@@ -161,6 +167,7 @@ async def _market_order(
         reduce_only=reduce_only,
         instrument_type=leg.instrument_type,
         funding_interval_s=leg.funding_interval_s,
+        kind=leg.kind,
     )
 
 

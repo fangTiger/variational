@@ -27,11 +27,13 @@ def test_instrument_accepts_explicit_gold_params() -> None:
         "XAU",
         instrument_type="perpetual_rwa_future",
         funding_interval_s=14400,
+        kind="commodity",
     ) == {
         "funding_interval_s": 14400,
         "instrument_type": "perpetual_rwa_future",
         "settlement_asset": "USDC",
         "underlying": "XAU",
+        "kind": "commodity",
     }
     assert VariationalClient._instrument(
         "XAUT",
@@ -43,6 +45,45 @@ def test_instrument_accepts_explicit_gold_params() -> None:
         "settlement_asset": "USDC",
         "underlying": "XAUT",
     }
+
+
+def test_rwa_instrument_carries_kind_but_default_omits_it() -> None:
+    """回归：RWA 永续必须带 kind（缺失后端 400 missing field `kind`）；
+    非 RWA/默认调用不得引入 kind 字段，保持 BTC/XAUT 行为不变。"""
+    # 默认（BTC）与显式非 RWA（XAUT）都不带 kind
+    assert "kind" not in VariationalClient._instrument("BTC")
+    assert "kind" not in VariationalClient._instrument(
+        "XAUT", instrument_type="perpetual_future", funding_interval_s=14400
+    )
+    # XAU RWA 带 kind=commodity（与前端构造一致）
+    assert VariationalClient._instrument(
+        "XAU",
+        instrument_type="perpetual_rwa_future",
+        funding_interval_s=14400,
+        kind="commodity",
+    )["kind"] == "commodity"
+
+
+def test_xau_leg_forwards_kind_into_quote_body() -> None:
+    """hedge_gold 的 XAU 腿必须把 kind 透传进报价体，否则实盘 400。"""
+    from tools import hedge_gold
+
+    assert hedge_gold.XAU_LEG.kind == "commodity"
+    assert hedge_gold.XAUT_LEG.kind is None
+    # XAUT instrument 标识的 funding_interval 恒为 3600，用 14400 会 400 unsupported instrument
+    assert hedge_gold.XAUT_LEG.funding_interval_s == 3600
+
+    client = object.__new__(VariationalClient)
+    capture: dict[str, object] = {}
+
+    async def fake_post(path: str, body: dict | None = None):
+        capture["body"] = body
+        return {"quote_id": "q", "mark_price": "4000", "qty_step": "0.001"}
+
+    client._post = fake_post
+    asyncio.run(hedge_gold._quote_xau_basis(client))
+    assert capture["body"]["instrument"]["kind"] == "commodity"
+    assert capture["body"]["instrument"]["instrument_type"] == "perpetual_rwa_future"
 
 
 def test_quote_and_market_order_forward_instrument_params() -> None:
@@ -90,6 +131,7 @@ def test_quote_and_market_order_forward_instrument_params() -> None:
         *,
         instrument_type: str = "perpetual_future",
         funding_interval_s: int = 3600,
+        kind: str | None = None,
     ):
         order_capture["quote_args"] = (
             underlying,
@@ -209,6 +251,7 @@ class FakeGoldVariational:
         *,
         instrument_type: str = "perpetual_future",
         funding_interval_s: int = 3600,
+        kind: str | None = None,
     ):
         return {
             "quote_id": f"q-{underlying}-{side}",
@@ -232,6 +275,7 @@ class FakeGoldVariational:
         reduce_only: bool = False,
         instrument_type: str = "perpetual_future",
         funding_interval_s: int = 3600,
+        kind: str | None = None,
     ):
         self.orders.append(
             (market, side, amount, reduce_only, instrument_type, funding_interval_s)
@@ -274,9 +318,9 @@ def test_open_orders_thin_leg_first_and_rolls_back_when_second_leg_fails() -> No
 
     assert "已回滚" in str(exc.value)
     assert var.orders == [
-        ("XAUT", Side.SELL, Decimal("0.075"), False, "perpetual_future", 14400),
+        ("XAUT", Side.SELL, Decimal("0.075"), False, "perpetual_future", 3600),
         ("XAU", Side.BUY, Decimal("0.075"), False, "perpetual_rwa_future", 14400),
-        ("XAUT", Side.BUY, Decimal("0.075"), True, "perpetual_future", 14400),
+        ("XAUT", Side.BUY, Decimal("0.075"), True, "perpetual_future", 3600),
     ]
     assert var.sizes["XAUT"] == Decimal("0")
     assert var.sizes["XAU"] == Decimal("0")
@@ -292,7 +336,7 @@ def test_open_direction_guard_never_builds_reverse_pair() -> None:
 
     opening_orders = [order for order in var.orders if not order[3]]
     assert opening_orders == [
-        ("XAUT", Side.SELL, Decimal("0.075"), False, "perpetual_future", 14400),
+        ("XAUT", Side.SELL, Decimal("0.075"), False, "perpetual_future", 3600),
         ("XAU", Side.BUY, Decimal("0.075"), False, "perpetual_rwa_future", 14400),
     ]
     assert not any(
@@ -318,7 +362,7 @@ def test_close_flattens_xaut_before_xau_with_reduce_only() -> None:
     asyncio.run(hedge_gold.cmd_close(var))
 
     assert var.orders == [
-        ("XAUT", Side.BUY, Decimal("0.075"), True, "perpetual_future", 14400),
+        ("XAUT", Side.BUY, Decimal("0.075"), True, "perpetual_future", 3600),
         ("XAU", Side.SELL, Decimal("0.075"), True, "perpetual_rwa_future", 14400),
     ]
     assert var.sizes == {"XAU": Decimal("0"), "XAUT": Decimal("0")}
