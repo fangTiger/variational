@@ -49,10 +49,26 @@ def test_breakout_triggers_off() -> None:
     assert decide_mode(adx_val=15, close=110, donchian_up=105, donchian_lo=95) is GridMode.OFF
 
 
+def test_adx_hysteresis() -> None:
+    """ADX 迟滞：>30 触发 OFF，回落到 <27 才恢复，27-30 之间保持原状态。"""
+    kw = dict(close=100, donchian_up=105, donchian_lo=95)
+    # 中性时 28 不触发（阈值 30）
+    assert decide_mode(adx_val=28, prev_mode=GridMode.NEUTRAL, **kw) is GridMode.NEUTRAL
+    # 中性时 31 触发 OFF
+    assert decide_mode(adx_val=31, prev_mode=GridMode.NEUTRAL, **kw) is GridMode.OFF
+    # 已 OFF 时 28 仍保持 OFF（须 <27 才恢复）
+    assert decide_mode(adx_val=28, prev_mode=GridMode.OFF, **kw) is GridMode.OFF
+    # 已 OFF 时 26 恢复中性
+    assert decide_mode(adx_val=26, prev_mode=GridMode.OFF, **kw) is GridMode.NEUTRAL
+    # 不传 prev_mode（旧调用方式）行为不变：阈值 30
+    assert decide_mode(adx_val=28, **kw) is GridMode.NEUTRAL
+
+
 if __name__ == "__main__":
     test_adx_low_in_range_high_in_trend()
     test_ema_and_donchian_produce_values()
     test_killswitch_off_in_strong_trend()
     test_warmup_defaults_off()
     test_breakout_triggers_off()
+    test_adx_hysteresis()
     print("✅ regime 测试通过")

@@ -30,6 +30,7 @@ class GridConfig:
     levels_per_side: int = 4             # 上下各挂几格
     adx_period: int = 14
     adx_off: float = 30.0
+    adx_resume: float = 27.0             # 迟滞：OFF 后 ADX 须回落到此值以下才恢复
     donchian_period: int = 48
     candle_lookback: int = 200
     poll_interval: float = 30.0
@@ -42,6 +43,7 @@ class GridEngine:
         self.config = config or GridConfig()
         self._fng_provider = fng_provider
         self._orders: dict[int, dict] = {}   # level -> {"id":..., "side": Side}
+        self._mode = GridMode.NEUTRAL        # 上一轮 regime（迟滞用）
         self._running = False
 
     @property
@@ -103,7 +105,9 @@ class GridEngine:
         price = closes[-1]
         fng = self._fng_provider() if self._fng_provider else None
         mode = decide_mode(adx_val=a[-1], close=price, donchian_up=up[-1], donchian_lo=lo[-1],
-                           fng=fng, adx_off=self.config.adx_off)
+                           fng=fng, adx_off=self.config.adx_off,
+                           adx_resume=self.config.adx_resume, prev_mode=self._mode)
+        self._mode = mode
 
         inv, mark = await self._inv()
         inv_usd = float(inv) * mark
@@ -122,21 +126,45 @@ class GridEngine:
         orders = await self.ext.get_open_orders(self.config.market)
         return {getattr(o, "id", None) for o in orders}
 
+    async def _order_statuses(self) -> dict:
+        """订单 id → 历史订单对象（查终态用）。失败返回空 dict（按未知处理）。"""
+        try:
+            orders = await self.ext.get_orders_history(self.config.market, limit=100)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询订单历史失败：%s", exc)
+            return {}
+        return {getattr(o, "id", None): o for o in orders}
+
     async def _handle_fills(self, inv_usd: float) -> None:
-        """跟踪单从盘口消失=成交：买成交→上一格挂卖；卖成交→下一格挂买。"""
+        """处理从盘口消失的跟踪单——按交易所终态区分，只有真成交才翻单。
+
+        订单会因 EXPIRED(有效期到)/CANCELLED(急停或手动)消失，误当成交翻单
+        会挂出穿越盘口的反向单（2026-07-20 实盘事故）。
+        - FILLED 或有成交量：买成交→上一格挂卖；卖成交→下一格挂买。
+        - EXPIRED/CANCELLED：原格原方向重挂。
+        - REJECTED/未知：仅移除记录，交给补格逻辑按当前中心重铺。
+        """
         if self.config.dry_run:
             return
         open_ids = await self._open_ids()
-        for lv in list(self._orders.keys()):
-            rec = self._orders[lv]
-            if rec["id"] in open_ids:
-                continue
-            # 成交
+        missing = {lv: rec for lv, rec in self._orders.items() if rec["id"] not in open_ids}
+        if not missing:
+            return
+        statuses = await self._order_statuses()
+        for lv, rec in missing.items():
             self._orders.pop(lv, None)
-            if rec["side"] is Side.BUY:      # 买成交 → 上一格挂卖止盈
-                await self._place(lv + 1, Side.SELL, inv_usd, why=f"{lv}买成交→挂卖")
-            else:                             # 卖成交 → 下一格挂买
-                await self._place(lv - 1, Side.BUY, inv_usd, why=f"{lv}卖成交→挂买")
+            o = statuses.get(rec["id"])
+            status = str(getattr(o, "status", "") or "") if o else ""
+            filled = float(getattr(o, "filled_qty", 0) or 0) if o else 0.0
+            if status == "FILLED" or filled > 0:
+                if rec["side"] is Side.BUY:      # 买成交 → 上一格挂卖止盈
+                    await self._place(lv + 1, Side.SELL, inv_usd, why=f"{lv}买成交→挂卖")
+                else:                             # 卖成交 → 下一格挂买
+                    await self._place(lv - 1, Side.BUY, inv_usd, why=f"{lv}卖成交→挂买")
+            elif status in ("EXPIRED", "CANCELLED"):
+                await self._place(lv, rec["side"], inv_usd, why=f"格{lv}{status}重挂")
+            else:
+                logger.warning("格%d 订单 %s 终态=%s，仅移除不翻单", lv, rec["id"], status or "未知")
 
     async def _maintain_ladder(self, price: float, inv_usd: float) -> str:
         center = self._price_level(price)
@@ -182,7 +210,11 @@ class GridEngine:
             return msg
         try:
             res = await self.ext.place_limit_order(self.config.market, side, qty, lp)
-            oid = getattr(getattr(res, "data", None), "id", None) or getattr(res, "id", None)
+            data = getattr(res, "data", None)
+            oid = getattr(data, "id", None) or getattr(res, "id", None)
+            if str(getattr(data, "status", "") or "") == "REJECTED":
+                logger.warning("%s → 被拒(%s)，不入账", msg, getattr(data, "status_reason", None))
+                return None
             self._orders[level] = {"id": oid, "side": side}
             logger.info("%s → id=%s", msg, oid)
             return msg
@@ -204,6 +236,8 @@ class GridEngine:
 
     async def _go_off(self, inv: Decimal) -> str:
         # 撤所有挂单
+        if self._orders:
+            logger.warning("急停：撤 %d 个挂单", len(self._orders))
         for lv in list(self._orders.keys()):
             await self._cancel(lv, why="急停撤单")
         # 平库存

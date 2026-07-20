@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 
 from x10.clients.rest.rest_api_client import RestApiClient
@@ -201,8 +202,12 @@ class ExtendedClient(ExchangeAdapter):
     # ---- 限价单（网格用）----
 
     async def place_limit_order(self, market: str, side: Side, amount: Decimal, price: Decimal,
-                                *, post_only: bool = True):
-        """挂限价单（默认 post_only=maker）。返回下单结果（含订单 id）。"""
+                                *, post_only: bool = True, expire_days: int = 7):
+        """挂限价单（默认 post_only=maker）。返回下单结果（含订单 id）。
+
+        SDK 默认有效期仅 1 小时，网格挂单会整批 EXPIRED（2026-07-20 实盘事故），
+        这里显式设置为 expire_days 天。
+        """
         amount = self._round_qty(market, amount)
         market_obj = self._market(market)
         order = create_order_object(
@@ -214,6 +219,7 @@ class ExtendedClient(ExchangeAdapter):
             amount_of_synthetic=amount,
             price=market_obj.trading_config.round_price(price),
             time_in_force=TimeInForce.GTT,
+            expire_time=datetime.now(timezone.utc) + timedelta(days=expire_days),
             reduce_only=False,
             post_only=post_only,
         )
@@ -224,6 +230,11 @@ class ExtendedClient(ExchangeAdapter):
 
     async def get_open_orders(self, market: str) -> list:
         r = await self._client.account.get_open_orders(market_names=[market])
+        return r.data or []
+
+    async def get_orders_history(self, market: str, limit: int = 100) -> list:
+        """历史订单（含终态 status/filled_qty，网格判断成交 vs 过期/被撤用）。"""
+        r = await self._client.account.get_orders_history(market_names=[market], limit=limit)
         return r.data or []
 
     async def close(self) -> None:

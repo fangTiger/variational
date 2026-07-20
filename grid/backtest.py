@@ -108,6 +108,7 @@ def simulate(
     adx_period: int = 14,
     donchian_period: int = 48,
     adx_off: float = 30.0,
+    adx_resume: float = 27.0,
 ) -> Result:
     """跑一遍网格模拟，返回结果。"""
     highs = [c.h for c in candles]
@@ -128,6 +129,7 @@ def simulate(
     max_dd = 0.0
     max_inv_usd = 0.0
 
+    prev_mode = GridMode.NEUTRAL
     for i, c in enumerate(candles):
         price = c.c
         level = round(math.log(price) / log_step)
@@ -140,7 +142,9 @@ def simulate(
                 adx_val=adx_series[i], close=price,
                 donchian_up=dc_up[i], donchian_lo=dc_lo[i],
                 fng=_fng_for(c.ts, fng), adx_off=adx_off,
+                adx_resume=adx_resume, prev_mode=prev_mode,
             )
+            prev_mode = mode
 
         if mode is GridMode.OFF:
             off_count += 1

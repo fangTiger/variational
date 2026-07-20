@@ -119,18 +119,23 @@ def decide_mode(
     donchian_lo: float | None,
     fng: int | None = None,
     adx_off: float = 30.0,
+    adx_resume: float = 27.0,
+    prev_mode: "GridMode | None" = None,
     fng_extreme_low: int = 15,
     fng_extreme_high: int = 85,
 ) -> GridMode:
     """急停开关：强趋势或通道突破 → OFF；否则 NEUTRAL。
 
     - ADX > adx_off：趋势太强，停。
+    - ADX 迟滞：已 OFF 时须回落到 adx_resume 以下才恢复，防止在阈值附近反复撤/挂单。
+      不传 prev_mode 时无迟滞（兼容旧调用）。
     - close 突破前 N 根通道上/下沿：趋势启动，停。
     - 恐惧贪婪极值 + 趋势偏强：更保守地停（极端情绪常伴随剧烈单边）。
     """
     if adx_val is None:
         return GridMode.OFF  # 预热不足，保守不开
-    if adx_val > adx_off:
+    threshold = adx_resume if prev_mode is GridMode.OFF else adx_off
+    if adx_val > threshold:
         return GridMode.OFF
     if donchian_up is not None and close > donchian_up:
         return GridMode.OFF
