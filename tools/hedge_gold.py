@@ -256,6 +256,63 @@ async def cmd_status(var: VariationalClient) -> None:
         print(f"⚠️ 积分读取失败：{exc}")
 
 
+async def _add_paired_qty(
+    var: VariationalClient,
+    add_qty: Decimal,
+    step: Decimal,
+    *,
+    expected_total: Decimal,
+    label: str,
+) -> None:
+    """给两腿各加 add_qty（等盎司）：先加薄腿 XAUT 空、再加 XAU 多；
+    第二腿失败 reduce_only 回滚刚加的 XAUT，绝不留裸仓。开仓与加仓共用。
+
+    不依赖即时读仓（RFQ 返回 rfq_id 即全量成交，/positions 最终一致有延迟）；
+    expected_total 为该腿加完后的预期总量，仅用于日志确认。
+    """
+    first_leg, second_leg = _opening_plan()
+    print(f">>> [1/2] Variational 加空 {first_leg.underlying} {add_qty} …")
+    try:
+        r1 = await _market_order(var, first_leg, first_leg.open_side, add_qty)
+    except VariationalJurisdictionError as exc:
+        raise SystemExit(
+            f"❌ Variational 交易被地区封锁：{exc}\n   需在放行 IP（Codex）执行。"
+        ) from exc
+    print(f"   成交：{_format_result(r1)}")
+
+    await _confirm_leg_filled(var, first_leg, expected_total)
+
+    print(f">>> [2/2] Variational 加多 {second_leg.underlying} {add_qty} …")
+    try:
+        r2 = await _market_order(var, second_leg, second_leg.open_side, add_qty)
+        print(f"   成交：{_format_result(r2)}")
+    except VariationalJurisdictionError as exc:
+        print(f"❌ Variational 交易被地区封锁：{exc}\n   需在放行 IP（Codex）执行。")
+        await _rollback_or_die(var, add_qty)
+        raise SystemExit("已回滚本次新增，未留裸仓；后续需在放行 IP（Codex）执行。") from exc
+    except Exception as exc:  # noqa: BLE001
+        print(f"❌ XAU 下单失败：{exc}")
+        await _rollback_or_die(var, add_qty)
+        raise SystemExit("已回滚本次新增，未留裸仓。") from exc
+
+    xau_size, xaut_size, net = await _await_net_delta(var, step)
+    neutral = abs(net) <= step
+    print(
+        f"\n{label}完成：XAU={xau_size} XAUT={xaut_size} 净delta={net} "
+        f"{'✅ 中性' if neutral else '⚠️ 有敞口，请检查'}"
+    )
+
+
+async def _rollback_or_die(var: VariationalClient, qty: Decimal) -> None:
+    """回滚刚加的 XAUT 空头；回滚失败则硬退出并要求人工介入。"""
+    try:
+        await _rollback_xaut(var, qty)
+    except Exception as rollback_exc:  # noqa: BLE001
+        raise SystemExit(
+            f"❌ 第二腿失败且 XAUT 回滚失败：{rollback_exc}，请立即人工检查"
+        ) from rollback_exc
+
+
 async def cmd_open(var: VariationalClient, notional: Decimal) -> None:
     if notional > MAX_NOTIONAL:
         raise SystemExit(f"❌ 名义 {notional} 超过上限 {MAX_NOTIONAL}")
@@ -263,7 +320,8 @@ async def cmd_open(var: VariationalClient, notional: Decimal) -> None:
     xau_size, xaut_size, _ = await _net_delta(var)
     if xau_size != 0 or xaut_size != 0:
         raise SystemExit(
-            f"❌ 已有黄金持仓（XAU={xau_size} XAUT={xaut_size}），请先 close 或人工检查"
+            f"❌ 已有黄金持仓（XAU={xau_size} XAUT={xaut_size}），"
+            f"请先 close，或用 topup 加仓到目标"
         )
 
     mark, step = await _quote_xau_basis(var)
@@ -272,50 +330,38 @@ async def cmd_open(var: VariationalClient, notional: Decimal) -> None:
         raise SystemExit(f"❌ 名义太小，qty={qty} 低于最小步长 {step}")
     print(f"目标：每腿 qty={qty} 盎司（名义≈${qty * mark:.2f}，XAU 价格≈{mark}）")
 
-    first_leg, second_leg = _opening_plan()
-    print(f">>> [1/2] Variational 开空 {first_leg.underlying} {qty} …")
-    try:
-        r1 = await _market_order(var, first_leg, first_leg.open_side, qty)
-    except VariationalJurisdictionError as exc:
+    await _add_paired_qty(var, qty, step, expected_total=qty, label="开仓")
+
+
+async def cmd_topup(var: VariationalClient, target_notional: Decimal) -> None:
+    """把已有对冲仓加仓到每腿 target_notional（不动底仓，只补差额，保住持有计时）。"""
+    if target_notional > MAX_NOTIONAL:
+        raise SystemExit(f"❌ 目标名义 {target_notional} 超过上限 {MAX_NOTIONAL}")
+
+    xau_size, xaut_size, net = await _net_delta(var)
+    if xau_size <= 0 or xaut_size >= 0:
         raise SystemExit(
-            f"❌ Variational 交易被地区封锁：{exc}\n   需在放行 IP（Codex）执行。"
-        ) from exc
-    print(f"   成交：{_format_result(r1)}")
+            f"❌ 加仓要求已有 多XAU/空XAUT 底仓（当前 XAU={xau_size} XAUT={xaut_size}），"
+            f"方向不符请人工检查"
+        )
 
-    # RFQ accept 返回 rfq_id 即代表所报 qty 已全量成交；不依赖即时读仓（/positions 有延迟），
-    # 第二腿直接按已知 qty 配平，确保等盎司。成交确认仅作日志，延迟不致命。
-    filled_qty = qty
-    await _confirm_leg_filled(var, first_leg, qty)
+    mark, step = await _quote_xau_basis(var)
+    if abs(net) > step:
+        raise SystemExit(f"❌ 当前净 delta={net} 不中性，请先配平再加仓")
 
-    print(f">>> [2/2] Variational 开多 {second_leg.underlying} {filled_qty} …")
-    try:
-        r2 = await _market_order(var, second_leg, second_leg.open_side, filled_qty)
-        print(f"   成交：{_format_result(r2)}")
-    except VariationalJurisdictionError as exc:
-        print(f"❌ Variational 交易被地区封锁：{exc}\n   需在放行 IP（Codex）执行。")
-        try:
-            await _rollback_xaut(var, filled_qty)
-        except Exception as rollback_exc:  # noqa: BLE001
-            raise SystemExit(
-                f"❌ 第二腿失败且 XAUT 回滚失败：{rollback_exc}，请立即人工检查"
-            ) from rollback_exc
-        raise SystemExit("已回滚，未留裸仓；后续需在放行 IP（Codex）执行。") from exc
-    except Exception as exc:  # noqa: BLE001
-        print(f"❌ XAU 开仓失败：{exc}")
-        try:
-            await _rollback_xaut(var, filled_qty)
-        except Exception as rollback_exc:  # noqa: BLE001
-            raise SystemExit(
-                f"❌ 第二腿失败且 XAUT 回滚失败：{rollback_exc}，请立即人工检查"
-            ) from rollback_exc
-        raise SystemExit("已回滚，未留裸仓。") from exc
-
-    xau_size, xaut_size, net = await _await_net_delta(var, step)
-    neutral = abs(net) <= step
+    target_qty = _round_qty(target_notional / mark, step)
+    current_qty = min(abs(xau_size), abs(xaut_size))
+    add_qty = _round_qty(target_qty - current_qty, step)
+    if add_qty < step:
+        raise SystemExit(
+            f"❌ 目标 {target_qty} 盎司不高于当前 {current_qty}，无需加仓"
+        )
     print(
-        f"\n开仓完成：XAU={xau_size} XAUT={xaut_size} 净delta={net} "
-        f"{'✅ 中性' if neutral else '⚠️ 有敞口，请检查'}"
+        f"加仓：每腿 {current_qty}→{target_qty} 盎司（目标≈${target_qty * mark:.2f}），"
+        f"各腿补 {add_qty}（≈${add_qty * mark:.2f}），XAU 价格≈{mark}"
     )
+
+    await _add_paired_qty(var, add_qty, step, expected_total=target_qty, label="加仓")
 
 
 async def _close_leg(var: VariationalClient, leg: GoldLeg):
@@ -364,6 +410,8 @@ async def _main(args) -> None:
             await cmd_status(var)
         elif args.cmd == "open":
             await cmd_open(var, Decimal(str(args.notional)))
+        elif args.cmd == "topup":
+            await cmd_topup(var, Decimal(str(args.notional)))
         elif args.cmd == "close":
             await cmd_close(var)
     finally:
@@ -376,6 +424,8 @@ def main() -> None:
     sub.add_parser("status", help="查看两腿/资金费/积分")
     po = sub.add_parser("open", help="开仓（多 XAU + 空 XAUT）")
     po.add_argument("--notional", type=float, required=True, help="每腿名义（美元）")
+    pt = sub.add_parser("topup", help="加仓到每腿目标名义（不动底仓，只补差额）")
+    pt.add_argument("--notional", type=float, required=True, help="每腿目标名义（美元）")
     sub.add_parser("close", help="平掉两腿")
     args = p.parse_args()
     asyncio.run(_main(args))

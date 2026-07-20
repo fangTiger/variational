@@ -400,3 +400,33 @@ def test_close_flattens_xaut_before_xau_with_reduce_only() -> None:
         ("XAU", Side.SELL, Decimal("0.075"), True, "perpetual_rwa_future", 14400),
     ]
     assert var.sizes == {"XAU": Decimal("0"), "XAUT": Decimal("0")}
+
+
+def test_topup_adds_only_the_difference_to_reach_target() -> None:
+    """加仓只补差额、不动底仓：底仓 0.074/腿，加到目标应各腿补差、先薄腿 XAUT。"""
+    from tools import hedge_gold
+
+    var = FakeGoldVariational()
+    var.sizes["XAU"] = Decimal("0.074")
+    var.sizes["XAUT"] = Decimal("-0.074")
+
+    # 假 mark=4000 → 目标 1500 → target_qty=0.375；补 0.375-0.074=0.301
+    asyncio.run(hedge_gold.cmd_topup(var, Decimal("1500")))
+
+    opened = [(m, s, a, ro) for (m, s, a, ro, _it, _fi) in var.orders]
+    assert opened == [
+        ("XAUT", Side.SELL, Decimal("0.301"), False),
+        ("XAU", Side.BUY, Decimal("0.301"), False),
+    ]
+    assert var.sizes["XAU"] == Decimal("0.375")
+    assert var.sizes["XAUT"] == Decimal("-0.375")
+
+
+def test_topup_refuses_without_existing_hedged_base() -> None:
+    """空账户或方向不符时不得加仓。"""
+    from tools import hedge_gold
+
+    var = FakeGoldVariational()  # 两腿均为 0
+    with pytest.raises(SystemExit):
+        asyncio.run(hedge_gold.cmd_topup(var, Decimal("1500")))
+    assert var.orders == []
