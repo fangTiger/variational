@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -223,10 +224,43 @@ class VariationalClient(ExchangeAdapter):
 
     # ---- 统一接口实现 ----
 
-    async def get_position(self, underlying: str = "BTC") -> Position:
+    @staticmethod
+    def _position_matches_underlying(
+        info: dict[str, Any], underlying: str, *, exact: bool = False
+    ) -> bool:
+        """判断持仓是否属于目标 underlying；默认保留旧的子串匹配行为。"""
+        target = underlying.upper()
+        instrument = info.get("instrument", info.get("underlying", ""))
+        if not exact:
+            return target in str(instrument).upper()
+
+        candidates: list[str] = []
+        if isinstance(instrument, dict):
+            for key in ("underlying", "asset", "base_asset"):
+                value = instrument.get(key)
+                if value:
+                    candidates.append(str(value))
+        else:
+            text = str(instrument).upper()
+            if text == target:
+                return True
+            candidates.extend(
+                token for token in re.split(r"[^A-Z0-9]+", text) if token
+            )
+
+        direct_underlying = info.get("underlying")
+        if direct_underlying and not isinstance(direct_underlying, dict):
+            candidates.append(str(direct_underlying))
+
+        return any(candidate.upper() == target for candidate in candidates)
+
+    async def get_position(
+        self, underlying: str = "BTC", *, exact: bool = False
+    ) -> Position:
         """获取某标的持仓并归一化为有符号数量（qty 本身带符号：>0 多，<0 空）。
 
         market 参数传 underlying（如 "BTC"）。当前账户无持仓时返回 signed_size=0。
+        exact=True 时按 instrument.underlying 精确匹配，避免 XAU 误命中 XAUT。
         TODO(有持仓后确认): /positions 填充后核对 instrument/qty 的确切字段与嵌套。
         前端侦察显示结构含 position_info.instrument 与 qty。
         """
@@ -234,8 +268,7 @@ class VariationalClient(ExchangeAdapter):
         items = data if isinstance(data, list) else (data or {}).get("positions", [])
         for p in items:
             info = p.get("position_info", p)
-            instrument = str(info.get("instrument", info.get("underlying", "")))
-            if underlying.upper() in instrument.upper():
+            if self._position_matches_underlying(info, underlying, exact=exact):
                 qty = Decimal(str(info.get("qty", info.get("size", "0"))))
                 return Position(market=underlying, signed_size=qty, raw=p)
         return Position(market=underlying, signed_size=Decimal(0))
@@ -246,7 +279,7 @@ class VariationalClient(ExchangeAdapter):
         return MarketPrice(market, Decimal(str(q["bid"])), Decimal(str(q["ask"])))
 
     async def get_liquidation_info(
-        self, market: str, maint: Decimal = Decimal("0.1")
+        self, market: str, maint: Decimal = Decimal("0.1"), *, exact: bool = False
     ) -> tuple[Decimal, Decimal] | None:
         """计算 (mark, liquidation_price)。Variational 不直接给清仓价，用维持保证金(10%)推算。
 
@@ -254,12 +287,11 @@ class VariationalClient(ExchangeAdapter):
         （s 为有符号数量，空头 s<0；E=balance+upnl；M=标记价）
         """
         data = await self.get_positions()
-        items = data if isinstance(data, list) else []
+        items = data if isinstance(data, list) else (data or {}).get("positions", [])
         pos = None
         for p in items:
             info = p.get("position_info", p)
-            underlying = str(info.get("instrument", {}).get("underlying", "") if isinstance(info.get("instrument"), dict) else "")
-            if market.upper() in underlying.upper():
+            if self._position_matches_underlying(info, market, exact=exact):
                 pos = p
                 break
         if not pos:
@@ -281,22 +313,42 @@ class VariationalClient(ExchangeAdapter):
         return mark, liq
 
     @staticmethod
-    def _instrument(underlying: str) -> dict:
-        """构造永续 instrument 描述符（实测确认的固定结构，funding_interval_s 恒为 3600）。"""
+    def _instrument(
+        underlying: str,
+        instrument_type: str = "perpetual_future",
+        funding_interval_s: int = 3600,
+    ) -> dict:
+        """构造永续 instrument 描述符；默认值保持原 BTC 流程不变。"""
         return {
-            "funding_interval_s": 3600,
-            "instrument_type": "perpetual_future",
+            "funding_interval_s": funding_interval_s,
+            "instrument_type": instrument_type,
             "settlement_asset": "USDC",
             "underlying": underlying,
         }
 
-    async def request_quote(self, underlying: str, side: str, qty: Decimal) -> Any:
+    async def request_quote(
+        self,
+        underlying: str,
+        side: str,
+        qty: Decimal,
+        *,
+        instrument_type: str = "perpetual_future",
+        funding_interval_s: int = 3600,
+    ) -> Any:
         """询价。side ∈ {buy, sell}。返回含 quote_id/bid/ask/mark_price/margin_requirements。
 
         用 /quotes/indicative：它按用户注册可执行报价（含保证金计算），其 quote_id 可用于
         /quotes/accept 成交。/quotes/simple 是无状态价格预览，quote_id 不可成交。
         """
-        body = {"instrument": self._instrument(underlying), "qty": str(qty), "side": side}
+        body = {
+            "instrument": self._instrument(
+                underlying,
+                instrument_type=instrument_type,
+                funding_interval_s=funding_interval_s,
+            ),
+            "qty": str(qty),
+            "side": side,
+        }
         return await self._post("/quotes/indicative", body)
 
     async def accept_quote(
@@ -312,14 +364,27 @@ class VariationalClient(ExchangeAdapter):
         return await self._post("/quotes/accept", body)
 
     async def market_order(
-        self, market: str, side: Side, amount: Decimal, *, reduce_only: bool = False
+        self,
+        market: str,
+        side: Side,
+        amount: Decimal,
+        *,
+        reduce_only: bool = False,
+        instrument_type: str = "perpetual_future",
+        funding_interval_s: int = 3600,
     ):
         """RFQ 市价成交：/quotes/simple 询价 → /quotes/accept 成交。
 
         market 传 underlying（如 "BTC"）。amount 为合约数量（BTC 个数）。
         """
         s = "buy" if side is Side.BUY else "sell"
-        quote = await self.request_quote(market, s, amount)
+        quote = await self.request_quote(
+            market,
+            s,
+            amount,
+            instrument_type=instrument_type,
+            funding_interval_s=funding_interval_s,
+        )
         return await self.accept_quote(
             quote_id=quote["quote_id"],
             side=s,
