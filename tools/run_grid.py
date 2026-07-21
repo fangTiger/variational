@@ -52,6 +52,7 @@ async def _main(args) -> None:
         dry_run=not args.live,
         spacing_pct=args.spacing,
         unit_usd=args.unit,
+        levels_per_side=args.levels,
         max_inventory_usd=args.max_inv,
         adx_off=args.adx_off,
         adx_resume=args.adx_resume,
@@ -59,8 +60,8 @@ async def _main(args) -> None:
         poll_interval=args.interval,
     )
     engine = GridEngine(ext, config, fng_provider=_current_fng)
-    print(f"网格守护启动（{'实盘' if args.live else 'dry_run'}，格距{args.spacing*100:.1f}%，"
-          f"库存上限${args.max_inv}）。Ctrl+C 停止。")
+    print(f"网格守护启动（{'实盘' if args.live else 'dry_run'}，格距{args.spacing*100:.2f}%，"
+          f"每边{args.levels}档×${args.unit}，库存上限${args.max_inv}）。Ctrl+C 停止。")
     try:
         await engine.run_forever()
     finally:
@@ -73,6 +74,7 @@ def main() -> None:
     p.add_argument("--interval", type=float, default=60)
     p.add_argument("--spacing", type=float, default=0.02, help="格距（默认2%）")
     p.add_argument("--unit", type=float, default=50.0, help="每格名义USD")
+    p.add_argument("--levels", type=int, default=4, help="上下各挂几格（受库存上限与±5%限价约束）")
     p.add_argument("--max-inv", type=float, default=400.0, help="最大库存名义USD")
     p.add_argument("--adx-off", type=float, default=999.0,
                    help="ADX熔断阈值(默认999=禁用；调低才启用强趋势保护)")
