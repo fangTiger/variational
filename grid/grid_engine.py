@@ -15,8 +15,17 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from adapters.base import Side
+from grid.band import blocked_side_for_breach, compute_band, is_out_of_band
 from grid.grid_state import GridState, load_state, save_state
-from grid.regime import GridMode, adx, decide_mode, donchian_prev
+from grid.regime import (
+    GridMode,
+    _wilder_atr,
+    adx,
+    decide_mode,
+    donchian_prev,
+    drop_forming_candle,
+    trend_gate,
+)
 from grid.risk import hard_stop_triggered
 from infra.logger import get_logger
 
@@ -38,8 +47,12 @@ class GridConfig:
     poll_interval: float = 30.0
     dry_run: bool = True
     trend_aware: bool = False
+    band_k: float = 1.75
+    min_half_frac: float = 0.04
     hard_stop_dist: float = 0.12
+    recenter_bars: int = 3
     state_path: str = "data/grid_state.json"
+    exchange_tpsl: bool = True
 
 
 class GridEngine:
@@ -50,6 +63,11 @@ class GridEngine:
         self._orders: dict[int, dict] = {}   # level -> {"id":..., "side": Side}
         self._mode = GridMode.NEUTRAL        # 上一轮 regime（迟滞用）
         self._running = False
+        self._state: GridState | None = None
+        self._latest_atr = 0.0
+        self._neutral_bars = 0
+        self._current_closed_bar_key: int | None = None
+        self._last_recenter_bar_key: int | None = None
 
     @property
     def _log_step(self) -> float:
@@ -72,17 +90,32 @@ class GridEngine:
                     f"账户已有持仓 {pos.signed_size}(≈${notional:.0f})远超库存上限，疑似外部仓，请先平掉。")
             logger.warning("接管账户已有持仓 %s 作为网格库存", pos.signed_size)
         # 接管账户上已存在的本网格挂单（重启对账）
-        await self._adopt_open_orders()
+        open_orders = await self._adopt_open_orders()
+        if self.config.trend_aware:
+            self._state = load_state(self.config.state_path)
+            unsafe_without_state = (
+                pos.signed_size != 0
+                or open_orders is None
+                or bool(open_orders)
+            )
+            if self._state is None and unsafe_without_state:
+                # band_low/high=0 表示没有可安全恢复的有效 band；该状态不会自动重建。
+                self._state = GridState(0.0, 0.0, True, None, False)
+                save_state(self.config.state_path, self._state)
+                logger.error(
+                    "趋势感知状态缺失/损坏，且账户有仓、挂单或挂单状态未知；"
+                    "已 fail-closed，等待人工介入"
+                )
         logger.info("网格引擎连接完成（dry_run=%s，持仓=%s，接管挂单=%d）",
                     self.config.dry_run, pos.signed_size, len(self._orders))
 
-    async def _adopt_open_orders(self) -> None:
+    async def _adopt_open_orders(self) -> list | None:
         """把交易所上已有的挂单按格价归入本引擎状态（重启接管）。"""
         try:
             orders = await self.ext.get_open_orders(self.config.market)
         except Exception as exc:  # noqa: BLE001
             logger.warning("查询挂单失败：%s", exc)
-            return
+            return None
         for o in orders:
             price = float(getattr(o, "price", 0) or 0)
             if price <= 0:
@@ -90,6 +123,7 @@ class GridEngine:
             lv = self._price_level(price)
             side = Side.BUY if "BUY" in str(getattr(o, "side", "")).upper() else Side.SELL
             self._orders[lv] = {"id": getattr(o, "id", None), "side": side}
+        return orders
 
     async def _inv(self) -> tuple[Decimal, float]:
         pos = await self.ext.get_position(self.config.market)
@@ -97,7 +131,224 @@ class GridEngine:
         price = float(stats.data.mark_price)
         return pos.signed_size, price
 
+    @staticmethod
+    def _has_valid_band(state: GridState) -> bool:
+        """判断状态里是否有可使用的 band；0/0 是 fail-closed 哨兵。"""
+        return state.band_low > 0 and state.band_high > state.band_low
+
+    @staticmethod
+    def _is_non_reduce_only_order(order) -> bool:
+        """TPSL/条件单与 reduce-only 单不是重建 band 的阻碍。"""
+        if bool(getattr(order, "reduce_only", False)):
+            return False
+        order_type = str(getattr(order, "type", "") or "").upper()
+        return "TPSL" not in order_type and "CONDITIONAL" not in order_type
+
+    @staticmethod
+    def _side_is_blocked(side: Side, blocked_side: str | None) -> bool:
+        """blocked_side='BOTH' 供趋势 OFF 使用，禁止双侧任何补单。"""
+        return blocked_side == "BOTH" or side.value == blocked_side
+
+    def _count_neutral_bar(self, mode: GridMode) -> None:
+        """按已收盘 K 线去重累计连续 NEUTRAL，避免 30 秒轮询重复计数。"""
+        if mode is not GridMode.NEUTRAL:
+            self._neutral_bars = 0
+            self._last_recenter_bar_key = self._current_closed_bar_key
+            return
+        if self._current_closed_bar_key is None:
+            # 单元测试或独立调用没有 candle key 时，每次调用视为一根新 bar。
+            self._neutral_bars += 1
+            return
+        if self._current_closed_bar_key != self._last_recenter_bar_key:
+            self._neutral_bars += 1
+            self._last_recenter_bar_key = self._current_closed_bar_key
+
+    async def _advance_band(self, mark: float, mode: GridMode) -> None:
+        """推进 ACTIVE/FROZEN 两态；既有 band 在越界时绝不随 mark 移动。"""
+        if self._state is None:
+            if mode is not GridMode.NEUTRAL:
+                return
+            low, high = compute_band(
+                mark,
+                self._latest_atr,
+                self.config.band_k,
+                self.config.min_half_frac,
+            )
+            self._state = GridState(low, high, False, None, False)
+            save_state(self.config.state_path, self._state)
+            self._neutral_bars = 0
+            self._last_recenter_bar_key = self._current_closed_bar_key
+            logger.info("新建固定 band：[%.2f, %.2f]", low, high)
+            return
+
+        state = self._state
+        if state.halted:
+            return
+
+        if not state.frozen:
+            if (
+                self._has_valid_band(state)
+                and is_out_of_band(mark, state.band_low, state.band_high)
+            ):
+                blocked_side = blocked_side_for_breach(
+                    mark,
+                    state.band_low,
+                    state.band_high,
+                )
+                # 先持久化 FROZEN，避免撤单网络调用期间崩溃后按现价重建。
+                self._state = GridState(
+                    state.band_low,
+                    state.band_high,
+                    True,
+                    blocked_side,
+                    state.halted,
+                )
+                save_state(self.config.state_path, self._state)
+                self._neutral_bars = 0
+                self._last_recenter_bar_key = self._current_closed_bar_key
+                try:
+                    if self.config.dry_run:
+                        for level in list(self._orders):
+                            await self._cancel(level, why="band 越界冻结")
+                    else:
+                        await self.ext.cancel_grid_orders(self.config.market)
+                        self._orders.clear()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("band 越界后撤网格单失败，保持 FROZEN：%s", exc)
+                logger.warning(
+                    "mark=%.2f 越出固定 band [%.2f, %.2f]，冻结 %s；band 中心不追价",
+                    mark,
+                    state.band_low,
+                    state.band_high,
+                    blocked_side,
+                )
+            return
+
+        # 0/0 表示 connect 时无法恢复有效 band 的 fail-closed 状态，只能人工处理。
+        if not self._has_valid_band(state):
+            return
+
+        self._count_neutral_bar(mode)
+        if self._neutral_bars < max(1, self.config.recenter_bars):
+            return
+
+        pos = await self.ext.get_position(self.config.market)
+        if pos.signed_size != 0:
+            return
+        try:
+            open_orders = await self.ext.get_open_orders(self.config.market)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("重建 band 前查询挂单失败，保持 FROZEN：%s", exc)
+            return
+        if any(self._is_non_reduce_only_order(order) for order in open_orders):
+            return
+
+        low, high = compute_band(
+            mark,
+            self._latest_atr,
+            self.config.band_k,
+            self.config.min_half_frac,
+        )
+        self._state = GridState(low, high, False, None, False)
+        save_state(self.config.state_path, self._state)
+        self._neutral_bars = 0
+        self._last_recenter_bar_key = self._current_closed_bar_key
+        logger.info("冷却满足，重建固定 band：[%.2f, %.2f]", low, high)
+
+    async def _run_once_trend_aware(self) -> str:
+        """趋势感知单轮：硬止损前置，再做门控、band 推进与受限铺单。"""
+        if await self._check_hard_stop():
+            return "HALTED：硬止损已触发"
+        if self._state is not None and self._state.halted:
+            return "HALTED：禁止新增报价"
+
+        r = await self.ext._client.info.get_candles_history(
+            market_name=self.config.market,
+            candle_type="trades",
+            interval="PT1H",
+            limit=self.config.candle_lookback,
+        )
+        candles = sorted(r.data, key=lambda k: int(k.timestamp))
+        highs = drop_forming_candle([float(k.high) for k in candles])
+        lows = drop_forming_candle([float(k.low) for k in candles])
+        closes = drop_forming_candle([float(k.close) for k in candles])
+        self._current_closed_bar_key = (
+            int(candles[-2].timestamp) if len(candles) >= 2 else None
+        )
+
+        mode = trend_gate(
+            highs,
+            lows,
+            closes,
+            adx_off=self.config.adx_off,
+            adx_resume=self.config.adx_resume,
+            prev_mode=self._mode,
+            adx_period=self.config.adx_period,
+        )
+        self._mode = mode
+        atr_values = _wilder_atr(highs, lows, closes, self.config.adx_period)
+        self._latest_atr = next(
+            (float(value) for value in reversed(atr_values) if value is not None),
+            0.0,
+        )
+
+        inv, mark = await self._inv()
+        inv_usd = float(inv) * mark
+        await self._advance_band(mark, mode)
+
+        state = self._state
+        if state is not None and state.halted:
+            return "HALTED：禁止新增报价"
+
+        frozen = state is not None and state.frozen
+        valid_active = (
+            state is not None
+            and not state.frozen
+            and self._has_valid_band(state)
+        )
+        if mode is GridMode.OFF:
+            blocked_side = "BOTH"
+        elif frozen:
+            # fail-closed 哨兵没有可判定的突破方向，必须冻结双侧。
+            blocked_side = state.blocked_side or "BOTH"
+        else:
+            blocked_side = state.blocked_side if state is not None else "BOTH"
+
+        logger.info(
+            "trend-aware mark=%.0f mode=%s inv=%s(≈$%.0f) band=%s frozen=%s blocked=%s",
+            mark,
+            mode.value,
+            inv,
+            inv_usd,
+            (
+                f"[{state.band_low:.0f},{state.band_high:.0f}]"
+                if state is not None and self._has_valid_band(state)
+                else None
+            ),
+            frozen,
+            blocked_side,
+        )
+
+        if mode is GridMode.OFF or not valid_active:
+            await self._handle_fills(inv_usd, blocked_side=blocked_side)
+            return (
+                "OFF：暂停新增报价"
+                if mode is GridMode.OFF
+                else "FROZEN：仅处理已有订单"
+            )
+
+        await self._handle_fills(inv_usd, blocked_side=state.blocked_side)
+        return await self._maintain_ladder(
+            mark,
+            inv_usd,
+            band=(state.band_low, state.band_high),
+            blocked_side=state.blocked_side,
+        )
+
     async def run_once(self) -> str:
+        if self.config.trend_aware:
+            return await self._run_once_trend_aware()
+
         # 指标 + regime
         r = await self.ext._client.info.get_candles_history(
             market_name=self.config.market, candle_type="trades",
@@ -169,37 +420,58 @@ class GridEngine:
                 else:                             # 卖成交 → 下一格挂买
                     next_level, next_side = lv - 1, Side.BUY
                     fill_why = f"{lv}卖成交→挂买"
-                if next_side.value == blocked_side:
+                if self._side_is_blocked(next_side, blocked_side):
                     continue
                 qty = filled if filled > 0 else None
                 await self._place(next_level, next_side, inv_usd, why=fill_why, qty=qty)
             elif status in ("EXPIRED", "CANCELLED"):
-                if rec["side"].value == blocked_side:
+                if self._side_is_blocked(rec["side"], blocked_side):
                     continue
                 await self._place(lv, rec["side"], inv_usd, why=f"格{lv}{status}重挂")
             else:
                 logger.warning("格%d 订单 %s 终态=%s，仅移除不翻单", lv, rec["id"], status or "未知")
 
-    async def _maintain_ladder(self, price: float, inv_usd: float) -> str:
+    async def _maintain_ladder(
+        self,
+        price: float,
+        inv_usd: float,
+        band: tuple[float, float] | None = None,
+        blocked_side: str | None = None,
+    ) -> str:
         center = self._price_level(price)
         n = self.config.levels_per_side
         acted = []
+
+        def allowed(level: int, side: Side) -> bool:
+            if self._side_is_blocked(side, blocked_side):
+                return False
+            if band is None:
+                return True
+            level_price = float(self._level_price(level))
+            return band[0] <= level_price <= band[1]
+
         # 下方挂买（_place 内部按库存上限守卫）
         for lv in range(center - 1, center - n - 1, -1):
-            if lv not in self._orders:
+            if lv not in self._orders and allowed(lv, Side.BUY):
                 m = await self._place(lv, Side.BUY, inv_usd, why="补买格")
                 if m:
                     acted.append(m)
         # 上方挂卖
         for lv in range(center + 1, center + n + 1):
-            if lv not in self._orders:
+            if lv not in self._orders and allowed(lv, Side.SELL):
                 m = await self._place(lv, Side.SELL, inv_usd, why="补卖格")
                 if m:
                     acted.append(m)
-        # 撤掉远离区间的陈单
-        for lv in list(self._orders.keys()):
-            if lv < center - n - 2 or lv > center + n + 2:
-                await self._cancel(lv, why="撤陈单")
+        # 撤掉远离中心、落在 band 外或属于冻结方向的陈单。
+        for lv, rec in list(self._orders.items()):
+            stale = lv < center - n - 2 or lv > center + n + 2
+            constrained_out = (
+                band is not None
+                and not (band[0] <= float(self._level_price(lv)) <= band[1])
+            )
+            side_blocked = self._side_is_blocked(rec["side"], blocked_side)
+            if stale or constrained_out or side_blocked:
+                await self._cancel(lv, why="撤陈单/越界单/冻结侧单")
         return "；".join(acted) if acted else "阶梯已就位"
 
     def _within_cap(self, side: Side, inv_usd: float) -> bool:
@@ -290,7 +562,7 @@ class GridEngine:
 
     async def _go_off_confirmed(self, inv: Decimal) -> bool:
         """持久化急停并反复减仓，连续两次确认空仓后才撤 TPSL。"""
-        current_state = load_state(self.config.state_path)
+        current_state = self._state or load_state(self.config.state_path)
         if current_state is None:
             halted_state = GridState(
                 band_low=0.0,
@@ -307,6 +579,7 @@ class GridEngine:
                 blocked_side=current_state.blocked_side,
                 halted=True,
             )
+        self._state = halted_state
         save_state(self.config.state_path, halted_state)
 
         logger.critical("确认平仓链启动：初始持仓=%s，已持久化 halted=true", inv)
