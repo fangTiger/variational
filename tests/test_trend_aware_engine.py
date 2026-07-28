@@ -369,6 +369,54 @@ def test_connect_restores_persisted_band(tmp_path) -> None:
     assert eng._state == expected
 
 
+def test_default_path_unchanged(tmp_path, monkeypatch) -> None:
+    """trend_aware=False 时 run_once 走原 decide_mode 路径且不触碰新逻辑。"""
+
+    class GuardExt(RunExt):
+        async def get_liquidation_info(self, market):
+            raise AssertionError("默认路径不应查清算价")
+
+        async def place_position_stop_loss(self, market, signed_size, trigger_price):
+            raise AssertionError("默认路径不应维护 TPSL")
+
+    async def fail_new_logic(*args, **kwargs):
+        raise AssertionError("默认路径不应进入趋势感知逻辑")
+
+    def fail_state_io(*args, **kwargs):
+        raise AssertionError("默认路径不应读写趋势感知状态")
+
+    decide_calls = []
+
+    def fake_decide_mode(**kwargs):
+        decide_calls.append(kwargs)
+        return GridMode.NEUTRAL
+
+    state_path = tmp_path / "grid_state.json"
+    ext = GuardExt(positions=[0.0])
+    eng = GridEngine(
+        ext,
+        GridConfig(
+            dry_run=True,
+            trend_aware=False,
+            adx_period=1,
+            donchian_period=1,
+            levels_per_side=1,
+            state_path=str(state_path),
+        ),
+    )
+    monkeypatch.setattr(eng, "_run_once_trend_aware", fail_new_logic)
+    monkeypatch.setattr(eng, "_check_hard_stop", fail_new_logic)
+    monkeypatch.setattr(eng, "_maintain_tpsl", fail_new_logic)
+    monkeypatch.setattr("grid.grid_engine.load_state", fail_state_io)
+    monkeypatch.setattr("grid.grid_engine.save_state", fail_state_io)
+    monkeypatch.setattr("grid.grid_engine.decide_mode", fake_decide_mode)
+
+    asyncio.run(eng.run_once())
+
+    assert len(decide_calls) == 1
+    assert not state_path.exists()
+
+
 def test_run_once_checks_hard_stop_before_candles(tmp_path) -> None:
     """硬止损触发后本轮立即返回，不能先拉 K 线或继续铺单。"""
     ext = RunExt(
