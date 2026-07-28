@@ -25,10 +25,13 @@ import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from adapters.extended_client import ExtendedClient  # noqa: E402
+from grid.grid_state import load_state  # noqa: E402
 from grid.regime import GridMode, adx, decide_mode, donchian_prev  # noqa: E402
+from grid.risk import dist_to_liq_pct  # noqa: E402
 
 _FILE = Path(__file__).resolve().parent.parent / "data" / "grid_monitor.jsonl"
 _BASELINE = Path(__file__).resolve().parent.parent / "data" / "grid_baseline.json"
+_STATE = Path(__file__).resolve().parent.parent / "data" / "grid_state.json"
 MARKET = "BTC-USD"
 
 
@@ -38,6 +41,37 @@ def _process_alive() -> bool:
         return bool(r.stdout.strip())
     except Exception:  # noqa: BLE001
         return False
+
+
+def _read_grid_state(path: str | Path = _STATE) -> dict:
+    """读取引擎持久化状态；缺失或损坏时返回空监控字段。"""
+    state = load_state(path)
+    if state is None:
+        return {
+            "frozen": None,
+            "blocked_side": None,
+            "halted": None,
+            "band_low": None,
+            "band_high": None,
+        }
+    return {
+        "frozen": state.frozen,
+        "blocked_side": state.blocked_side,
+        "halted": state.halted,
+        "band_low": state.band_low,
+        "band_high": state.band_high,
+    }
+
+
+def _liquidation_distance_pct(
+    liquidation_info,
+    signed_size: float,
+) -> float | None:
+    """计算距强平价比例；空仓或交易所未返回数据时记为 None。"""
+    if liquidation_info is None or signed_size == 0:
+        return None
+    mark, liq = liquidation_info
+    return dist_to_liq_pct(float(mark), float(liq), signed_size)
 
 
 async def _snapshot() -> dict:
@@ -68,6 +102,8 @@ async def _snapshot() -> dict:
         mode = decide_mode(adx_val=a[-1], close=price, donchian_up=up[-1], donchian_lo=lo[-1],
                            adx_off=999.0)
         inv = float(pos.signed_size)
+        liquidation_info = await ext.get_liquidation_info(MARKET)
+        liquidation_distance = _liquidation_distance_pct(liquidation_info, inv)
     finally:
         await ext.close()
 
@@ -79,6 +115,7 @@ async def _snapshot() -> dict:
         _BASELINE.parent.mkdir(exist_ok=True)
         _BASELINE.write_text(json.dumps({"equity": equity, "ts": time.time()}))
 
+    grid_state = _read_grid_state()
     return {
         "ts": time.time(),
         "alive": _process_alive(),
@@ -89,6 +126,8 @@ async def _snapshot() -> dict:
         "price": price,
         "adx": round(a[-1], 1) if a[-1] else None,
         "mode": mode.value,
+        **grid_state,
+        "dist_to_liq_pct": liquidation_distance,
     }
 
 
@@ -123,6 +162,22 @@ def _report() -> None:
     print(f"  当前权益 ${cur['equity']:.2f}  自起始 PnL ${cur['pnl_since_start']:+.2f}")
     print(f"  当前库存 {cur['inv_btc']:+.5f} BTC(≈${cur['inv_usd']:+.0f})  现价 ${cur['price']:.0f}")
     print(f"  当前 ADX {cur['adx']} / 模式 {cur['mode']}")
+    band_low = cur.get("band_low")
+    band_high = cur.get("band_high")
+    band = (
+        f"[{band_low:.0f}, {band_high:.0f}]"
+        if band_low is not None and band_high is not None
+        else "None"
+    )
+    liquidation_distance = cur.get("dist_to_liq_pct")
+    liquidation_text = (
+        f"{liquidation_distance:.1%}" if liquidation_distance is not None else "None"
+    )
+    print(
+        f"  趋势状态 frozen={cur.get('frozen')} "
+        f"blocked_side={cur.get('blocked_side')} halted={cur.get('halted')} "
+        f"band={band} 距强平 {liquidation_text}"
+    )
     print(f"  权益最大回撤 ${max_dd:.2f}  OFF占比 {off_ratio:.0%}  进程存活率 {alive_ratio:.0%}")
     if not cur["alive"]:
         print("  ⚠️ 最新一次检测进程未存活，请检查 launchd！")

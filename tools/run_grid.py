@@ -38,37 +38,8 @@ def _current_fng() -> int | None:
         return _fng_cache["val"]
 
 
-async def _main(args) -> None:
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv()
-    except ImportError:
-        pass
-
-    ext = ExtendedClient.from_env(prefix=args.account)
-    print(f"网格账户前缀：{args.account}")
-    config = GridConfig(
-        dry_run=not args.live,
-        spacing_pct=args.spacing,
-        unit_usd=args.unit,
-        levels_per_side=args.levels,
-        max_inventory_usd=args.max_inv,
-        adx_off=args.adx_off,
-        adx_resume=args.adx_resume,
-        donchian_period=args.donchian,
-        poll_interval=args.interval,
-    )
-    engine = GridEngine(ext, config, fng_provider=_current_fng)
-    print(f"网格守护启动（{'实盘' if args.live else 'dry_run'}，格距{args.spacing*100:.2f}%，"
-          f"每边{args.levels}档×${args.unit}，库存上限${args.max_inv}）。Ctrl+C 停止。")
-    try:
-        await engine.run_forever()
-    finally:
-        await ext.close()
-
-
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器。"""
     p = argparse.ArgumentParser(description="网格守护进程")
     p.add_argument("--live", action="store_true", help="真实下单（默认 dry_run）")
     p.add_argument("--interval", type=float, default=60)
@@ -84,7 +55,56 @@ def main() -> None:
                    help="Donchian通道周期(小时)，仅供日志，不再触发急停")
     p.add_argument("--account", default="X10_GRID",
                    help="账户环境变量前缀（默认X10_GRID网格账户；用X10则跑farm账户）")
-    args = p.parse_args()
+    p.add_argument("--trend-aware", action="store_true",
+                   help="启用有界趋势感知(默认关闭=现有行为)")
+    p.add_argument("--band-k", type=float, default=1.75, help="band 半宽=k×ATR")
+    p.add_argument("--hard-stop-dist", type=float, default=0.12,
+                   help="距强平价触发硬止损的比例")
+    return p
+
+
+def _grid_config(args: argparse.Namespace) -> GridConfig:
+    """把命令行参数转换为网格配置。"""
+    return GridConfig(
+        dry_run=not args.live,
+        spacing_pct=args.spacing,
+        unit_usd=args.unit,
+        levels_per_side=args.levels,
+        max_inventory_usd=args.max_inv,
+        adx_off=args.adx_off,
+        adx_resume=args.adx_resume,
+        donchian_period=args.donchian,
+        poll_interval=args.interval,
+        trend_aware=args.trend_aware,
+        band_k=args.band_k,
+        hard_stop_dist=args.hard_stop_dist,
+    )
+
+
+async def _main(args) -> None:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
+    ext = ExtendedClient.from_env(prefix=args.account)
+    print(f"网格账户前缀：{args.account}")
+    config = _grid_config(args)
+    engine = GridEngine(ext, config, fng_provider=_current_fng)
+    trend_mode = "trend-aware" if args.trend_aware else "legacy"
+    print(f"网格守护启动（{'实盘' if args.live else 'dry_run'}，{trend_mode}，"
+          f"格距{args.spacing*100:.2f}%，"
+          f"每边{args.levels}档×${args.unit}，库存上限${args.max_inv}）。Ctrl+C 停止。")
+    try:
+        await engine.run_forever()
+    finally:
+        await ext.close()
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
     asyncio.run(_main(args))
 
 
