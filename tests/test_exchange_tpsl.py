@@ -5,9 +5,15 @@
 """
 from __future__ import annotations
 
+import asyncio
+from decimal import Decimal
 from types import SimpleNamespace
 
+from adapters.base import Position
 from adapters.extended_client import filter_grid_orders  # 纯函数：从开放单里挑出该撤的网格单
+from grid.grid_engine import GridConfig, GridEngine
+from grid.grid_state import GridState
+from grid.regime import GridMode
 
 
 def _o(oid, reduce_only=False, otype="LIMIT"):
@@ -20,3 +26,78 @@ def test_filter_keeps_tpsl_and_reduce_only() -> None:
     to_cancel = filter_grid_orders(orders)
     ids = {getattr(o, "id") for o in to_cancel}
     assert ids == {"g1", "g2"}  # 只撤普通网格单，保留 TPSL 与 reduce_only
+
+
+def test_tpsl_blocks_new_risk_when_unconfirmed(tmp_path, monkeypatch) -> None:
+    """TPSL 挂单失败时仍处理已有订单，但本轮不能铺新阶梯。"""
+
+    class NoTpslExt:
+        def __init__(self) -> None:
+            self.tpsl_calls = []
+            self.open_orders_calls = 0
+            self.placed = []
+            self._client = SimpleNamespace(info=self)
+
+        async def get_position(self, market):
+            return Position(market=market, signed_size=Decimal("0.01"))
+
+        async def get_liquidation_info(self, market):
+            return Decimal("100"), Decimal("80")
+
+        async def get_candles_history(self, **kwargs):
+            candles = [
+                SimpleNamespace(
+                    timestamp=str(i),
+                    high=101.0,
+                    low=99.0,
+                    close=100.0,
+                )
+                for i in range(4)
+            ]
+            return SimpleNamespace(data=candles)
+
+        async def get_market_statistics(self, **kwargs):
+            return SimpleNamespace(data=SimpleNamespace(mark_price=100.0))
+
+        async def place_position_stop_loss(
+            self,
+            market,
+            signed_size,
+            trigger_price,
+        ):
+            self.tpsl_calls.append((market, signed_size, trigger_price))
+            raise RuntimeError("tpsl rejected")
+
+        async def get_open_orders(self, market):
+            self.open_orders_calls += 1
+            return []
+
+        async def get_orders_history(self, market, limit=100):
+            return []
+
+        async def place_limit_order(self, market, side, amount, price, **kwargs):
+            self.placed.append((market, side, amount, price, kwargs))
+            return SimpleNamespace(data=SimpleNamespace(id="unexpected", status="NEW"))
+
+    ext = NoTpslExt()
+    cfg = GridConfig(
+        dry_run=False,
+        trend_aware=True,
+        exchange_tpsl=True,
+        state_path=str(tmp_path / "s.json"),
+    )
+    eng = GridEngine(ext, cfg)
+    eng._state = GridState(95.0, 105.0, False, None, False)
+    monkeypatch.setattr(
+        "grid.grid_engine.trend_gate",
+        lambda *args, **kwargs: GridMode.NEUTRAL,
+    )
+
+    result = asyncio.run(eng.run_once())
+
+    assert ext.tpsl_calls == [
+        (cfg.market, Decimal("0.01"), Decimal("88.00")),
+    ]
+    assert ext.open_orders_calls == 1  # _handle_fills 仍处理已有订单
+    assert ext.placed == []            # _maintain_ladder 未铺新单
+    assert result == "TPSL 未确认：仅处理已有订单"

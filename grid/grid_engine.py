@@ -255,6 +255,41 @@ class GridEngine:
         self._last_recenter_bar_key = self._current_closed_bar_key
         logger.info("冷却满足，重建固定 band：[%.2f, %.2f]", low, high)
 
+    async def _maintain_tpsl(self, mark: float, signed_size: Decimal) -> bool:
+        """维护交易所端整仓止损；本任务以挂单调用成功视为已确认。"""
+        if not self.config.exchange_tpsl or signed_size == 0:
+            return True
+
+        mark_decimal = Decimal(str(mark))
+        stop_distance = Decimal(str(self.config.hard_stop_dist))
+        # 直接使用硬止损距离边界：与本地 hard stop 相当，不晚于该保护阈值。
+        if signed_size > 0:
+            trigger_price = mark_decimal * (Decimal("1") - stop_distance)
+        else:
+            trigger_price = mark_decimal * (Decimal("1") + stop_distance)
+
+        try:
+            await self.ext.place_position_stop_loss(
+                self.config.market,
+                signed_size,
+                trigger_price,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "交易所整仓 TPSL 维护失败：持仓=%s 触发价=%s；本轮禁止新增风险仓：%s",
+                signed_size,
+                trigger_price,
+                exc,
+            )
+            return False
+
+        logger.info(
+            "交易所整仓 TPSL 已挂出并按 UNTRIGGERED 确认：持仓=%s 触发价=%s",
+            signed_size,
+            trigger_price,
+        )
+        return True
+
     async def _run_once_trend_aware(self) -> str:
         """趋势感知单轮：硬止损前置，再做门控、band 推进与受限铺单。"""
         if await self._check_hard_stop():
@@ -300,6 +335,7 @@ class GridEngine:
         if state is not None and state.halted:
             return "HALTED：禁止新增报价"
 
+        tpsl_confirmed = await self._maintain_tpsl(mark, inv)
         frozen = state is not None and state.frozen
         valid_active = (
             state is not None
@@ -338,6 +374,8 @@ class GridEngine:
             )
 
         await self._handle_fills(inv_usd, blocked_side=state.blocked_side)
+        if not tpsl_confirmed:
+            return "TPSL 未确认：仅处理已有订单"
         return await self._maintain_ladder(
             mark,
             inv_usd,
