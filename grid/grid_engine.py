@@ -10,9 +10,13 @@ dry_run 只打印意图不真正挂单。
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import time
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 
 from adapters.base import Side
 from grid.band import blocked_side_for_breach, compute_band, is_out_of_band
@@ -25,8 +29,9 @@ from grid.regime import (
     donchian_prev,
     drop_forming_candle,
     trend_gate,
+    close_slope,
 )
-from grid.risk import hard_stop_triggered
+from grid.risk import dist_to_liq_pct, hard_stop_triggered
 from infra.logger import get_logger
 
 logger = get_logger("grid_engine")
@@ -68,6 +73,12 @@ class GridEngine:
         self._neutral_bars = 0
         self._current_closed_bar_key: int | None = None
         self._last_recenter_bar_key: int | None = None
+        self._last_dist_to_liq: float | None = None
+        self._last_highs: list[float] = []
+        self._last_lows: list[float] = []
+        self._last_closes: list[float] = []
+        self._last_mark: float | None = None
+        self._last_inv: Decimal | float | None = None
 
     @property
     def _log_step(self) -> float:
@@ -294,11 +305,89 @@ class GridEngine:
         )
         return True
 
+    async def _dump_live(
+        self,
+        mark: float | None,
+        mode: GridMode,
+        inv: Decimal | float | None,
+        closes: list[float],
+    ) -> None:
+        """把趋势感知单轮状态原子写入面板读取的 live 快照。"""
+        state = self._state
+        live_path = Path(self.config.state_path).parent / "grid_live.json"
+        live_path.parent.mkdir(parents=True, exist_ok=True)
+
+        adx_val = None
+        if (
+            self._last_highs
+            and self._last_lows
+            and len(self._last_highs) == len(closes)
+            and len(self._last_lows) == len(closes)
+        ):
+            adx_values = adx(
+                self._last_highs,
+                self._last_lows,
+                closes,
+                self.config.adx_period,
+            )
+            adx_val = adx_values[-1] if adx_values else None
+
+        mark_float = float(mark) if mark is not None else None
+        inv_btc = float(inv) if inv is not None else None
+        payload = {
+            "ts": time.time(),
+            "mark": mark_float,
+            "mode": mode.value,
+            "adx": adx_val,
+            "slope_short": close_slope(closes, 6),
+            "slope_long": close_slope(closes, 24),
+            "atr_pct": (
+                self._latest_atr / mark_float
+                if mark_float is not None and mark_float > 0
+                else None
+            ),
+            "inv_btc": inv_btc,
+            "inv_usd": (
+                inv_btc * mark_float
+                if inv_btc is not None and mark_float is not None
+                else None
+            ),
+            "band_low": state.band_low if state is not None else None,
+            "band_high": state.band_high if state is not None else None,
+            "frozen": state.frozen if state is not None else False,
+            "blocked_side": state.blocked_side if state is not None else None,
+            "halted": state.halted if state is not None else False,
+            "dist_to_liq_pct": self._last_dist_to_liq,
+            "cfg": {
+                "unit": self.config.unit_usd,
+                "levels": self.config.levels_per_side,
+                "max_inv": self.config.max_inventory_usd,
+                "spacing": self.config.spacing_pct,
+                "hard_stop_dist": self.config.hard_stop_dist,
+                "adx_off": self.config.adx_off,
+            },
+        }
+        tmp = live_path.with_suffix(live_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, live_path)
+
     async def _run_once_trend_aware(self) -> str:
         """趋势感知单轮：硬止损前置，再做门控、band 推进与受限铺单。"""
         if await self._check_hard_stop():
+            await self._dump_live(
+                mark=self._last_mark,
+                mode=self._mode,
+                inv=self._last_inv,
+                closes=self._last_closes,
+            )
             return "HALTED：硬止损已触发"
         if self._state is not None and self._state.halted:
+            await self._dump_live(
+                mark=self._last_mark,
+                mode=self._mode,
+                inv=self._last_inv,
+                closes=self._last_closes,
+            )
             return "HALTED：禁止新增报价"
 
         r = await self.ext._client.info.get_candles_history(
@@ -311,6 +400,9 @@ class GridEngine:
         highs = drop_forming_candle([float(k.high) for k in candles])
         lows = drop_forming_candle([float(k.low) for k in candles])
         closes = drop_forming_candle([float(k.close) for k in candles])
+        self._last_highs = highs
+        self._last_lows = lows
+        self._last_closes = closes
         self._current_closed_bar_key = (
             int(candles[-2].timestamp) if len(candles) >= 2 else None
         )
@@ -332,11 +424,14 @@ class GridEngine:
         )
 
         inv, mark = await self._inv()
+        self._last_inv = inv
+        self._last_mark = mark
         inv_usd = float(inv) * mark
         await self._advance_band(mark, mode)
 
         state = self._state
         if state is not None and state.halted:
+            await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
             return "HALTED：禁止新增报价"
 
         tpsl_confirmed = await self._maintain_tpsl(mark, inv)
@@ -371,6 +466,7 @@ class GridEngine:
 
         if mode is GridMode.OFF or not valid_active:
             await self._handle_fills(inv_usd, blocked_side=blocked_side)
+            await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
             return (
                 "OFF：暂停新增报价"
                 if mode is GridMode.OFF
@@ -379,13 +475,16 @@ class GridEngine:
 
         await self._handle_fills(inv_usd, blocked_side=state.blocked_side)
         if not tpsl_confirmed:
+            await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
             return "TPSL 未确认：仅处理已有订单"
-        return await self._maintain_ladder(
+        result = await self._maintain_ladder(
             mark,
             inv_usd,
             band=(state.band_low, state.band_high),
             blocked_side=state.blocked_side,
         )
+        await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
+        return result
 
     async def run_once(self) -> str:
         if self.config.trend_aware:
@@ -572,11 +671,14 @@ class GridEngine:
         """检查距强平价距离；空仓与有仓但缺失清算信息必须区别处理。"""
         pos = await self.ext.get_position(self.config.market)
         signed_size = pos.signed_size
+        self._last_inv = signed_size
         if signed_size == 0:
+            self._last_dist_to_liq = None
             return False
 
         liquidation_info = await self.ext.get_liquidation_info(self.config.market)
         if liquidation_info is None:
+            self._last_dist_to_liq = None
             logger.error(
                 "硬止损检查进入 fail-safe：当前有仓位 %s，但无法取得清算价",
                 signed_size,
@@ -584,6 +686,12 @@ class GridEngine:
             return False
 
         mark, liq = liquidation_info
+        self._last_mark = float(mark)
+        self._last_dist_to_liq = dist_to_liq_pct(
+            float(mark),
+            float(liq),
+            float(signed_size),
+        )
         if not hard_stop_triggered(
             float(mark),
             float(liq),
