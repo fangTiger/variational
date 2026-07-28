@@ -27,14 +27,33 @@ from decimal import ROUND_DOWN, Decimal
 from x10.clients.rest.rest_api_client import RestApiClient
 from x10.config import get_config_by_name
 from x10.core.stark_account import StarkPerpetualAccount
-from x10.models.order import OrderSide, OrderType, TimeInForce
-from x10.signing.order_object import create_order_object
+from x10.models.order import (
+    OrderPriceType,
+    OrderSide,
+    OrderTpslType,
+    OrderTriggerPriceType,
+    OrderType,
+    TimeInForce,
+)
+from x10.signing.order_object import OrderTpslTriggerParam, create_order_object
 from x10.utils.order import get_price_with_slippage
 
 from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
 
 # 统一 Side 与 SDK OrderSide 的映射
 _SIDE_TO_SDK = {Side.BUY: OrderSide.BUY, Side.SELL: OrderSide.SELL}
+
+
+def filter_grid_orders(open_orders: list) -> list:
+    """从开放订单里挑出"普通网格单"（该撤的），保留 TPSL / reduce_only 兜底单。"""
+    out = []
+    for o in open_orders:
+        if bool(getattr(o, "reduce_only", False)):
+            continue
+        if str(getattr(o, "type", "") or "").upper() in ("TPSL", "CONDITIONAL"):
+            continue
+        out.append(o)
+    return out
 
 
 class ExtendedClient(ExchangeAdapter):
@@ -201,8 +220,17 @@ class ExtendedClient(ExchangeAdapter):
 
     # ---- 限价单（网格用）----
 
-    async def place_limit_order(self, market: str, side: Side, amount: Decimal, price: Decimal,
-                                *, post_only: bool = True, expire_days: int = 7):
+    async def place_limit_order(
+        self,
+        market: str,
+        side: Side,
+        amount: Decimal,
+        price: Decimal,
+        *,
+        post_only: bool = True,
+        expire_days: int = 7,
+        reduce_only: bool = False,
+    ):
         """挂限价单（默认 post_only=maker）。返回下单结果（含订单 id）。
 
         SDK 默认有效期仅 1 小时，网格挂单会整批 EXPIRED（2026-07-20 实盘事故），
@@ -220,8 +248,52 @@ class ExtendedClient(ExchangeAdapter):
             price=market_obj.trading_config.round_price(price),
             time_in_force=TimeInForce.GTT,
             expire_time=datetime.now(timezone.utc) + timedelta(days=expire_days),
-            reduce_only=False,
+            reduce_only=reduce_only,
             post_only=post_only,
+        )
+        return await self._client.orders.place_order(order=order)
+
+    async def place_position_stop_loss(
+        self,
+        market: str,
+        signed_size: Decimal,
+        trigger_price: Decimal,
+    ):
+        """为当前整仓挂 reduce-only 市价止损，多仓平多、空仓平空。"""
+        signed_size = Decimal(str(signed_size))
+        trigger_price = Decimal(str(trigger_price))
+        if signed_size == 0:
+            raise ValueError("空仓不能挂整仓止损")
+        if trigger_price <= 0:
+            raise ValueError("止损触发价必须大于 0")
+
+        close_side = OrderSide.SELL if signed_size > 0 else OrderSide.BUY
+        market_obj = self._market(market)
+        execution_price = get_price_with_slippage(
+            side=close_side,
+            price=trigger_price,
+            min_price_change=market_obj.trading_config.min_price_change,
+            slippage=self._client.config.defaults.market_price_slippage,
+        )
+        order = create_order_object(
+            account=self._client.stark_account,
+            order_type=OrderType.TPSL,
+            starknet_domain=self._client.config.signing.starknet_domain,
+            market=market_obj,
+            side=close_side,
+            amount_of_synthetic=Decimal(0),
+            price=Decimal(0),
+            time_in_force=TimeInForce.GTT,
+            expire_time=datetime.now(timezone.utc) + timedelta(days=7),
+            reduce_only=True,
+            post_only=False,
+            tp_sl_type=OrderTpslType.POSITION,
+            stop_loss=OrderTpslTriggerParam(
+                trigger_price=trigger_price,
+                trigger_price_type=OrderTriggerPriceType.MARK,
+                price=execution_price,
+                price_type=OrderPriceType.MARKET,
+            ),
         )
         return await self._client.orders.place_order(order=order)
 
@@ -231,6 +303,22 @@ class ExtendedClient(ExchangeAdapter):
     async def get_open_orders(self, market: str) -> list:
         r = await self._client.account.get_open_orders(market_names=[market])
         return r.data or []
+
+    async def cancel_grid_orders(self, market: str) -> int:
+        """逐单撤掉普通网格单，保留 reduce-only、TPSL 与条件单。"""
+        orders = filter_grid_orders(await self.get_open_orders(market))
+        for order in orders:
+            await self.cancel_order(order.id)
+        return len(orders)
+
+    async def cancel_tpsl(self, market: str) -> None:
+        """逐单撤掉该市场的整仓 TPSL，不影响其他订单。"""
+        orders = await self.get_open_orders(market)
+        for order in orders:
+            order_type = str(getattr(order, "type", "") or "").upper()
+            tp_sl_type = str(getattr(order, "tp_sl_type", "") or "").upper()
+            if order_type == "TPSL" and tp_sl_type == "POSITION":
+                await self.cancel_order(order.id)
 
     async def get_orders_history(self, market: str, limit: int = 100) -> list:
         """历史订单（含终态 status/filled_qty，网格判断成交 vs 过期/被撤用）。"""

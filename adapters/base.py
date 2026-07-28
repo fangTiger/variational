@@ -91,6 +91,23 @@ class ExchangeAdapter(ABC):
         """
         return None
 
+    async def cancel_grid_orders(self, market: str) -> int:
+        """只撤普通网格单，保留交易所端保护单。"""
+        raise NotImplementedError
+
+    async def place_position_stop_loss(
+        self,
+        market: str,
+        signed_size: Decimal,
+        trigger_price: Decimal,
+    ):
+        """为当前整仓挂交易所端止损。"""
+        raise NotImplementedError
+
+    async def cancel_tpsl(self, market: str) -> None:
+        """撤掉当前市场的整仓 TPSL。"""
+        raise NotImplementedError
+
     # ---- 通用逻辑（子类一般无需重写）----
 
     async def hedge(self, market: str, target_signed_size: Decimal):
