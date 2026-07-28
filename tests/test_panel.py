@@ -6,6 +6,7 @@ import json
 
 from grid.grid_engine import GridConfig, GridEngine
 from grid.regime import GridMode, close_slope, describe_regime
+from tools.grid_panel import render_html
 
 
 def test_close_slope_flat_is_zero() -> None:
@@ -77,3 +78,55 @@ def test_dump_live_writes_expected_fields(tmp_path) -> None:
     assert d["mark"] == 63000.0 and d["mode"] == "neutral"
     assert d["cfg"]["unit"] == 40 and d["cfg"]["max_inv"] == 160
     assert "adx" in d and "slope_short" in d and "atr_pct" in d
+
+
+def _live(**kw):
+    base = dict(
+        ts=0,
+        mark=63000.0,
+        mode="neutral",
+        adx=22.0,
+        slope_short=0.0,
+        slope_long=0.0,
+        atr_pct=0.004,
+        inv_btc=0.0,
+        inv_usd=0.0,
+        band_low=60000.0,
+        band_high=66000.0,
+        frozen=False,
+        blocked_side=None,
+        halted=False,
+        dist_to_liq_pct=None,
+        cfg=dict(
+            unit=40,
+            levels=4,
+            max_inv=160,
+            spacing=0.005,
+            hard_stop_dist=0.12,
+            adx_off=30,
+        ),
+    )
+    base.update(kw)
+    return base
+
+
+def test_render_contains_key_fields() -> None:
+    html = render_html(_live(), {"equity": 286.0, "pnl_since_start": 1.2})
+    assert "63000" in html and "震荡" in html and "60000" in html and "66000" in html
+    assert "refresh" in html and "286" in html
+
+
+def test_render_frozen_highlights() -> None:
+    html = render_html(_live(frozen=True, blocked_side="BUY", mode="off"), {})
+    assert "趋势" in html or "停铺" in html
+    assert "frozen" in html.lower() or "越界" in html or "冻结" in html
+
+
+def test_render_missing_equity_no_crash() -> None:
+    html = render_html(_live(), {})
+    assert "—" in html
+
+
+def test_render_no_live_data() -> None:
+    html = render_html({}, {})
+    assert "未运行" in html or "无数据" in html
