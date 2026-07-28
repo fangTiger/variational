@@ -189,14 +189,11 @@ class GridEngine:
         return "；".join(acted) if acted else "阶梯已就位"
 
     def _within_cap(self, side: Side, inv_usd: float) -> bool:
-        """严格库存上限：现有挂单全部成交后，长/短库存名义仍不超上限。"""
+        """严格库存上限：真实持仓与该侧挂单全部成交后仍不超上限。"""
         unit = self.config.unit_usd
-        maxinv = self.config.max_inventory_usd
-        n_buy = sum(1 for r in self._orders.values() if r["side"] is Side.BUY)
-        n_sell = sum(1 for r in self._orders.values() if r["side"] is Side.SELL)
-        if side is Side.BUY:
-            return inv_usd + (n_buy + 1) * unit <= maxinv
-        return -inv_usd + (n_sell + 1) * unit <= maxinv
+        inventory_usd = inv_usd if side is Side.BUY else -inv_usd
+        pending_usd = sum(unit for rec in self._orders.values() if rec["side"] is side)
+        return inventory_usd + pending_usd + unit <= self.config.max_inventory_usd
 
     async def _place(self, level: int, side: Side, inv_usd: float, why: str = "") -> str | None:
         if not self._within_cap(side, inv_usd):
@@ -223,16 +220,18 @@ class GridEngine:
             return None
 
     async def _cancel(self, level: int, why: str = "") -> None:
-        rec = self._orders.pop(level, None)
+        rec = self._orders.get(level)
         if not rec:
             return
         if self.config.dry_run:
             logger.info("[dry_run] %s：撤 格%d", why, level)
+            self._orders.pop(level, None)
             return
         try:
             await self.ext.cancel_order(rec["id"])
+            self._orders.pop(level, None)  # 撤单成功后才删记录
         except Exception as exc:  # noqa: BLE001
-            logger.warning("撤单失败 格%d：%s", level, exc)
+            logger.warning("撤单失败 格%d：%s（保留记录下轮重试）", level, exc)
 
     async def _go_off(self, inv: Decimal) -> str:
         # 撤所有挂单

@@ -97,6 +97,43 @@ def test_still_open_untouched() -> None:
     assert ext.placed == []
 
 
+def test_cancel_keeps_record_on_failure() -> None:
+    """撤单失败时不能把订单记录丢掉（否则留孤儿单）。"""
+
+    class FailExt(FakeExt):
+        async def cancel_order(self, oid):
+            raise RuntimeError("network")
+
+    ext = FailExt()
+    eng = _engine(ext, {560: {"id": "o1", "side": Side.SELL}})
+    asyncio.run(eng._cancel(560, why="test"))
+    assert 560 in eng._orders  # 撤单失败 → 记录保留，下轮重试
+
+
+def test_within_cap_uses_real_inventory() -> None:
+    """已有多头库存接近上限时，不应再允许新增买单。"""
+    ext = FakeExt()
+    eng = GridEngine(ext, GridConfig(dry_run=False, unit_usd=200, max_inventory_usd=1600))
+    # 已持多头 $1500，再挂 1 张 $200 买单会到 $1700 > 上限
+    assert eng._within_cap(Side.BUY, inv_usd=1500.0) is False
+    # 持多头 $1000，挂 $200 到 $1200 < 上限 → 允许
+    assert eng._within_cap(Side.BUY, inv_usd=1000.0) is True
+
+
+def test_within_cap_same_orders_respects_real_inventory() -> None:
+    """同样的挂单数量下，是否可加仓必须由真实持仓共同决定。"""
+    ext = FakeExt()
+    eng = GridEngine(ext, GridConfig(dry_run=False, unit_usd=200, max_inventory_usd=1600))
+    eng._orders = {
+        558: {"id": "b1", "side": Side.BUY},
+        559: {"id": "b2", "side": Side.BUY},
+    }
+    # 两张已挂买单 $400 + 一张新买单 $200：真实多头 $800 时最坏为 $1400。
+    assert eng._within_cap(Side.BUY, inv_usd=800.0) is True
+    # 挂单数不变，真实多头升至 $1100 时最坏为 $1700，应拒绝。
+    assert eng._within_cap(Side.BUY, inv_usd=1100.0) is False
+
+
 if __name__ == "__main__":
     test_filled_order_flips()
     test_expired_order_replaced_same_level()
