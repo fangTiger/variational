@@ -166,3 +166,40 @@ def trend_gate(
     a = adx(highs, lows, closes, adx_period)
     return decide_mode(adx_val=a[-1] if a else None,
                        adx_off=adx_off, adx_resume=adx_resume, prev_mode=prev_mode)
+
+
+def close_slope(closes: list[float], period: int) -> float:
+    """近端收盘斜率，归一化为"每根变化占当前价比例"（%/根）。
+
+    数据不足或当前价非正返回 0.0。正=上行，负=下行，≈0=走平。
+    """
+    if len(closes) <= period or closes[-1] <= 0:
+        return 0.0
+    return (closes[-1] - closes[-1 - period]) / period / closes[-1]
+
+
+def describe_regime(mode, adx, slope_short, slope_long, atr_pct) -> str:
+    """规则拼句的中文市况解读（无 LLM）。mode 接受 GridMode 或其 value 字符串。"""
+    m = mode.value if isinstance(mode, GridMode) else str(mode)
+    # 斜率方向（两周期同向才明确表态，用较小量级判走平）
+    thr = 0.001  # 每根 0.1% 以内算走平
+
+    def _dir(s: float) -> int:
+        return 1 if s > thr else (-1 if s < -thr else 0)
+
+    ds, dl = _dir(slope_short), _dir(slope_long)
+    if ds == dl == 1:
+        slope_txt = "斜率上行"
+    elif ds == dl == -1:
+        slope_txt = "斜率下行"
+    else:
+        slope_txt = "斜率接近零"
+    # 波动
+    if atr_pct < 0.003:
+        atr_txt = "波动小"
+    elif atr_pct > 0.01:
+        atr_txt = "波动大"
+    else:
+        atr_txt = "ATR 适中"
+    head = "震荡 · 适合网格" if m == "neutral" else "趋势 · 已停铺"
+    return f"{head}｜ADX {adx:.1f} · {slope_txt} · {atr_txt}"
