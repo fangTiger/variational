@@ -6,7 +6,7 @@ import json
 
 from grid.grid_engine import GridConfig, GridEngine
 from grid.regime import GridMode, close_slope, describe_regime
-from tools.grid_panel import render_html
+from tools.grid_panel import _latest_equity, _read_live, render_html
 
 
 def test_close_slope_flat_is_zero() -> None:
@@ -130,3 +130,21 @@ def test_render_missing_equity_no_crash() -> None:
 def test_render_no_live_data() -> None:
     html = render_html({}, {})
     assert "未运行" in html or "无数据" in html
+
+
+def test_read_live_missing_returns_empty(tmp_path) -> None:
+    assert _read_live(tmp_path / "nope.json") == {}
+
+
+def test_latest_equity_reads_last_line(tmp_path) -> None:
+    p = tmp_path / "m.jsonl"
+    p.write_text(
+        '{"equity":100,"pnl_since_start":1}\n{"equity":286,"pnl_since_start":2}\n',
+        encoding="utf-8",
+    )
+    got = _latest_equity(p)
+    assert got["equity"] == 286 and got["pnl_since_start"] == 2
+
+
+def test_latest_equity_missing_returns_empty(tmp_path) -> None:
+    assert _latest_equity(tmp_path / "none.jsonl") == {}

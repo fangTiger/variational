@@ -2,11 +2,68 @@
 
 from __future__ import annotations
 
+import argparse
+import http.server
+import json
 import math
 from datetime import datetime
 from html import escape
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from grid.regime import describe_regime
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _read_live(path) -> dict:
+    """读取 live 快照；文件缺失、损坏或结构异常时返回空字典。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _latest_equity(jsonl_path) -> dict:
+    """读取监控 JSONL 最后一条权益快照。"""
+    try:
+        lines = Path(jsonl_path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    if not lines:
+        return {}
+    try:
+        data = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: data[key] for key in ("equity", "pnl_since_start") if key in data}
+
+
+class GridPanelHandler(http.server.BaseHTTPRequestHandler):
+    """本地面板 HTTP handler。"""
+
+    live_path = PROJECT_ROOT / "data" / "grid_live.json"
+    monitor_path = PROJECT_ROOT / "data" / "grid_monitor.jsonl"
+
+    def do_GET(self) -> None:
+        if urlsplit(self.path).path != "/":
+            self.send_error(404)
+            return
+
+        html = render_html(_read_live(self.live_path), _latest_equity(self.monitor_path))
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args) -> None:
+        pass
 
 
 def render_html(live: dict, equity: dict) -> str:
@@ -461,3 +518,29 @@ def render_html(live: dict, equity: dict) -> str:
   </section>
 </main>"""
     return _page(body)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="启动本地网格监控面板")
+    parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument(
+        "--live-path",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "grid_live.json",
+    )
+    parser.add_argument(
+        "--monitor-path",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "grid_monitor.jsonl",
+    )
+    args = parser.parse_args()
+
+    GridPanelHandler.live_path = args.live_path
+    GridPanelHandler.monitor_path = args.monitor_path
+    with http.server.HTTPServer(("localhost", args.port), GridPanelHandler) as server:
+        print(f"面板已启动：http://localhost:{args.port}（Ctrl+C 停）", flush=True)
+        server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
