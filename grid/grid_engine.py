@@ -15,7 +15,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from adapters.base import Side
+from grid.grid_state import GridState, load_state, save_state
 from grid.regime import GridMode, adx, decide_mode, donchian_prev
+from grid.risk import hard_stop_triggered
 from infra.logger import get_logger
 
 logger = get_logger("grid_engine")
@@ -35,6 +37,9 @@ class GridConfig:
     candle_lookback: int = 200
     poll_interval: float = 30.0
     dry_run: bool = True
+    trend_aware: bool = False
+    hard_stop_dist: float = 0.12
+    state_path: str = "data/grid_state.json"
 
 
 class GridEngine:
@@ -248,6 +253,114 @@ class GridEngine:
             self._orders.pop(level, None)  # 撤单成功后才删记录
         except Exception as exc:  # noqa: BLE001
             logger.warning("撤单失败 格%d：%s（保留记录下轮重试）", level, exc)
+
+    async def _check_hard_stop(self) -> bool:
+        """检查距强平价距离；空仓与有仓但缺失清算信息必须区别处理。"""
+        pos = await self.ext.get_position(self.config.market)
+        signed_size = pos.signed_size
+        if signed_size == 0:
+            return False
+
+        liquidation_info = await self.ext.get_liquidation_info(self.config.market)
+        if liquidation_info is None:
+            logger.error(
+                "硬止损检查进入 fail-safe：当前有仓位 %s，但无法取得清算价",
+                signed_size,
+            )
+            return False
+
+        mark, liq = liquidation_info
+        if not hard_stop_triggered(
+            float(mark),
+            float(liq),
+            float(signed_size),
+            self.config.hard_stop_dist,
+        ):
+            return False
+
+        logger.critical(
+            "触发硬止损：mark=%s liq=%s 持仓=%s 阈值=%.2f%%",
+            mark,
+            liq,
+            signed_size,
+            self.config.hard_stop_dist * 100,
+        )
+        await self._go_off_confirmed(signed_size)
+        return True
+
+    async def _go_off_confirmed(self, inv: Decimal) -> bool:
+        """持久化急停并反复减仓，连续两次确认空仓后才撤 TPSL。"""
+        current_state = load_state(self.config.state_path)
+        if current_state is None:
+            halted_state = GridState(
+                band_low=0.0,
+                band_high=0.0,
+                frozen=True,
+                blocked_side=None,
+                halted=True,
+            )
+        else:
+            halted_state = GridState(
+                band_low=current_state.band_low,
+                band_high=current_state.band_high,
+                frozen=current_state.frozen,
+                blocked_side=current_state.blocked_side,
+                halted=True,
+            )
+        save_state(self.config.state_path, halted_state)
+
+        logger.critical("确认平仓链启动：初始持仓=%s，已持久化 halted=true", inv)
+        try:
+            await self.ext.cancel_grid_orders(self.config.market)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("只撤网格单失败，继续执行确认平仓链：%s", exc)
+
+        max_close_attempts = 3
+        close_attempts = 0
+        consecutive_flat_reads = 0
+        while True:
+            pos = await self.ext.get_position(self.config.market)
+            remaining = pos.signed_size
+            if remaining == 0:
+                consecutive_flat_reads += 1
+                if consecutive_flat_reads < 2:
+                    continue
+                await self.ext.cancel_tpsl(self.config.market)
+                logger.critical("已连续两次确认空仓，撤除 TPSL，确认平仓链完成")
+                return True
+
+            consecutive_flat_reads = 0
+            if close_attempts >= max_close_attempts:
+                logger.error(
+                    "确认平仓失败：%d 次 reduce_only 下单后仍有仓位 %s；保留 TPSL",
+                    close_attempts,
+                    remaining,
+                )
+                return False
+
+            side = Side.SELL if remaining > 0 else Side.BUY
+            close_attempts += 1
+            try:
+                await self.ext.market_order(
+                    self.config.market,
+                    side,
+                    abs(remaining),
+                    reduce_only=True,
+                )
+                logger.warning(
+                    "确认平仓第 %d/%d 次：%s %s（reduce_only）",
+                    close_attempts,
+                    max_close_attempts,
+                    side.value,
+                    abs(remaining),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "确认平仓第 %d/%d 次下单失败：%s",
+                    close_attempts,
+                    max_close_attempts,
+                    exc,
+                )
 
     async def _go_off(self, inv: Decimal) -> str:
         # 撤所有挂单
