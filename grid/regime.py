@@ -141,3 +141,28 @@ def decide_mode(
     if adx_val > threshold:
         return GridMode.OFF
     return GridMode.NEUTRAL
+
+
+def drop_forming_candle(values: list[float]) -> list[float]:
+    """去掉最后一根（形成中的当前 K 线），只用已收盘数据。"""
+    return values[:-1] if values else values
+
+
+def trend_gate(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    *,
+    adx_off: float,
+    adx_resume: float,
+    prev_mode: "GridMode | None" = None,
+    adx_period: int = 14,
+) -> GridMode:
+    """二态趋势门控（设计 v3 Component 1）：强趋势=OFF（停止新增），否则 NEUTRAL。
+
+    与 decide_mode 的区别：这里 ADX 熔断强制启用（阈值来自 config），
+    调用方须先用 drop_forming_candle 传入已收盘 K 线。
+    """
+    a = adx(highs, lows, closes, adx_period)
+    return decide_mode(adx_val=a[-1] if a else None,
+                       adx_off=adx_off, adx_resume=adx_resume, prev_mode=prev_mode)
