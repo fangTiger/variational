@@ -269,12 +269,14 @@ class ExtendedClient(ExchangeAdapter):
 
         close_side = OrderSide.SELL if signed_size > 0 else OrderSide.BUY
         market_obj = self._market(market)
+        trigger_price = market_obj.trading_config.round_price(trigger_price)
         execution_price = get_price_with_slippage(
             side=close_side,
             price=trigger_price,
             min_price_change=market_obj.trading_config.min_price_change,
             slippage=self._client.config.defaults.market_price_slippage,
         )
+        execution_price = market_obj.trading_config.round_price(execution_price)
         order = create_order_object(
             account=self._client.stark_account,
             order_type=OrderType.TPSL,

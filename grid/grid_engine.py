@@ -268,6 +268,10 @@ class GridEngine:
         else:
             trigger_price = mark_decimal * (Decimal("1") + stop_distance)
 
+        if self.config.dry_run:
+            logger.info("[dry_run] 维护整仓TPSL 触发价=%s", trigger_price)
+            return True
+
         try:
             await self.ext.place_position_stop_loss(
                 self.config.market,
@@ -621,6 +625,13 @@ class GridEngine:
         save_state(self.config.state_path, halted_state)
 
         logger.critical("确认平仓链启动：初始持仓=%s，已持久化 halted=true", inv)
+        if self.config.dry_run:
+            logger.warning(
+                "[dry_run] 确认平仓链：撤网格单，平库存=%s，确认空仓后撤 TPSL",
+                inv,
+            )
+            return True
+
         try:
             await self.ext.cancel_grid_orders(self.config.market)
         except Exception as exc:  # noqa: BLE001

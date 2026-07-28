@@ -17,9 +17,11 @@ class StopExt:
     def __init__(self, positions, liq=None):
         self._positions = list(positions)  # 依次返回的 signed_size
         self._liq = liq                    # (mark, liq) 或 None
+        self.position_reads = 0
         self.market_orders = []
         self.grid_cancelled = 0
         self.tpsl_cancelled = 0
+        self.position_stop_losses = []
         self.open_orders = []
         self.placed = []
 
@@ -27,6 +29,7 @@ class StopExt:
         return None
 
     async def get_position(self, market):
+        self.position_reads += 1
         size = self._positions[0] if len(self._positions) == 1 else self._positions.pop(0)
         return Position(market=market, signed_size=Decimal(str(size)))
 
@@ -42,6 +45,9 @@ class StopExt:
 
     async def market_order(self, market, side, amount, *, reduce_only=False):
         self.market_orders.append((side, float(amount), reduce_only))
+
+    async def place_position_stop_loss(self, market, signed_size, trigger_price):
+        self.position_stop_losses.append((market, signed_size, trigger_price))
 
     async def get_open_orders(self, market):
         return self.open_orders
@@ -130,6 +136,48 @@ def test_hard_stop_confirms_flat(tmp_path) -> None:
     assert ext.tpsl_cancelled >= 1                 # 归零后才撤 TPSL
 
 
+def test_dry_run_maintain_tpsl_only_records_intent(tmp_path) -> None:
+    """dry_run 维护整仓 TPSL 只视为已确认，绝不能调用交易所下单。"""
+    ext = StopExt(positions=[Decimal("0.01")])
+    eng = GridEngine(
+        ext,
+        GridConfig(
+            dry_run=True,
+            trend_aware=True,
+            exchange_tpsl=True,
+            state_path=str(tmp_path / "s.json"),
+        ),
+    )
+
+    result = asyncio.run(
+        eng._maintain_tpsl(mark=Decimal("100"), signed_size=Decimal("0.01"))
+    )
+
+    assert result is True
+    assert ext.position_stop_losses == []
+
+
+def test_dry_run_go_off_confirmed_returns_without_exchange_calls(tmp_path) -> None:
+    """dry_run 硬止损只打印意图，不撤单、不平仓、不撤 TPSL，也不重读持仓。"""
+    ext = StopExt(positions=[Decimal("0.02")])
+    eng = GridEngine(
+        ext,
+        GridConfig(
+            dry_run=True,
+            trend_aware=True,
+            state_path=str(tmp_path / "s.json"),
+        ),
+    )
+
+    result = asyncio.run(eng._go_off_confirmed(Decimal("0.02")))
+
+    assert result is True
+    assert ext.position_reads == 0
+    assert ext.grid_cancelled == 0
+    assert ext.market_orders == []
+    assert ext.tpsl_cancelled == 0
+
+
 def test_breach_freezes_and_does_not_recenter(tmp_path) -> None:
     """价格跌破下界后冻结 BUY，且既有 band 绝不追随现价移动。"""
     ext = StopExt(positions=[0.01], liq=(100.0, 80.0))
@@ -179,7 +227,7 @@ def test_upper_breach_freezes_sell_without_recentering(tmp_path) -> None:
     """价格涨破上界后冻结 SELL，且 band 上下界保持原值。"""
     ext = StopExt(positions=[0.0])
     cfg = GridConfig(
-        dry_run=False,
+        dry_run=True,
         trend_aware=True,
         state_path=str(tmp_path / "s.json"),
     )
@@ -190,6 +238,7 @@ def test_upper_breach_freezes_sell_without_recentering(tmp_path) -> None:
 
     assert eng._state == GridState(95.0, 105.0, True, "SELL", False)
     assert load_state(cfg.state_path) == eng._state
+    assert ext.grid_cancelled == 0
 
 
 def test_frozen_band_recenters_after_required_neutral_bars(tmp_path) -> None:

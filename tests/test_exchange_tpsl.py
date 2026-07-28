@@ -10,7 +10,10 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from adapters.base import Position
-from adapters.extended_client import filter_grid_orders  # 纯函数：从开放单里挑出该撤的网格单
+from adapters.extended_client import (
+    ExtendedClient,
+    filter_grid_orders,  # 纯函数：从开放单里挑出该撤的网格单
+)
 from grid.grid_engine import GridConfig, GridEngine
 from grid.grid_state import GridState
 from grid.regime import GridMode
@@ -26,6 +29,59 @@ def test_filter_keeps_tpsl_and_reduce_only() -> None:
     to_cancel = filter_grid_orders(orders)
     ids = {getattr(o, "id") for o in to_cancel}
     assert ids == {"g1", "g2"}  # 只撤普通网格单，保留 TPSL 与 reduce_only
+
+
+def test_position_stop_loss_rounds_trigger_and_execution_prices(monkeypatch) -> None:
+    """整仓 TPSL 的触发价与滑点执行价都必须按市场 tick 取整。"""
+    rounded_inputs = []
+    placed_orders = []
+
+    class TradingConfig:
+        min_price_change = Decimal("0.1")
+
+        def round_price(self, price):
+            value = Decimal(str(price))
+            rounded_inputs.append(value)
+            return value.quantize(self.min_price_change)
+
+    async def place_order(*, order):
+        placed_orders.append(order)
+        return SimpleNamespace(data=SimpleNamespace(id="tpsl-1"))
+
+    rest_client = SimpleNamespace(
+        stark_account=object(),
+        config=SimpleNamespace(
+            signing=SimpleNamespace(starknet_domain=object()),
+            defaults=SimpleNamespace(market_price_slippage=Decimal("0.01")),
+        ),
+        orders=SimpleNamespace(place_order=place_order),
+    )
+    client = ExtendedClient(rest_client)
+    client._markets = {
+        "BTC-USD": SimpleNamespace(trading_config=TradingConfig()),
+    }
+
+    monkeypatch.setattr(
+        "adapters.extended_client.get_price_with_slippage",
+        lambda **kwargs: Decimal("87.654"),
+    )
+    monkeypatch.setattr(
+        "adapters.extended_client.create_order_object",
+        lambda **kwargs: kwargs,
+    )
+
+    asyncio.run(
+        client.place_position_stop_loss(
+            "BTC-USD",
+            signed_size=Decimal("0.01"),
+            trigger_price=Decimal("88.123"),
+        )
+    )
+
+    assert rounded_inputs == [Decimal("88.123"), Decimal("87.654")]
+    stop_loss = placed_orders[0]["stop_loss"]
+    assert stop_loss.trigger_price == Decimal("88.1")
+    assert stop_loss.price == Decimal("87.7")
 
 
 def test_tpsl_blocks_new_risk_when_unconfirmed(tmp_path, monkeypatch) -> None:
