@@ -29,7 +29,7 @@ class FakeExt:
         return self.history
 
     async def place_limit_order(self, market, side, amount, price, **kw):
-        self.placed.append({"side": side, "price": float(price)})
+        self.placed.append({"side": side, "amount": float(amount), "price": float(price)})
         return SimpleNamespace(data=SimpleNamespace(id=f"new-{len(self.placed)}", status="NEW"))
 
 
@@ -68,6 +68,23 @@ def test_partial_fill_then_expired_flips() -> None:
     eng = _engine(ext, {558: {"id": "o1", "side": Side.BUY}})
     asyncio.run(eng._handle_fills(0.0))
     assert len(ext.placed) == 1 and ext.placed[0]["side"] is Side.SELL
+
+
+def test_frozen_side_not_replenished() -> None:
+    """冻结 BUY 时，买单过期不重挂买单。"""
+    ext = FakeExt(open_orders=[], history=[_hist("o1", "EXPIRED")])
+    eng = _engine(ext, {558: {"id": "o1", "side": Side.BUY}})
+    asyncio.run(eng._handle_fills(0.0, blocked_side="BUY"))
+    assert ext.placed == []
+
+
+def test_partial_fill_uses_filled_qty() -> None:
+    """部分成交翻单数量按 filled_qty，不按整格。"""
+    ext = FakeExt(open_orders=[], history=[_hist("o1", "FILLED", filled_qty=0.0002)])
+    eng = _engine(ext, {558: {"id": "o1", "side": Side.BUY}})
+    asyncio.run(eng._handle_fills(0.0))
+    assert len(ext.placed) == 1
+    assert ext.placed[0]["amount"] == 0.0002
 
 
 def test_rejected_order_dropped_without_flip() -> None:

@@ -135,7 +135,7 @@ class GridEngine:
             return {}
         return {getattr(o, "id", None): o for o in orders}
 
-    async def _handle_fills(self, inv_usd: float) -> None:
+    async def _handle_fills(self, inv_usd: float, blocked_side: str | None = None) -> None:
         """处理从盘口消失的跟踪单——按交易所终态区分，只有真成交才翻单。
 
         订单会因 EXPIRED(有效期到)/CANCELLED(急停或手动)消失，误当成交翻单
@@ -143,6 +143,7 @@ class GridEngine:
         - FILLED 或有成交量：买成交→上一格挂卖；卖成交→下一格挂买。
         - EXPIRED/CANCELLED：原格原方向重挂。
         - REJECTED/未知：仅移除记录，交给补格逻辑按当前中心重铺。
+        - blocked_side：跳过即将挂出的同方向新单。
         """
         if self.config.dry_run:
             return
@@ -155,13 +156,21 @@ class GridEngine:
             self._orders.pop(lv, None)
             o = statuses.get(rec["id"])
             status = str(getattr(o, "status", "") or "") if o else ""
-            filled = float(getattr(o, "filled_qty", 0) or 0) if o else 0.0
+            filled = Decimal(str(getattr(o, "filled_qty", 0) or 0)) if o else Decimal("0")
             if status == "FILLED" or filled > 0:
                 if rec["side"] is Side.BUY:      # 买成交 → 上一格挂卖止盈
-                    await self._place(lv + 1, Side.SELL, inv_usd, why=f"{lv}买成交→挂卖")
+                    next_level, next_side = lv + 1, Side.SELL
+                    fill_why = f"{lv}买成交→挂卖"
                 else:                             # 卖成交 → 下一格挂买
-                    await self._place(lv - 1, Side.BUY, inv_usd, why=f"{lv}卖成交→挂买")
+                    next_level, next_side = lv - 1, Side.BUY
+                    fill_why = f"{lv}卖成交→挂买"
+                if next_side.value == blocked_side:
+                    continue
+                qty = filled if filled > 0 else None
+                await self._place(next_level, next_side, inv_usd, why=fill_why, qty=qty)
             elif status in ("EXPIRED", "CANCELLED"):
+                if rec["side"].value == blocked_side:
+                    continue
                 await self._place(lv, rec["side"], inv_usd, why=f"格{lv}{status}重挂")
             else:
                 logger.warning("格%d 订单 %s 终态=%s，仅移除不翻单", lv, rec["id"], status or "未知")
@@ -195,11 +204,18 @@ class GridEngine:
         pending_usd = sum(unit for rec in self._orders.values() if rec["side"] is side)
         return inventory_usd + pending_usd + unit <= self.config.max_inventory_usd
 
-    async def _place(self, level: int, side: Side, inv_usd: float, why: str = "") -> str | None:
+    async def _place(
+        self,
+        level: int,
+        side: Side,
+        inv_usd: float,
+        why: str = "",
+        qty: Decimal | None = None,
+    ) -> str | None:
         if not self._within_cap(side, inv_usd):
             return None  # 超库存上限，不挂
         lp = self._level_price(level)
-        qty = Decimal(str(self.config.unit_usd)) / lp
+        qty = qty if qty is not None else Decimal(str(self.config.unit_usd)) / lp
         msg = f"{why}：{side.value} {qty:.6f}@{lp:.0f}(格{level})"
         if self.config.dry_run:
             logger.info("[dry_run] %s", msg)
