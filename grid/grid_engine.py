@@ -10,6 +10,7 @@ dry_run 只打印意图不真正挂单。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -36,6 +37,14 @@ from infra.logger import get_logger
 
 logger = get_logger("grid_engine")
 
+# TPSL 触发价相对变化不超过千分之一时不重挂，避免细小行情抖动冲刷历史订单。
+_TPSL_REPRICE_THRESHOLD_PCT = Decimal("0.001")
+# BTC 触发价按 0.1 tick 取整；同时保留百万分之一相对容差以兼容高价位。
+_TPSL_EXCHANGE_TRIGGER_TOLERANCE_ABS = Decimal("0.1")
+_TPSL_EXCHANGE_TRIGGER_TOLERANCE_PCT = Decimal("0.000001")
+# 连续多轮无法解析单笔终态时升级告警，但仍不得猜测终态或补重复单。
+_ORDER_STATUS_CRITICAL_RETRIES = 3
+
 
 @dataclass
 class GridConfig:
@@ -58,6 +67,9 @@ class GridConfig:
     recenter_bars: int = 3
     state_path: str = "data/grid_state.json"
     exchange_tpsl: bool = True
+    liq_buffer_pct: float = 0.12
+    max_equity_loss_pct: float = 0.10
+    flat_confirmation_interval: float = 0.05
 
 
 class GridEngine:
@@ -79,6 +91,7 @@ class GridEngine:
         self._last_closes: list[float] = []
         self._last_mark: float | None = None
         self._last_inv: Decimal | float | None = None
+        self._current_tpsl: tuple[Decimal, Decimal] | None = None
 
     @property
     def _log_step(self) -> float:
@@ -268,16 +281,145 @@ class GridEngine:
 
     async def _maintain_tpsl(self, mark: float, signed_size: Decimal) -> bool:
         """维护交易所端整仓止损；本任务以挂单调用成功视为已确认。"""
-        if not self.config.exchange_tpsl or signed_size == 0:
+        signed_size = Decimal(str(signed_size))
+        if signed_size == 0:
+            # 空仓后旧保护已经失去对应仓位，新开同尺寸仓位时必须重新挂单。
+            self._current_tpsl = None
+            return True
+        if not self.config.exchange_tpsl:
             return True
 
         mark_decimal = Decimal(str(mark))
         stop_distance = Decimal(str(self.config.hard_stop_dist))
-        # 直接使用硬止损距离边界：与本地 hard stop 相当，不晚于该保护阈值。
+        liq_buffer = Decimal(str(self.config.liq_buffer_pct))
+        max_loss_pct = Decimal(str(self.config.max_equity_loss_pct))
+
+        liq_price: Decimal | None = None
+        liquidation_getter = getattr(self.ext, "get_liquidation_info", None)
+        if callable(liquidation_getter):
+            try:
+                liquidation_info = await liquidation_getter(self.config.market)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("计算 TPSL 时查询清算价失败，将使用其他可用约束：%s", exc)
+            else:
+                if liquidation_info is not None:
+                    candidate_liq = Decimal(str(liquidation_info[1]))
+                    if candidate_liq > 0:
+                        liq_price = candidate_liq
+
+        equity: Decimal | None = None
+        balance_getter = getattr(self.ext, "get_balance", None)
+        if callable(balance_getter):
+            try:
+                balance = await balance_getter()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("计算 TPSL 时查询权益失败，将使用其他可用约束：%s", exc)
+            else:
+                raw_equity = (
+                    balance.get("equity")
+                    if isinstance(balance, dict)
+                    else getattr(balance, "equity", None)
+                )
+                if raw_equity is not None:
+                    candidate_equity = Decimal(str(raw_equity))
+                    if candidate_equity > 0:
+                        equity = candidate_equity
+
+        constraints: list[Decimal] = []
         if signed_size > 0:
-            trigger_price = mark_decimal * (Decimal("1") - stop_distance)
+            if liq_price is not None and Decimal("0") <= liq_buffer < Decimal("1"):
+                constraints.append(liq_price / (Decimal("1") - liq_buffer))
+            if equity is not None and max_loss_pct >= 0:
+                equity_floor = equity * (Decimal("1") - max_loss_pct)
+                equity_trigger = mark_decimal - (
+                    (equity - equity_floor) / abs(signed_size)
+                )
+                if equity_trigger > 0:
+                    constraints.append(equity_trigger)
+            trigger_price = (
+                max(constraints)
+                if constraints
+                else mark_decimal * (Decimal("1") - stop_distance)
+            )
         else:
-            trigger_price = mark_decimal * (Decimal("1") + stop_distance)
+            if liq_price is not None and liq_buffer >= 0:
+                constraints.append(liq_price / (Decimal("1") + liq_buffer))
+            if equity is not None and max_loss_pct >= 0:
+                equity_floor = equity * (Decimal("1") - max_loss_pct)
+                equity_trigger = mark_decimal + (
+                    (equity - equity_floor) / abs(signed_size)
+                )
+                if equity_trigger > 0:
+                    constraints.append(equity_trigger)
+            trigger_price = (
+                min(constraints)
+                if constraints
+                else mark_decimal * (Decimal("1") + stop_distance)
+            )
+
+        previous = self._current_tpsl
+        if previous is not None:
+            previous_size, previous_trigger = previous
+            same_direction = (previous_size > 0) == (signed_size > 0)
+            if not same_direction:
+                # 仓位翻向后旧方向的单向收紧约束必须失效。
+                self._current_tpsl = None
+                previous = None
+            else:
+                # 同方向持仓期间只允许把止损朝更早触发的方向移动。
+                if signed_size > 0:
+                    trigger_price = max(trigger_price, previous_trigger)
+                else:
+                    trigger_price = min(trigger_price, previous_trigger)
+
+        if previous is not None:
+            previous_size, previous_trigger = previous
+            relative_change = (
+                abs(trigger_price - previous_trigger) / previous_trigger
+                if previous_trigger > 0
+                else Decimal("Infinity")
+            )
+            if (
+                signed_size == previous_size
+                and relative_change <= _TPSL_REPRICE_THRESHOLD_PCT
+            ):
+                position_tpsl_getter = getattr(
+                    self.ext,
+                    "get_position_tpsl",
+                    None,
+                )
+                if not callable(position_tpsl_getter):
+                    return True
+
+                exchange_matches = False
+                try:
+                    exchange_tpsl = await position_tpsl_getter(self.config.market)
+                    exchange_trigger = (
+                        getattr(exchange_tpsl, "trigger_price", None)
+                        if exchange_tpsl is not None
+                        else None
+                    )
+                    if exchange_trigger is None and exchange_tpsl is not None:
+                        stop_loss = getattr(exchange_tpsl, "stop_loss", None)
+                        exchange_trigger = getattr(stop_loss, "trigger_price", None)
+                    if exchange_trigger is not None:
+                        exchange_trigger = Decimal(str(exchange_trigger))
+                        exchange_tolerance = max(
+                            _TPSL_EXCHANGE_TRIGGER_TOLERANCE_ABS,
+                            abs(previous_trigger)
+                            * _TPSL_EXCHANGE_TRIGGER_TOLERANCE_PCT,
+                        )
+                        exchange_matches = (
+                            abs(exchange_trigger - previous_trigger)
+                            <= exchange_tolerance
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "交易所整仓 TPSL 校验失败，将重新挂单：%s",
+                        exc,
+                    )
+                if exchange_matches:
+                    return True
 
         if self.config.dry_run:
             logger.info("[dry_run] 维护整仓TPSL 触发价=%s", trigger_price)
@@ -298,8 +440,9 @@ class GridEngine:
             )
             return False
 
+        self._current_tpsl = (signed_size, trigger_price)
         logger.info(
-            "交易所整仓 TPSL 已挂出并按 UNTRIGGERED 确认：持仓=%s 触发价=%s",
+            "交易所整仓 TPSL 挂单请求已成功提交：持仓=%s 触发价=%s",
             signed_size,
             trigger_price,
         )
@@ -373,6 +516,38 @@ class GridEngine:
 
     async def _run_once_trend_aware(self) -> str:
         """趋势感知单轮：硬止损前置，再做门控、band 推进与受限铺单。"""
+        if self._state is None:
+            self._state = load_state(self.config.state_path)
+        if self._state is not None and self._state.halted:
+            pos = await self.ext.get_position(self.config.market)
+            inv = pos.signed_size
+            self._last_inv = inv
+            if inv == 0:
+                self._current_tpsl = None
+            else:
+                stats = await self.ext._client.info.get_market_statistics(
+                    market_name=self.config.market
+                )
+                mark = float(stats.data.mark_price)
+                self._last_mark = mark
+                await self._maintain_tpsl(mark, inv)
+                # halted 只禁止新增报价，既有硬止损风险管理仍继续执行。
+                if await self._check_hard_stop():
+                    await self._dump_live(
+                        mark=self._last_mark,
+                        mode=self._mode,
+                        inv=self._last_inv,
+                        closes=self._last_closes,
+                    )
+                    return "HALTED：硬止损已触发"
+            await self._dump_live(
+                mark=self._last_mark,
+                mode=self._mode,
+                inv=self._last_inv,
+                closes=self._last_closes,
+            )
+            return "HALTED：禁止新增报价"
+
         if await self._check_hard_stop():
             await self._dump_live(
                 mark=self._last_mark,
@@ -523,14 +698,32 @@ class GridEngine:
         orders = await self.ext.get_open_orders(self.config.market)
         return {getattr(o, "id", None) for o in orders}
 
-    async def _order_statuses(self) -> dict:
-        """订单 id → 历史订单对象（查终态用）。失败返回空 dict（按未知处理）。"""
+    async def _order_statuses(self, order_ids: set) -> dict:
+        """订单 id → 订单对象；批量历史未命中时按 ID 单查兜底。"""
         try:
-            orders = await self.ext.get_orders_history(self.config.market, limit=100)
+            orders = await self.ext.get_orders_history(
+                self.config.market,
+                limit=100,
+                order_type="LIMIT",
+                sort="UPDATED_AT",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("查询订单历史失败：%s", exc)
-            return {}
-        return {getattr(o, "id", None): o for o in orders}
+            orders = []
+        statuses = {getattr(o, "id", None): o for o in orders}
+
+        order_getter = getattr(self.ext, "get_order_by_id", None)
+        if not callable(order_getter):
+            return statuses
+        for order_id in order_ids - statuses.keys():
+            try:
+                order = await order_getter(self.config.market, order_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("按 ID 查询订单 %s 失败，下轮重试：%s", order_id, exc)
+                continue
+            if order is not None:
+                statuses[order_id] = order
+        return statuses
 
     async def _handle_fills(self, inv_usd: float, blocked_side: str | None = None) -> None:
         """处理从盘口消失的跟踪单——按交易所终态区分，只有真成交才翻单。
@@ -539,22 +732,54 @@ class GridEngine:
         会挂出穿越盘口的反向单（2026-07-20 实盘事故）。
         - FILLED 或有成交量：买成交→上一格挂卖；卖成交→下一格挂买。
         - EXPIRED/CANCELLED：原格原方向重挂。
-        - REJECTED/未知：仅移除记录，交给补格逻辑按当前中心重铺。
+        - REJECTED：确认终态后移除记录，交给补格逻辑按当前中心重铺。
+        - 未知或非终态：保留记录并在下轮继续查询，禁止同格重复补单。
         - blocked_side：跳过即将挂出的同方向新单。
         """
         if self.config.dry_run:
             return
         open_ids = await self._open_ids()
+        for rec in self._orders.values():
+            if rec["id"] in open_ids:
+                # 订单重新出现在盘口时解除终态待确认标记。
+                rec.pop("status_pending", None)
+                rec.pop("status_lookup_attempts", None)
         missing = {lv: rec for lv, rec in self._orders.items() if rec["id"] not in open_ids}
         if not missing:
             return
-        statuses = await self._order_statuses()
+        statuses = await self._order_statuses({rec["id"] for rec in missing.values()})
         for lv, rec in missing.items():
-            self._orders.pop(lv, None)
             o = statuses.get(rec["id"])
-            status = str(getattr(o, "status", "") or "") if o else ""
+            status = str(getattr(o, "status", "") or "").upper() if o else ""
             filled = Decimal(str(getattr(o, "filled_qty", 0) or 0)) if o else Decimal("0")
-            if status == "FILLED" or filled > 0:
+            if status not in ("FILLED", "EXPIRED", "CANCELLED", "REJECTED"):
+                attempts = int(rec.get("status_lookup_attempts", 0)) + 1
+                rec["status_lookup_attempts"] = attempts
+                rec["status_pending"] = True
+                if (
+                    attempts == _ORDER_STATUS_CRITICAL_RETRIES
+                    or attempts % 100 == 0
+                ):
+                    logger.critical(
+                        "格%d 订单 %s 已连续 %d 轮无法解析终态；"
+                        "该格保持冻结以防重复单，请人工对账",
+                        lv,
+                        rec["id"],
+                        attempts,
+                    )
+                else:
+                    logger.warning(
+                        "格%d 订单 %s 终态=%s，保留记录下轮重试",
+                        lv,
+                        rec["id"],
+                        status or "未知",
+                    )
+                continue
+
+            self._orders.pop(lv, None)
+            if status == "FILLED" or (
+                status in ("EXPIRED", "CANCELLED") and filled > 0
+            ):
                 if rec["side"] is Side.BUY:      # 买成交 → 上一格挂卖止盈
                     next_level, next_side = lv + 1, Side.SELL
                     fill_why = f"{lv}买成交→挂卖"
@@ -570,7 +795,7 @@ class GridEngine:
                     continue
                 await self._place(lv, rec["side"], inv_usd, why=f"格{lv}{status}重挂")
             else:
-                logger.warning("格%d 订单 %s 终态=%s，仅移除不翻单", lv, rec["id"], status or "未知")
+                logger.warning("格%d 订单 %s 终态=REJECTED，仅移除不翻单", lv, rec["id"])
 
     async def _maintain_ladder(
         self,
@@ -605,6 +830,9 @@ class GridEngine:
                     acted.append(m)
         # 撤掉远离中心、落在 band 外或属于冻结方向的陈单。
         for lv, rec in list(self._orders.items()):
+            if rec.get("status_pending"):
+                # 已从盘口消失但终态未知的订单必须等待单查结果，不能按陈单误删。
+                continue
             stale = lv < center - n - 2 or lv > center + n + 2
             constrained_out = (
                 band is not None
@@ -711,7 +939,7 @@ class GridEngine:
         return True
 
     async def _go_off_confirmed(self, inv: Decimal) -> bool:
-        """持久化急停并反复减仓，连续两次确认空仓后才撤 TPSL。"""
+        """持久化急停并反复减仓；空仓且残单清净后才撤 TPSL。"""
         current_state = self._state or load_state(self.config.state_path)
         if current_state is None:
             halted_state = GridState(
@@ -743,25 +971,88 @@ class GridEngine:
         try:
             await self.ext.cancel_grid_orders(self.config.market)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("只撤网格单失败，继续执行确认平仓链：%s", exc)
+            logger.critical(
+                "只撤网格单失败，保留 TPSL 并终止确认平仓链：%s",
+                exc,
+                exc_info=True,
+            )
+            return False
 
         max_close_attempts = 3
         close_attempts = 0
         consecutive_flat_reads = 0
         while True:
-            pos = await self.ext.get_position(self.config.market)
+            try:
+                pos = await self.ext.get_position(self.config.market)
+            except Exception as exc:  # noqa: BLE001
+                logger.critical(
+                    "确认平仓时查询仓位失败；保留 TPSL：%s",
+                    exc,
+                    exc_info=True,
+                )
+                return False
             remaining = pos.signed_size
             if remaining == 0:
                 consecutive_flat_reads += 1
                 if consecutive_flat_reads < 2:
+                    await asyncio.sleep(
+                        max(0.0, float(self.config.flat_confirmation_interval))
+                    )
                     continue
-                await self.ext.cancel_tpsl(self.config.market)
+
+                try:
+                    open_orders = await self.ext.get_open_orders(self.config.market)
+                    residual_orders = [
+                        order
+                        for order in open_orders
+                        if self._is_non_reduce_only_order(order)
+                    ]
+                except Exception as exc:  # noqa: BLE001
+                    logger.critical(
+                        "连续两次确认空仓，但查询残余普通挂单失败；保留 TPSL：%s",
+                        exc,
+                        exc_info=True,
+                    )
+                    return False
+                if residual_orders:
+                    logger.critical(
+                        "连续两次确认空仓，但盘口仍有 %d 个普通挂单；保留 TPSL",
+                        len(residual_orders),
+                    )
+                    return False
+
+                try:
+                    final_pos = await self.ext.get_position(self.config.market)
+                except Exception as exc:  # noqa: BLE001
+                    logger.critical(
+                        "盘口已无普通挂单，但最终空仓复核失败；保留 TPSL：%s",
+                        exc,
+                        exc_info=True,
+                    )
+                    return False
+                if final_pos.signed_size != 0:
+                    logger.critical(
+                        "盘口查询期间仓位重新出现 %s；保留 TPSL",
+                        final_pos.signed_size,
+                    )
+                    return False
+
+                try:
+                    await self.ext.cancel_tpsl(self.config.market)
+                except Exception as exc:  # noqa: BLE001
+                    logger.critical(
+                        "空仓且普通挂单已清净，但撤 TPSL 失败：%s",
+                        exc,
+                        exc_info=True,
+                    )
+                    return False
+                self._current_tpsl = None
                 logger.critical("已连续两次确认空仓，撤除 TPSL，确认平仓链完成")
                 return True
 
             consecutive_flat_reads = 0
             if close_attempts >= max_close_attempts:
-                logger.error(
+                logger.critical(
                     "确认平仓失败：%d 次 reduce_only 下单后仍有仓位 %s；保留 TPSL",
                     close_attempts,
                     remaining,
@@ -809,8 +1100,6 @@ class GridEngine:
         return "OFF：已撤单+平库存"
 
     async def run_forever(self) -> None:
-        import asyncio
-
         self._running = True
         await self.connect()
         logger.info("网格引擎启动（dry_run=%s，格距%.1f%%，每边%d格，库存上限$%.0f）",

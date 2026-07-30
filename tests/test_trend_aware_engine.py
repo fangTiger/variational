@@ -101,7 +101,7 @@ class RunExt(StopExt):
         self.calls.append("open_orders")
         return await super().get_open_orders(market)
 
-    async def get_orders_history(self, market, limit=100):
+    async def get_orders_history(self, market, limit=100, **kwargs):
         return []
 
 

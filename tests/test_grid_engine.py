@@ -25,7 +25,7 @@ class FakeExt:
     async def get_open_orders(self, market):
         return self.open_orders
 
-    async def get_orders_history(self, market, limit=100):
+    async def get_orders_history(self, market, limit=100, **kwargs):
         return self.history
 
     async def place_limit_order(self, market, side, amount, price, **kw):
@@ -96,12 +96,12 @@ def test_rejected_order_dropped_without_flip() -> None:
     assert ext.placed == []
 
 
-def test_unknown_status_dropped_without_flip() -> None:
-    """历史里查不到终态 → 保守只移除，不翻单（防错误吃单）。"""
+def test_unknown_status_retained_for_retry_without_flip() -> None:
+    """历史查不到终态 → 保留跟踪记录下轮重试，但绝不翻单。"""
     ext = FakeExt(open_orders=[], history=[])
     eng = _engine(ext, {560: {"id": "o1", "side": Side.SELL}})
     asyncio.run(eng._handle_fills(0.0))
-    assert 560 not in eng._orders
+    assert 560 in eng._orders
     assert ext.placed == []
 
 
@@ -156,6 +156,6 @@ if __name__ == "__main__":
     test_expired_order_replaced_same_level()
     test_partial_fill_then_expired_flips()
     test_rejected_order_dropped_without_flip()
-    test_unknown_status_dropped_without_flip()
+    test_unknown_status_retained_for_retry_without_flip()
     test_still_open_untouched()
     print("✅ grid_engine 测试通过")
