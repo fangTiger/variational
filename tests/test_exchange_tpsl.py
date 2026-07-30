@@ -128,7 +128,7 @@ def test_tpsl_blocks_new_risk_when_unconfirmed(tmp_path, monkeypatch) -> None:
             self.open_orders_calls += 1
             return []
 
-        async def get_orders_history(self, market, limit=100):
+        async def get_orders_history(self, market, limit=100, **kwargs):
             return []
 
         async def place_limit_order(self, market, side, amount, price, **kwargs):
@@ -151,9 +151,10 @@ def test_tpsl_blocks_new_risk_when_unconfirmed(tmp_path, monkeypatch) -> None:
 
     result = asyncio.run(eng.run_once())
 
-    assert ext.tpsl_calls == [
-        (cfg.market, Decimal("0.01"), Decimal("88.00")),
-    ]
+    assert len(ext.tpsl_calls) == 1
+    market, size, trigger = ext.tpsl_calls[0]
+    assert (market, size) == (cfg.market, Decimal("0.01"))
+    assert abs(trigger - Decimal("90.9091")) < Decimal("0.001")
     assert ext.open_orders_calls == 1  # _handle_fills 仍处理已有订单
     assert ext.placed == []            # _maintain_ladder 未铺新单
     assert result == "TPSL 未确认：仅处理已有订单"

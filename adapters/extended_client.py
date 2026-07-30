@@ -30,6 +30,7 @@ from x10.core.stark_account import StarkPerpetualAccount
 from x10.models.order import (
     OrderPriceType,
     OrderSide,
+    OrderSortBy,
     OrderTpslType,
     OrderTriggerPriceType,
     OrderType,
@@ -54,6 +55,18 @@ def filter_grid_orders(open_orders: list) -> list:
             continue
         out.append(o)
     return out
+
+
+def _is_position_tpsl(order) -> bool:
+    """判断订单是否为整仓 TPSL。"""
+    order_type = str(getattr(order, "type", "") or "").upper()
+    tp_sl_type = str(getattr(order, "tp_sl_type", "") or "").upper()
+    return order_type == "TPSL" and tp_sl_type == "POSITION"
+
+
+def filter_position_tpsl(orders: list):
+    """从开放订单中返回第一张整仓 TPSL；不存在时返回 None。"""
+    return next((order for order in orders if _is_position_tpsl(order)), None)
 
 
 class ExtendedClient(ExchangeAdapter):
@@ -317,15 +330,37 @@ class ExtendedClient(ExchangeAdapter):
         """逐单撤掉该市场的整仓 TPSL，不影响其他订单。"""
         orders = await self.get_open_orders(market)
         for order in orders:
-            order_type = str(getattr(order, "type", "") or "").upper()
-            tp_sl_type = str(getattr(order, "tp_sl_type", "") or "").upper()
-            if order_type == "TPSL" and tp_sl_type == "POSITION":
+            if _is_position_tpsl(order):
                 await self.cancel_order(order.id)
 
-    async def get_orders_history(self, market: str, limit: int = 100) -> list:
+    async def get_position_tpsl(self, market: str):
+        """查询当前市场真实挂出的整仓 TPSL。"""
+        return filter_position_tpsl(await self.get_open_orders(market))
+
+    async def get_orders_history(
+        self,
+        market: str,
+        limit: int = 100,
+        *,
+        order_type: str | OrderType | None = None,
+        sort: str | OrderSortBy | None = None,
+    ) -> list:
         """历史订单（含终态 status/filled_qty，网格判断成交 vs 过期/被撤用）。"""
-        r = await self._client.account.get_orders_history(market_names=[market], limit=limit)
+        sdk_order_type = OrderType(order_type) if order_type is not None else None
+        sdk_sort = OrderSortBy(sort) if sort is not None else None
+        r = await self._client.account.get_orders_history(
+            market_names=[market],
+            order_type=sdk_order_type,
+            limit=limit,
+            sort=sdk_sort,
+        )
         return r.data or []
+
+    async def get_order_by_id(self, market: str, order_id):
+        """按 ID 查询单笔订单；market 保留用于统一适配器接口。"""
+        del market
+        r = await self._client.account.get_order_by_id(order_id=order_id)
+        return r.data
 
     async def close(self) -> None:
         await self._client.close()

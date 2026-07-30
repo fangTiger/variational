@@ -108,6 +108,25 @@ class ExchangeAdapter(ABC):
         """撤掉当前市场的整仓 TPSL。"""
         raise NotImplementedError
 
+    async def get_position_tpsl(self, market: str) -> object | None:
+        """查询当前市场真实挂出的整仓 TPSL。"""
+        raise NotImplementedError
+
+    async def get_orders_history(
+        self,
+        market: str,
+        limit: int = 100,
+        *,
+        order_type: str | None = None,
+        sort: str | None = None,
+    ) -> list:
+        """查询历史订单，可在服务端按类型过滤和更新时间排序。"""
+        raise NotImplementedError
+
+    async def get_order_by_id(self, market: str, order_id) -> object:
+        """按交易所订单 ID 查询单笔订单。"""
+        raise NotImplementedError
+
     # ---- 通用逻辑（子类一般无需重写）----
 
     async def hedge(self, market: str, target_signed_size: Decimal):
