@@ -233,6 +233,15 @@ class ExtendedClient(ExchangeAdapter):
 
     # ---- 限价单（网格用）----
 
+    async def round_price(self, market: str, price: Decimal) -> Decimal:
+        """复用 SDK 市场配置，按该市场价格 tick 对齐。"""
+        trading_config = self._market(market).trading_config
+        return Decimal(str(trading_config.round_price(Decimal(str(price)))))
+
+    async def get_price_tick_size(self, market: str) -> Decimal:
+        """返回 SDK 市场配置中的最小价格变动。"""
+        return Decimal(str(self._market(market).trading_config.min_price_change))
+
     async def place_limit_order(
         self,
         market: str,
@@ -282,14 +291,14 @@ class ExtendedClient(ExchangeAdapter):
 
         close_side = OrderSide.SELL if signed_size > 0 else OrderSide.BUY
         market_obj = self._market(market)
-        trigger_price = market_obj.trading_config.round_price(trigger_price)
+        trigger_price = await self.round_price(market, trigger_price)
         execution_price = get_price_with_slippage(
             side=close_side,
             price=trigger_price,
             min_price_change=market_obj.trading_config.min_price_change,
             slippage=self._client.config.defaults.market_price_slippage,
         )
-        execution_price = market_obj.trading_config.round_price(execution_price)
+        execution_price = await self.round_price(market, execution_price)
         order = create_order_object(
             account=self._client.stark_account,
             order_type=OrderType.TPSL,

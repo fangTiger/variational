@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 from adapters.base import Side
@@ -43,23 +44,33 @@ def _hist(oid, status, filled_qty=0):
     return SimpleNamespace(id=oid, status=status, filled_qty=filled_qty)
 
 
-def test_filled_order_flips() -> None:
+def test_filled_order_flips(caplog) -> None:
     """真成交 → 翻反向一格。"""
     ext = FakeExt(open_orders=[], history=[_hist("o1", "FILLED")])
     eng = _engine(ext, {558: {"id": "o1", "side": Side.BUY}})
-    asyncio.run(eng._handle_fills(0.0))
+    with caplog.at_level(logging.INFO, logger="grid_engine"):
+        asyncio.run(eng._handle_fills(0.0))
     assert 558 not in eng._orders
     assert len(ext.placed) == 1 and ext.placed[0]["side"] is Side.SELL
     assert 559 in eng._orders  # 买成交 → 上一格挂卖
+    assert any(
+        "格558" in record.getMessage() and "成交" in record.getMessage()
+        for record in caplog.records
+    )
 
 
-def test_expired_order_replaced_same_level() -> None:
+def test_expired_order_replaced_same_level(caplog) -> None:
     """过期 → 原格原方向重挂，不翻单。"""
     ext = FakeExt(open_orders=[], history=[_hist("o1", "EXPIRED")])
     eng = _engine(ext, {560: {"id": "o1", "side": Side.SELL}})
-    asyncio.run(eng._handle_fills(0.0))
+    with caplog.at_level(logging.INFO, logger="grid_engine"):
+        asyncio.run(eng._handle_fills(0.0))
     assert len(ext.placed) == 1 and ext.placed[0]["side"] is Side.SELL
     assert eng._orders[560]["id"] == "new-1"  # 同格新单
+    assert any(
+        "EXPIRED" in record.getMessage() and "重挂" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_partial_fill_then_expired_flips() -> None:
@@ -70,12 +81,17 @@ def test_partial_fill_then_expired_flips() -> None:
     assert len(ext.placed) == 1 and ext.placed[0]["side"] is Side.SELL
 
 
-def test_frozen_side_not_replenished() -> None:
+def test_frozen_side_not_replenished(caplog) -> None:
     """冻结 BUY 时，买单过期不重挂买单。"""
     ext = FakeExt(open_orders=[], history=[_hist("o1", "EXPIRED")])
     eng = _engine(ext, {558: {"id": "o1", "side": Side.BUY}})
-    asyncio.run(eng._handle_fills(0.0, blocked_side="BUY"))
+    with caplog.at_level(logging.INFO, logger="grid_engine"):
+        asyncio.run(eng._handle_fills(0.0, blocked_side="BUY"))
     assert ext.placed == []
+    assert any(
+        "格558" in record.getMessage() and "冻结" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_partial_fill_uses_filled_qty() -> None:
@@ -105,13 +121,15 @@ def test_unknown_status_retained_for_retry_without_flip() -> None:
     assert ext.placed == []
 
 
-def test_still_open_untouched() -> None:
+def test_still_open_untouched(caplog) -> None:
     """仍在盘口的单不动。"""
     ext = FakeExt(open_orders=[SimpleNamespace(id="o1")], history=[])
     eng = _engine(ext, {560: {"id": "o1", "side": Side.SELL}})
-    asyncio.run(eng._handle_fills(0.0))
+    with caplog.at_level(logging.DEBUG, logger="grid_engine"):
+        asyncio.run(eng._handle_fills(0.0))
     assert eng._orders[560]["id"] == "o1"
     assert ext.placed == []
+    assert any("仍在盘口" in record.getMessage() for record in caplog.records)
 
 
 def test_cancel_keeps_record_on_failure() -> None:
@@ -127,7 +145,7 @@ def test_cancel_keeps_record_on_failure() -> None:
     assert 560 in eng._orders  # 撤单失败 → 记录保留，下轮重试
 
 
-def test_within_cap_uses_real_inventory() -> None:
+def test_within_cap_uses_real_inventory(caplog) -> None:
     """已有多头库存接近上限时，不应再允许新增买单。"""
     ext = FakeExt()
     eng = GridEngine(ext, GridConfig(dry_run=False, unit_usd=200, max_inventory_usd=1600))
@@ -135,6 +153,27 @@ def test_within_cap_uses_real_inventory() -> None:
     assert eng._within_cap(Side.BUY, inv_usd=1500.0) is False
     # 持多头 $1000，挂 $200 到 $1200 < 上限 → 允许
     assert eng._within_cap(Side.BUY, inv_usd=1000.0) is True
+
+    with caplog.at_level(logging.INFO, logger="grid_engine"):
+        asyncio.run(eng._place(558, Side.BUY, inv_usd=1500.0, why="补买格"))
+        asyncio.run(eng._place(559, Side.BUY, inv_usd=1500.0, why="补买格"))
+    cap_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "库存上限拒绝挂单" in record.getMessage()
+    ]
+    assert len(cap_messages) == 1, "相同库存拒绝不得每轮重复打 INFO"
+    assert all(
+        item in cap_messages[0]
+        for item in (
+            "格558",
+            "方向=BUY",
+            "inventory_usd=",
+            "pending_usd=",
+            "unit=",
+            "max_inventory_usd=",
+        )
+    )
 
 
 def test_within_cap_same_orders_respects_real_inventory() -> None:

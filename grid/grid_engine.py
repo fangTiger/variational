@@ -44,6 +44,8 @@ _TPSL_EXCHANGE_TRIGGER_TOLERANCE_ABS = Decimal("0.1")
 _TPSL_EXCHANGE_TRIGGER_TOLERANCE_PCT = Decimal("0.000001")
 # 连续多轮无法解析单笔终态时升级告警，但仍不得猜测终态或补重复单。
 _ORDER_STATUS_CRITICAL_RETRIES = 3
+# 相同库存拒绝只在首次、状态变化或累计到整百次时打 INFO。
+_CAP_REJECTION_SUMMARY_EVERY = 100
 
 
 @dataclass
@@ -92,6 +94,7 @@ class GridEngine:
         self._last_mark: float | None = None
         self._last_inv: Decimal | float | None = None
         self._current_tpsl: tuple[Decimal, Decimal] | None = None
+        self._cap_rejection_state: dict[Side, dict] = {}
 
     @property
     def _log_step(self) -> float:
@@ -186,6 +189,37 @@ class GridEngine:
         if self._current_closed_bar_key != self._last_recenter_bar_key:
             self._neutral_bars += 1
             self._last_recenter_bar_key = self._current_closed_bar_key
+
+    async def _round_market_price(self, price: Decimal) -> Decimal:
+        """优先使用适配器的 tick 对齐能力；旧桩缺失该能力时原样降级。"""
+        price = Decimal(str(price))
+        rounder = getattr(self.ext, "round_price", None)
+        if not callable(rounder):
+            return price
+        try:
+            rounded = Decimal(
+                str(await rounder(self.config.market, price))
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("按市场 tick 对齐价格失败，暂用原值 %s：%s", price, exc)
+            return price
+        if rounded <= 0:
+            logger.warning("适配器返回无效取整价格 %s，暂用原值 %s", rounded, price)
+            return price
+        return rounded
+
+    async def _price_tick_size(self) -> Decimal | None:
+        """读取适配器 tick，用于交易所回读比较的半 tick 容差兜底。"""
+        getter = getattr(self.ext, "get_price_tick_size", None)
+        if not callable(getter):
+            return None
+        try:
+            tick = await getter(self.config.market)
+            tick = Decimal(str(tick)) if tick is not None else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取市场价格 tick 失败，将只使用固定容差：%s", exc)
+            return None
+        return tick if tick is not None and tick > 0 else None
 
     async def _advance_band(self, mark: float, mode: GridMode) -> None:
         """推进 ACTIVE/FROZEN 两态；既有 band 在越界时绝不随 mark 移动。"""
@@ -372,6 +406,10 @@ class GridEngine:
                 else:
                     trigger_price = min(trigger_price, previous_trigger)
 
+        # 引擎、适配器和交易所必须共享同一个 tick 对齐目标值。
+        trigger_price = await self._round_market_price(trigger_price)
+        price_tick = await self._price_tick_size()
+
         if previous is not None:
             previous_size, previous_trigger = previous
             relative_change = (
@@ -404,10 +442,16 @@ class GridEngine:
                         exchange_trigger = getattr(stop_loss, "trigger_price", None)
                     if exchange_trigger is not None:
                         exchange_trigger = Decimal(str(exchange_trigger))
+                        exchange_trigger = await self._round_market_price(
+                            exchange_trigger
+                        )
                         exchange_tolerance = max(
                             _TPSL_EXCHANGE_TRIGGER_TOLERANCE_ABS,
                             abs(previous_trigger)
                             * _TPSL_EXCHANGE_TRIGGER_TOLERANCE_PCT,
+                            price_tick / 2
+                            if price_tick is not None
+                            else Decimal("0"),
                         )
                         exchange_matches = (
                             abs(exchange_trigger - previous_trigger)
@@ -737,15 +781,26 @@ class GridEngine:
         - blocked_side：跳过即将挂出的同方向新单。
         """
         if self.config.dry_run:
+            logger.debug("dry_run：跳过成交终态处理")
             return
         open_ids = await self._open_ids()
-        for rec in self._orders.values():
+        for lv, rec in self._orders.items():
             if rec["id"] in open_ids:
                 # 订单重新出现在盘口时解除终态待确认标记。
+                was_pending = bool(rec.get("status_pending"))
                 rec.pop("status_pending", None)
                 rec.pop("status_lookup_attempts", None)
+                if was_pending:
+                    logger.info(
+                        "格%d 订单 %s 已重新出现在盘口，解除终态待确认",
+                        lv,
+                        rec["id"],
+                    )
+                else:
+                    logger.debug("格%d 订单 %s 仍在盘口，不处理", lv, rec["id"])
         missing = {lv: rec for lv, rec in self._orders.items() if rec["id"] not in open_ids}
         if not missing:
+            logger.debug("成交检查完成：没有从盘口消失的跟踪单")
             return
         statuses = await self._order_statuses({rec["id"] for rec in missing.values()})
         for lv, rec in missing.items():
@@ -767,12 +822,20 @@ class GridEngine:
                         rec["id"],
                         attempts,
                     )
-                else:
+                elif attempts == 1:
                     logger.warning(
                         "格%d 订单 %s 终态=%s，保留记录下轮重试",
                         lv,
                         rec["id"],
                         status or "未知",
+                    )
+                else:
+                    logger.debug(
+                        "格%d 订单 %s 终态仍为%s，已重试 %d 轮；继续冻结该格",
+                        lv,
+                        rec["id"],
+                        status or "未知",
+                        attempts,
                     )
                 continue
 
@@ -786,12 +849,41 @@ class GridEngine:
                 else:                             # 卖成交 → 下一格挂买
                     next_level, next_side = lv - 1, Side.BUY
                     fill_why = f"{lv}卖成交→挂买"
+                logger.info(
+                    "格%d 订单 %s 终态=%s、filled_qty=%s，判定为成交；"
+                    "计划格%d %s 翻单",
+                    lv,
+                    rec["id"],
+                    status,
+                    filled,
+                    next_level,
+                    next_side.value,
+                )
                 if self._side_is_blocked(next_side, blocked_side):
+                    logger.info(
+                        "格%d 成交后的 %s 翻单被当前冻结方向 %s 阻止",
+                        lv,
+                        next_side.value,
+                        blocked_side,
+                    )
                     continue
                 qty = filled if filled > 0 else None
                 await self._place(next_level, next_side, inv_usd, why=fill_why, qty=qty)
             elif status in ("EXPIRED", "CANCELLED"):
+                logger.info(
+                    "格%d 订单 %s 终态=%s 且无成交，准备原格 %s 重挂",
+                    lv,
+                    rec["id"],
+                    status,
+                    rec["side"].value,
+                )
                 if self._side_is_blocked(rec["side"], blocked_side):
+                    logger.info(
+                        "格%d %s 原格重挂被当前冻结方向 %s 阻止",
+                        lv,
+                        rec["side"].value,
+                        blocked_side,
+                    )
                     continue
                 await self._place(lv, rec["side"], inv_usd, why=f"格{lv}{status}重挂")
             else:
@@ -843,12 +935,59 @@ class GridEngine:
                 await self._cancel(lv, why="撤陈单/越界单/冻结侧单")
         return "；".join(acted) if acted else "阶梯已就位"
 
-    def _within_cap(self, side: Side, inv_usd: float) -> bool:
-        """严格库存上限：真实持仓与该侧挂单全部成交后仍不超上限。"""
+    def _cap_components(
+        self,
+        side: Side,
+        inv_usd: float,
+    ) -> tuple[float, float, float, float]:
+        """返回库存上限算式的四项，供判断与日志共享。"""
         unit = self.config.unit_usd
         inventory_usd = inv_usd if side is Side.BUY else -inv_usd
         pending_usd = sum(unit for rec in self._orders.values() if rec["side"] is side)
-        return inventory_usd + pending_usd + unit <= self.config.max_inventory_usd
+        return inventory_usd, pending_usd, unit, self.config.max_inventory_usd
+
+    def _within_cap(self, side: Side, inv_usd: float) -> bool:
+        """严格库存上限：真实持仓与该侧挂单全部成交后仍不超上限。"""
+        inventory_usd, pending_usd, unit, cap = self._cap_components(side, inv_usd)
+        return inventory_usd + pending_usd + unit <= cap
+
+    def _log_cap_rejection(
+        self,
+        level: int,
+        side: Side,
+        inv_usd: float,
+        why: str,
+    ) -> None:
+        """库存拒绝按状态变化记录，重复事件只做 DEBUG/整百次聚合。"""
+        inventory_usd, pending_usd, unit, cap = self._cap_components(side, inv_usd)
+        projected = inventory_usd + pending_usd + unit
+        signature = (inventory_usd, pending_usd, unit, cap, why)
+        previous = self._cap_rejection_state.get(side)
+        repeated = previous is not None and previous["signature"] == signature
+        count = int(previous["count"]) + 1 if repeated else 1
+        self._cap_rejection_state[side] = {
+            "signature": signature,
+            "count": count,
+        }
+        log = (
+            logger.info
+            if not repeated or count % _CAP_REJECTION_SUMMARY_EVERY == 0
+            else logger.debug
+        )
+        log(
+            "库存上限拒绝挂单：格%d 方向=%s 原因=%s；"
+            "inventory_usd=%.2f + pending_usd=%.2f + unit=%.2f"
+            " = %.2f > max_inventory_usd=%.2f；同类累计=%d",
+            level,
+            side.value,
+            why or "未说明",
+            inventory_usd,
+            pending_usd,
+            unit,
+            projected,
+            cap,
+            count,
+        )
 
     async def _place(
         self,
@@ -859,7 +998,8 @@ class GridEngine:
         qty: Decimal | None = None,
     ) -> str | None:
         if not self._within_cap(side, inv_usd):
-            return None  # 超库存上限，不挂
+            self._log_cap_rejection(level, side, inv_usd, why)
+            return None
         lp = self._level_price(level)
         qty = qty if qty is not None else Decimal(str(self.config.unit_usd)) / lp
         msg = f"{why}：{side.value} {qty:.6f}@{lp:.0f}(格{level})"

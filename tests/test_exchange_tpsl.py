@@ -70,6 +70,8 @@ def test_position_stop_loss_rounds_trigger_and_execution_prices(monkeypatch) -> 
         lambda **kwargs: kwargs,
     )
 
+    rounded = asyncio.run(client.round_price("BTC-USD", Decimal("88.123")))
+    tick = asyncio.run(client.get_price_tick_size("BTC-USD"))
     asyncio.run(
         client.place_position_stop_loss(
             "BTC-USD",
@@ -78,7 +80,13 @@ def test_position_stop_loss_rounds_trigger_and_execution_prices(monkeypatch) -> 
         )
     )
 
-    assert rounded_inputs == [Decimal("88.123"), Decimal("87.654")]
+    assert rounded == Decimal("88.1")
+    assert tick == Decimal("0.1")
+    assert rounded_inputs == [
+        Decimal("88.123"),
+        Decimal("88.123"),
+        Decimal("87.654"),
+    ]
     stop_loss = placed_orders[0]["stop_loss"]
     assert stop_loss.trigger_price == Decimal("88.1")
     assert stop_loss.price == Decimal("87.7")
