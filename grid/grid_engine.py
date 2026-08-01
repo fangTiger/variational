@@ -16,6 +16,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -46,6 +47,9 @@ _TPSL_EXCHANGE_TRIGGER_TOLERANCE_PCT = Decimal("0.000001")
 _ORDER_STATUS_CRITICAL_RETRIES = 3
 # 相同库存拒绝只在首次、状态变化或累计到整百次时打 INFO。
 _CAP_REJECTION_SUMMARY_EVERY = 100
+# 交易所时间与本机可能有轻微偏差；对账时允许一分钟时钟偏移。
+_RETRY_RECONCILE_CLOCK_SKEW_SECONDS = 60.0
+_RETRY_MAX_ATTEMPTS = 10
 
 
 @dataclass
@@ -80,6 +84,18 @@ class GridEngine:
         self.config = config or GridConfig()
         self._fng_provider = fng_provider
         self._orders: dict[int, dict] = {}   # level -> {"id":..., "side": Side}
+        self._retry: dict[int, dict] = {}
+        self._counters = {
+            "fill_detected": 0,
+            "replacement_placed": 0,
+            "replacement_failed": 0,
+            "terminal_unknown": 0,
+            "rejected_terminal": 0,
+            "dup_skipped": 0,
+            "bad_snapshot": 0,
+            "orphan_adopted": 0,
+        }
+        self._counters_started_at = time.time()
         self._mode = GridMode.NEUTRAL        # 上一轮 regime（迟滞用）
         self._running = False
         self._state: GridState | None = None
@@ -769,6 +785,242 @@ class GridEngine:
                 statuses[order_id] = order
         return statuses
 
+    def _queue_retry(
+        self,
+        level: int,
+        side: Side,
+        qty: Decimal | None,
+        why: str,
+    ) -> dict:
+        """保留同档既有重试次数，只刷新本次挂单意图。"""
+        entry = self._retry.setdefault(
+            level,
+            {
+                "side": side,
+                "qty": qty,
+                "why": why,
+                "attempts": 0,
+                "exhausted": False,
+                "requested_at": time.time(),
+            },
+        )
+        entry["side"], entry["qty"], entry["why"] = side, qty, why
+        entry.setdefault("attempts", 0)
+        entry.setdefault("exhausted", False)
+        entry.setdefault("requested_at", time.time())
+        return entry
+
+    async def _drain_retry(
+        self,
+        inv_usd: float,
+        blocked_side: str | None,
+    ) -> None:
+        """完全 ACTIVE 时双源对账翻单意图，确认不存在后才重试。"""
+        if blocked_side is not None or not self._retry:
+            return
+
+        try:
+            open_snapshot = await self.ext.get_open_orders(self.config.market)
+            hist_snapshot = await self.ext.get_orders_history(
+                self.config.market,
+                limit=100,
+                order_type="LIMIT",
+                sort="UPDATED_AT",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("翻单重试双源对账失败，本轮不重挂：%s", exc)
+            return
+
+        def field(order, *names):
+            for name in names:
+                value = (
+                    order.get(name)
+                    if isinstance(order, dict)
+                    else getattr(order, name, None)
+                )
+                if value is not None:
+                    return value
+            return None
+
+        def normalized(value) -> str:
+            value = getattr(value, "value", value)
+            return str(value or "").upper().rsplit(".", 1)[-1]
+
+        def close_decimal(left: Decimal, right: Decimal) -> bool:
+            tolerance = max(
+                Decimal("1e-12"),
+                abs(right) * Decimal("1e-9"),
+            )
+            return abs(left - right) <= tolerance
+
+        def within_request_window(order, requested_at: float) -> bool:
+            if requested_at <= 0:
+                return True
+            raw = field(
+                order,
+                "created_at",
+                "created_time",
+                "timestamp",
+                "updated_at",
+                "updated_time",
+            )
+            if raw is None:
+                # 旧桩或旧 SDK 没暴露时间字段时，仍由三元匹配保护。
+                return True
+            if isinstance(raw, datetime):
+                order_time = raw.timestamp()
+            else:
+                try:
+                    order_time = float(raw)
+                except (TypeError, ValueError):
+                    try:
+                        order_time = datetime.fromisoformat(
+                            str(raw).replace("Z", "+00:00")
+                        ).timestamp()
+                    except ValueError:
+                        return True
+                while order_time > 100_000_000_000:
+                    order_time /= 1000
+            return (
+                order_time + _RETRY_RECONCILE_CLOCK_SKEW_SECONDS
+                >= requested_at
+            )
+
+        price_rounder = getattr(self.ext, "round_price", None)
+        amount_rounder = getattr(self.ext, "round_amount", None)
+
+        async def aligned_price(value) -> Decimal:
+            result = Decimal(str(value))
+            if callable(price_rounder):
+                result = await price_rounder(self.config.market, result)
+            return Decimal(str(result))
+
+        async def aligned_amount(value) -> Decimal:
+            result = Decimal(str(value))
+            if callable(amount_rounder):
+                result = await amount_rounder(self.config.market, result)
+            return Decimal(str(result))
+
+        async def matches(order, entry, target_price, target_qty) -> bool:
+            if normalized(field(order, "side")) != entry["side"].value:
+                return False
+            raw_price = field(order, "price")
+            raw_qty = field(
+                order,
+                "qty",
+                "amount",
+                "quantity",
+                "size",
+                "amount_of_synthetic",
+                "filled_qty",
+            )
+            if raw_price is None or raw_qty is None:
+                return False
+            candidate_price = await aligned_price(raw_price)
+            candidate_qty = await aligned_amount(raw_qty)
+            return (
+                close_decimal(candidate_price, target_price)
+                and close_decimal(candidate_qty, target_qty)
+                and within_request_window(
+                    order,
+                    float(entry.get("requested_at", 0) or 0),
+                )
+            )
+
+        terminal_statuses = {"FILLED", "CANCELLED", "EXPIRED", "REJECTED"}
+        for level, entry in list(self._retry.items()):
+            if entry.get("exhausted"):
+                continue
+            side = entry["side"]
+            price = self._level_price(level)
+            qty = entry.get("qty")
+            if qty is None:
+                qty = Decimal(str(self.config.unit_usd)) / price
+            try:
+                target_price = await aligned_price(price)
+                target_qty = await aligned_amount(qty)
+                open_matches = [
+                    order
+                    for order in open_snapshot
+                    if await matches(order, entry, target_price, target_qty)
+                ]
+                hist_matches = [
+                    order
+                    for order in hist_snapshot
+                    if await matches(order, entry, target_price, target_qty)
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("格%d 翻单精度对齐失败，本轮保留队列：%s", level, exc)
+                continue
+
+            if len(open_matches) > 1 or len(hist_matches) > 1:
+                logger.critical(
+                    "格%d 翻单双源对账命中多笔：open=%d history=%d；"
+                    "保留队列等待人工处理",
+                    level,
+                    len(open_matches),
+                    len(hist_matches),
+                )
+                continue
+
+            if len(open_matches) == 1:
+                order = open_matches[0]
+                self._orders[level] = {"id": field(order, "id"), "side": side}
+                self._counters["orphan_adopted"] += 1
+                self._retry.pop(level, None)
+                logger.warning(
+                    "格%d 翻单在盘口找到既有订单 %s，已接管且不重挂",
+                    level,
+                    field(order, "id"),
+                )
+                continue
+
+            if len(hist_matches) == 1:
+                order = hist_matches[0]
+                status = normalized(field(order, "status"))
+                if status in terminal_statuses:
+                    self._retry.pop(level, None)
+                    logger.warning(
+                        "格%d 翻单在历史中找到终态订单 %s（%s），已闭环且不重挂",
+                        level,
+                        field(order, "id"),
+                        status,
+                    )
+                else:
+                    logger.warning(
+                        "格%d 翻单在历史中命中非终态订单 %s（%s），"
+                        "本轮保留队列不重挂",
+                        level,
+                        field(order, "id"),
+                        status or "未知",
+                    )
+                continue
+
+            # 库存上限是正常风控，既不下单也不消耗重试次数。
+            if not self._within_cap(side, inv_usd):
+                self._log_cap_rejection(level, side, inv_usd, entry.get("why", ""))
+                continue
+            placed = await self._place(
+                level,
+                side,
+                inv_usd,
+                why=entry.get("why", ""),
+                qty=entry.get("qty"),
+                retrying=True,
+            )
+            if placed is not None:
+                self._retry.pop(level, None)
+                continue
+            entry["attempts"] = int(entry.get("attempts", 0)) + 1
+            if entry["attempts"] >= _RETRY_MAX_ATTEMPTS:
+                entry["exhausted"] = True
+                logger.critical(
+                    "格%d 翻单已连续重试 %d 次失败；保留意图并暂停自动重试，"
+                    "请人工处理",
+                    level,
+                    entry["attempts"],
+                )
+
     async def _handle_fills(self, inv_usd: float, blocked_side: str | None = None) -> None:
         """处理从盘口消失的跟踪单——按交易所终态区分，只有真成交才翻单。
 
@@ -783,6 +1035,7 @@ class GridEngine:
         if self.config.dry_run:
             logger.debug("dry_run：跳过成交终态处理")
             return
+        await self._drain_retry(inv_usd, blocked_side)
         open_ids = await self._open_ids()
         for lv, rec in self._orders.items():
             if rec["id"] in open_ids:
@@ -861,11 +1114,13 @@ class GridEngine:
                 )
                 if self._side_is_blocked(next_side, blocked_side):
                     logger.info(
-                        "格%d 成交后的 %s 翻单被当前冻结方向 %s 阻止",
+                        "格%d 成交后的 %s 翻单被当前冻结方向 %s 阻止，已进入重试队列",
                         lv,
                         next_side.value,
                         blocked_side,
                     )
+                    qty = filled if filled > 0 else None
+                    self._queue_retry(next_level, next_side, qty, fill_why)
                     continue
                 qty = filled if filled > 0 else None
                 await self._place(next_level, next_side, inv_usd, why=fill_why, qty=qty)
@@ -996,13 +1251,25 @@ class GridEngine:
         inv_usd: float,
         why: str = "",
         qty: Decimal | None = None,
+        retrying: bool = False,
     ) -> str | None:
+        if level in self._orders:
+            self._counters["dup_skipped"] += 1
+            logger.debug("格%d 已有跟踪单，跳过", level)
+            return None
+        # retrying=True 是 drain 的专用通道：只绕过 _retry 去重；
+        # _orders 去重与 attempts 累加照常，绝不临时移除队列记录。
+        if not retrying and level in self._retry:
+            self._counters["dup_skipped"] += 1
+            logger.debug("格%d 在重试队列中，普通补格跳过", level)
+            return None
         if not self._within_cap(side, inv_usd):
             self._log_cap_rejection(level, side, inv_usd, why)
             return None
         lp = self._level_price(level)
         qty = qty if qty is not None else Decimal(str(self.config.unit_usd)) / lp
         msg = f"{why}：{side.value} {qty:.6f}@{lp:.0f}(格{level})"
+        is_replacement = "翻单" in why or "成交→" in why
         if self.config.dry_run:
             logger.info("[dry_run] %s", msg)
             self._orders[level] = {"id": f"dry-{level}", "side": side}
@@ -1011,14 +1278,35 @@ class GridEngine:
             res = await self.ext.place_limit_order(self.config.market, side, qty, lp)
             data = getattr(res, "data", None)
             oid = getattr(data, "id", None) or getattr(res, "id", None)
-            if str(getattr(data, "status", "") or "") == "REJECTED":
-                logger.warning("%s → 被拒(%s)，不入账", msg, getattr(data, "status_reason", None))
+            status = str(
+                getattr(data, "status", None) or getattr(res, "status", "") or ""
+            ).upper()
+            if status.rsplit(".", 1)[-1] == "REJECTED":
+                self._queue_retry(level, side, qty, why)
+                if is_replacement:
+                    self._counters["replacement_failed"] += 1
+                logger.warning(
+                    "%s → 被拒(%s)，已进入重试队列",
+                    msg,
+                    getattr(data, "status_reason", None),
+                )
+                return None
+            if not oid:
+                self._queue_retry(level, side, qty, why)
+                if is_replacement:
+                    self._counters["replacement_failed"] += 1
+                logger.warning("%s → 响应缺少订单 ID，已进入重试队列", msg)
                 return None
             self._orders[level] = {"id": oid, "side": side}
+            if is_replacement:
+                self._counters["replacement_placed"] += 1
             logger.info("%s → id=%s", msg, oid)
             return msg
         except Exception as exc:  # noqa: BLE001
-            logger.warning("挂单失败 %s：%s", msg, exc)
+            self._queue_retry(level, side, qty, why)
+            if is_replacement:
+                self._counters["replacement_failed"] += 1
+            logger.warning("挂单失败 %s：%s；已进入重试队列", msg, exc)
             return None
 
     async def _cancel(self, level: int, why: str = "") -> None:

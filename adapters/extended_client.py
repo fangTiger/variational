@@ -238,6 +238,10 @@ class ExtendedClient(ExchangeAdapter):
         trading_config = self._market(market).trading_config
         return Decimal(str(trading_config.round_price(Decimal(str(price)))))
 
+    async def round_amount(self, market: str, amount: Decimal) -> Decimal:
+        """复用 SDK 市场配置，按该市场数量步长对齐。"""
+        return self._round_qty(market, amount)
+
     async def get_price_tick_size(self, market: str) -> Decimal:
         """返回 SDK 市场配置中的最小价格变动。"""
         return Decimal(str(self._market(market).trading_config.min_price_change))

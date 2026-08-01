@@ -103,6 +103,14 @@ class ExchangeAdapter(ABC):
         del market
         return Decimal(str(price))
 
+    async def round_amount(self, market: str, amount: Decimal) -> Decimal:
+        """按市场数量步长对齐；不支持市场元数据的适配器原样返回。
+
+        这是可选能力，保留默认实现以兼容旧适配器与测试桩。
+        """
+        del market
+        return Decimal(str(amount))
+
     async def get_price_tick_size(self, market: str) -> Decimal | None:
         """返回市场价格 tick；无法取得时返回 None。"""
         del market
