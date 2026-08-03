@@ -622,7 +622,7 @@ class GridEngine:
             "closed_loops": self._closed_loops,
             "realized_pnl_net": float(self._realized_pnl_net),
             "max_abs_inv_usd": self._max_abs_inv_usd,
-            # 适配器尚不提供资金费；该值只含成交价差减订单手续费。
+            # 纯价差合计，未计手续费（maker 为 0）也未计资金费。
             "funding_included": False,
             "consecutive_failures": self._consecutive_failures,
             "last_success_ts": self._last_success_ts,
@@ -1240,15 +1240,8 @@ class GridEngine:
                     if raw_fill_price is not None
                     else None
                 )
-                raw_fee = (
-                    getattr(o, "payed_fee", None)
-                    or getattr(o, "fee", None)
-                    or Decimal("0")
-                )
-                fill_fee = Decimal(str(raw_fee))
                 previous_fill = self._loop_fills.get(lv)
                 unmatched_fill_qty = filled
-                unmatched_fill_fee = fill_fee
                 if (
                     previous_fill is not None
                     and previous_fill["side"] is not rec["side"]
@@ -1267,27 +1260,15 @@ class GridEngine:
                         else previous_fill["price"]
                     )
                     loop_qty = min(filled, previous_fill["qty"])
-                    previous_fee = (
-                        previous_fill["fee"]
-                        * loop_qty
-                        / previous_fill["qty"]
-                    )
-                    current_fee = fill_fee * loop_qty / filled
-                    self._realized_pnl_net += (
-                        (sell_price - buy_price) * loop_qty
-                        - previous_fee
-                        - current_fee
-                    )
+                    self._realized_pnl_net += (sell_price - buy_price) * loop_qty
                     self._closed_loops += 1
                     previous_remaining = previous_fill["qty"] - loop_qty
                     if previous_remaining > 0:
                         self._loop_fills[lv] = {
                             **previous_fill,
                             "qty": previous_remaining,
-                            "fee": previous_fill["fee"] - previous_fee,
                         }
                     unmatched_fill_qty = filled - loop_qty
-                    unmatched_fill_fee = fill_fee - current_fee
                 if rec["side"] is Side.BUY:      # 买成交 → 上一格挂卖止盈
                     next_level, next_side = lv + 1, Side.SELL
                     fill_why = f"{lv}买成交→挂卖"
@@ -1319,14 +1300,12 @@ class GridEngine:
                             )
                             / merged_qty,
                             "qty": merged_qty,
-                            "fee": existing_fill["fee"] + unmatched_fill_fee,
                         }
                     else:
                         self._loop_fills[next_level] = {
                             "side": rec["side"],
                             "price": fill_price,
                             "qty": unmatched_fill_qty,
-                            "fee": unmatched_fill_fee,
                         }
                 if self._side_is_blocked(next_side, blocked_side):
                     logger.info(

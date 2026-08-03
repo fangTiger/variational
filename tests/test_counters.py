@@ -151,7 +151,7 @@ def test_retry_preserves_explicit_replacement_flag() -> None:
 
 
 def test_opposite_fills_form_one_closed_loop_from_actual_prices() -> None:
-    """相邻档反向成交按实际成交价和双边费用结算一个闭环。"""
+    """realized_pnl_net 按实际成交价累计纯价差，不含手续费。"""
     first_fill = _history_order(
         "buy-1",
         "FILLED",
@@ -177,11 +177,11 @@ def test_opposite_fills_form_one_closed_loop_from_actual_prices() -> None:
     asyncio.run(eng._handle_fills(0.0, blocked_side=None))
 
     assert eng._closed_loops == 1
-    assert eng._realized_pnl_net == Decimal("19.5")
+    assert eng._realized_pnl_net == Decimal("20")
 
 
-def test_partial_loop_prorates_fees_and_keeps_unmatched_open_leg() -> None:
-    """部分反向成交只结算已配对数量，并保留上一腿的剩余数量与费用。"""
+def test_partial_loop_keeps_unmatched_open_leg() -> None:
+    """部分反向成交只配对已有数量，剩余腿留待下次配对。"""
     ext = CounterExt(
         history=[
             _history_order(
@@ -209,9 +209,9 @@ def test_partial_loop_prorates_fees_and_keeps_unmatched_open_leg() -> None:
     asyncio.run(eng._handle_fills(0.0, blocked_side=None))
 
     assert eng._closed_loops == 1
-    assert eng._realized_pnl_net == Decimal("9.8")
+    # 配对量 min(1, 2)=1，纯价差 (110-100)×1；原断言 9.8 含两笔按比例分摊的手续费。
+    assert eng._realized_pnl_net == Decimal("10")
     assert eng._loop_fills[49]["qty"] == Decimal("1")
-    assert eng._loop_fills[49]["fee"] == Decimal("0.1")
 
     ext.history = [
         _history_order(
@@ -226,7 +226,6 @@ def test_partial_loop_prorates_fees_and_keeps_unmatched_open_leg() -> None:
 
     assert eng._loop_fills[49]["qty"] == Decimal("2")
     assert eng._loop_fills[49]["price"] == Decimal("101")
-    assert eng._loop_fills[49]["fee"] == Decimal("0.22")
 
 
 def test_rejected_terminal_is_counted_from_history() -> None:
