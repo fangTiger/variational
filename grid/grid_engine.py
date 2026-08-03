@@ -64,7 +64,8 @@ class GridConfig:
     adx_resume: float = 999.0            # 迟滞：OFF 后 ADX 须回落到此值以下才恢复
     donchian_period: int = 48
     candle_lookback: int = 200
-    poll_interval: float = 10.0
+    poll_interval: float = 2.5
+    slow_interval: float = 30.0
     dry_run: bool = True
     trend_aware: bool = False
     band_k: float = 1.75
@@ -122,6 +123,7 @@ class GridEngine:
         self._cap_rejection_state: dict[Side, dict] = {}
         self._consecutive_failures = 0
         self._last_success_ts = time.time()
+        self._connectivity_critical = False
         self._write_budget = self.config.max_writes_per_round
         self._by_id_lookup_budget = self.config.max_by_id_lookups_per_round
         self._write_budget_exhausted_this_round = False
@@ -645,8 +647,8 @@ class GridEngine:
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, live_path)
 
-    async def _run_once_trend_aware(self) -> str:
-        """趋势感知单轮：保护性执行优先，K 线失败只跳过补格。"""
+    async def _run_once_trend_aware(self, include_slow: bool = True) -> str:
+        """趋势感知单轮：每轮保护性执行，按需追加 K 线与补格慢路径。"""
         if self._state is None:
             self._state = load_state(self.config.state_path)
         if self._state is not None and self._state.halted:
@@ -711,6 +713,9 @@ class GridEngine:
             blocked_side = state.blocked_side if state is not None else "BOTH"
         # _handle_fills 内部会先 drain retry；外层不得重复调用。
         await self._handle_fills(inv_usd, blocked_side=blocked_side)
+
+        if not include_slow:
+            return "快速执行完成"
 
         try:
             r = await self.ext._client.info.get_candles_history(
@@ -811,12 +816,12 @@ class GridEngine:
         await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
         return result
 
-    async def run_once(self) -> str:
+    async def run_once(self, include_slow: bool = True) -> str:
         self._write_budget = self.config.max_writes_per_round
         self._by_id_lookup_budget = self.config.max_by_id_lookups_per_round
         self._write_budget_exhausted_this_round = False
         if self.config.trend_aware:
-            return await self._run_once_trend_aware()
+            return await self._run_once_trend_aware(include_slow=include_slow)
 
         # 指标 + regime
         r = await self.ext._client.info.get_candles_history(
@@ -1805,22 +1810,35 @@ class GridEngine:
         logger.info("网格引擎启动（dry_run=%s，格距%.1f%%，每边%d格，库存上限$%.0f）",
                     self.config.dry_run, self.config.spacing_pct * 100,
                     self.config.levels_per_side, self.config.max_inventory_usd)
+        next_fast = time.monotonic()
+        last_slow = 0.0
         while self._running:
             started = time.monotonic()
+            include_slow = (
+                started - last_slow >= self.config.slow_interval
+            )
             try:
-                await self.run_once()
+                if self.config.trend_aware:
+                    await self.run_once(include_slow=include_slow)
+                else:
+                    # 旧模式仍保持每轮完整执行，避免改变其既有语义。
+                    await self.run_once()
+                if include_slow:
+                    last_slow = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 self._consecutive_failures += 1
                 elapsed = time.monotonic() - started
                 logger.exception("本轮异常（耗时 %.2f 秒）：%s", elapsed, exc)
-                if self._consecutive_failures == 5:
-                    disconnected_minutes = (
-                        time.time() - self._last_success_ts
-                    ) / 60
+                disconnected_seconds = time.time() - self._last_success_ts
+                if (
+                    disconnected_seconds >= self.config.slow_interval * 2
+                    and not self._connectivity_critical
+                ):
+                    self._connectivity_critical = True
                     logger.critical(
                         "引擎连续失败 %d 轮，已失联 %.1f 分钟",
                         self._consecutive_failures,
-                        disconnected_minutes,
+                        disconnected_seconds / 60,
                     )
                 try:
                     self._dump_connectivity()
@@ -1829,12 +1847,18 @@ class GridEngine:
             else:
                 self._consecutive_failures = 0
                 self._last_success_ts = time.time()
+                self._connectivity_critical = False
                 logger.info("本轮完成，耗时 %.2f 秒", time.monotonic() - started)
                 try:
                     self._dump_connectivity()
                 except Exception as snapshot_exc:  # noqa: BLE001
                     logger.exception("成功轮次更新 live 快照失败：%s", snapshot_exc)
-            await asyncio.sleep(self.config.poll_interval)
+            next_fast += self.config.poll_interval
+            now = time.monotonic()
+            if now - next_fast > self.config.poll_interval:
+                # 丢弃已错过的轮次，避免故障恢复后连续空转追赶。
+                next_fast = now
+            await asyncio.sleep(max(0.0, next_fast - time.monotonic()))
 
     def stop(self) -> None:
         self._running = False

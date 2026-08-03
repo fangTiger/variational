@@ -135,7 +135,7 @@ def test_failed_rounds_increment_counter_and_write_live_snapshot(
     monkeypatch,
     caplog,
 ) -> None:
-    """整轮快速失败时也必须把连续失败数写进 live 快照。"""
+    """短时连续失败写入快照，但未满 60 秒不得升级 CRITICAL。"""
     eng = GridEngine(
         object(),
         GridConfig(state_path=str(tmp_path / "grid_state.json"), poll_interval=0),
@@ -166,7 +166,7 @@ def test_failed_rounds_increment_counter_and_write_live_snapshot(
     assert eng._consecutive_failures == 5
     assert live["consecutive_failures"] == 5
     assert live["last_success_ts"] == eng._last_success_ts
-    assert "引擎连续失败 5 轮" in caplog.text
+    assert "已失联" not in caplog.text
 
 
 def test_successful_round_resets_failure_counter_and_updates_last_success(
@@ -208,7 +208,9 @@ def test_successful_round_resets_failure_counter_and_updates_last_success(
     assert live["last_success_ts"] == eng._last_success_ts
 
 
-def test_polling_defaults_are_ten_seconds() -> None:
-    """引擎配置和命令行默认轮询间隔保持一致。"""
-    assert GridConfig().poll_interval == 10.0
-    assert _build_parser().parse_args([]).interval == 10
+def test_polling_defaults_match_dual_loop_intervals() -> None:
+    """引擎配置和命令行默认快慢轮询间隔保持一致。"""
+    assert GridConfig().poll_interval == 2.5
+    assert GridConfig().slow_interval == 30.0
+    assert _build_parser().parse_args([]).interval == 2.5
+    assert _build_parser().parse_args([]).slow_interval == 30.0

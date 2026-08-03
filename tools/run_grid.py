@@ -42,7 +42,8 @@ def _build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     p = argparse.ArgumentParser(description="网格守护进程")
     p.add_argument("--live", action="store_true", help="真实下单（默认 dry_run）")
-    p.add_argument("--interval", type=float, default=10)
+    p.add_argument("--interval", type=float, default=2.5)
+    p.add_argument("--slow-interval", type=float, default=30.0)
     p.add_argument("--spacing", type=float, default=0.02, help="格距（默认2%）")
     p.add_argument("--unit", type=float, default=50.0, help="每格名义USD")
     p.add_argument("--levels", type=int, default=4, help="上下各挂几格（受库存上限与±5%限价约束）")
@@ -75,6 +76,7 @@ def _grid_config(args: argparse.Namespace) -> GridConfig:
         adx_resume=args.adx_resume,
         donchian_period=args.donchian,
         poll_interval=args.interval,
+        slow_interval=args.slow_interval,
         trend_aware=args.trend_aware,
         band_k=args.band_k,
         hard_stop_dist=args.hard_stop_dist,

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -90,6 +92,16 @@ def test_position_stop_loss_rounds_trigger_and_execution_prices(monkeypatch) -> 
     stop_loss = placed_orders[0]["stop_loss"]
     assert stop_loss.trigger_price == Decimal("88.1")
     assert stop_loss.price == Decimal("87.7")
+    remaining = placed_orders[0]["expire_time"] - datetime.now(timezone.utc)
+    assert timedelta(days=89) < remaining <= timedelta(days=90)
+
+
+def test_limit_order_default_expiry_is_ninety_days() -> None:
+    """长期运行网格的普通 GTT 限价单默认有效期为 90 天。"""
+    default = inspect.signature(ExtendedClient.place_limit_order).parameters[
+        "expire_days"
+    ].default
+    assert default == 90
 
 
 def test_tpsl_blocks_new_risk_when_unconfirmed(tmp_path, monkeypatch) -> None:

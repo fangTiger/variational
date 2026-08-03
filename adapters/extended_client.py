@@ -262,7 +262,7 @@ class ExtendedClient(ExchangeAdapter):
         price: Decimal,
         *,
         post_only: bool = True,
-        expire_days: int = 7,
+        expire_days: int = 90,
         reduce_only: bool = False,
     ):
         """挂限价单（默认 post_only=maker）。返回下单结果（含订单 id）。
@@ -320,7 +320,7 @@ class ExtendedClient(ExchangeAdapter):
             amount_of_synthetic=Decimal(0),
             price=Decimal(0),
             time_in_force=TimeInForce.GTT,
-            expire_time=datetime.now(timezone.utc) + timedelta(days=7),
+            expire_time=datetime.now(timezone.utc) + timedelta(days=90),
             reduce_only=True,
             post_only=False,
             tp_sl_type=OrderTpslType.POSITION,
