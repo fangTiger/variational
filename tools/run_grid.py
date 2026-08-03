@@ -59,6 +59,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trend-aware", action="store_true",
                    help="启用有界趋势感知(默认关闭=现有行为)")
     p.add_argument("--band-k", type=float, default=1.75, help="band 半宽=k×ATR")
+    p.add_argument("--min-half-frac", type=float, default=0.04,
+                   help="band 半宽下限占价格的比例")
     p.add_argument("--hard-stop-dist", type=float, default=0.12,
                    help="距强平价触发硬止损的比例")
     return p
@@ -79,6 +81,7 @@ def _grid_config(args: argparse.Namespace) -> GridConfig:
         slow_interval=args.slow_interval,
         trend_aware=args.trend_aware,
         band_k=args.band_k,
+        min_half_frac=args.min_half_frac,
         hard_stop_dist=args.hard_stop_dist,
     )
 

@@ -39,14 +39,24 @@ def test_run_grid_trend_aware_cli_defaults_and_overrides() -> None:
     defaults = parser.parse_args([])
     assert defaults.trend_aware is False
     assert defaults.band_k == 1.75
+    assert defaults.min_half_frac == 0.04
     assert defaults.hard_stop_dist == 0.12
 
     args = parser.parse_args(
-        ["--trend-aware", "--band-k", "2.25", "--hard-stop-dist", "0.08"]
+        [
+            "--trend-aware",
+            "--band-k",
+            "2.25",
+            "--min-half-frac",
+            "0.047",
+            "--hard-stop-dist",
+            "0.08",
+        ]
     )
     config = run_grid._grid_config(args)
     assert config.trend_aware is True
     assert config.band_k == 2.25
+    assert config.min_half_frac == 0.047
     assert config.hard_stop_dist == 0.08
 
 
