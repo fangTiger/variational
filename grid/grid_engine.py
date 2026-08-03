@@ -76,6 +76,8 @@ class GridConfig:
     liq_buffer_pct: float = 0.12
     max_equity_loss_pct: float = 0.10
     flat_confirmation_interval: float = 0.05
+    max_writes_per_round: int = 10
+    max_by_id_lookups_per_round: int = 10
 
 
 class GridEngine:
@@ -94,6 +96,7 @@ class GridEngine:
             "dup_skipped": 0,
             "bad_snapshot": 0,
             "orphan_adopted": 0,
+            "write_budget_exhausted_rounds": 0,
         }
         # 以下观测值仅在当前进程内累计，进程重启后与计数器一起清零。
         self._counters_started_at = time.time()
@@ -119,6 +122,9 @@ class GridEngine:
         self._cap_rejection_state: dict[Side, dict] = {}
         self._consecutive_failures = 0
         self._last_success_ts = time.time()
+        self._write_budget = self.config.max_writes_per_round
+        self._by_id_lookup_budget = self.config.max_by_id_lookups_per_round
+        self._write_budget_exhausted_this_round = False
 
     @property
     def _log_step(self) -> float:
@@ -806,6 +812,9 @@ class GridEngine:
         return result
 
     async def run_once(self) -> str:
+        self._write_budget = self.config.max_writes_per_round
+        self._by_id_lookup_budget = self.config.max_by_id_lookups_per_round
+        self._write_budget_exhausted_this_round = False
         if self.config.trend_aware:
             return await self._run_once_trend_aware()
 
@@ -861,6 +870,10 @@ class GridEngine:
         if not callable(order_getter):
             return statuses
         for order_id in order_ids - statuses.keys():
+            if self._by_id_lookup_budget <= 0:
+                logger.debug("本轮按 ID 终态查询预算已耗尽，剩余订单下轮继续")
+                break
+            self._by_id_lookup_budget -= 1
             try:
                 order = await order_getter(self.config.market, order_id)
             except Exception as exc:  # noqa: BLE001
@@ -1088,6 +1101,9 @@ class GridEngine:
             if not self._within_cap(side, inv_usd):
                 self._log_cap_rejection(level, side, inv_usd, entry.get("why", ""))
                 continue
+            if self._write_budget <= 0:
+                logger.debug("本轮写请求预算已耗尽，剩余翻单重试下轮继续")
+                break
             placed = await self._place(
                 level,
                 side,
@@ -1191,6 +1207,17 @@ class GridEngine:
                         status or "未知",
                         attempts,
                     )
+                continue
+
+            if status != "REJECTED" and self._write_budget <= 0:
+                rec["status_pending"] = True
+                logger.debug(
+                    "格%d 订单 %s 已确认终态=%s，但本轮写请求预算已耗尽；"
+                    "保留记录下轮处理",
+                    lv,
+                    rec["id"],
+                    status,
+                )
                 continue
 
             self._orders.pop(lv, None)
@@ -1361,18 +1388,6 @@ class GridEngine:
             level_price = float(self._level_price(level))
             return band[0] <= level_price <= band[1]
 
-        # 下方挂买（_place 内部按库存上限守卫）
-        for lv in range(center - 1, center - n - 1, -1):
-            if lv not in self._orders and allowed(lv, Side.BUY):
-                m = await self._place(lv, Side.BUY, inv_usd, why="补买格")
-                if m:
-                    acted.append(m)
-        # 上方挂卖
-        for lv in range(center + 1, center + n + 1):
-            if lv not in self._orders and allowed(lv, Side.SELL):
-                m = await self._place(lv, Side.SELL, inv_usd, why="补卖格")
-                if m:
-                    acted.append(m)
         # 撤掉远离中心、落在 band 外或属于冻结方向的陈单。
         for lv, rec in list(self._orders.items()):
             if rec.get("status_pending"):
@@ -1385,7 +1400,25 @@ class GridEngine:
             )
             side_blocked = self._side_is_blocked(rec["side"], blocked_side)
             if stale or constrained_out or side_blocked:
+                if not self.config.dry_run and self._write_budget <= 0:
+                    logger.debug("本轮写请求预算已耗尽，剩余陈单下轮继续撤")
+                    break
                 await self._cancel(lv, why="撤陈单/越界单/冻结侧单")
+
+        # 按距离从近到远交替补 BUY/SELL，剩余档位由下一轮继续补齐。
+        for distance in range(1, n + 1):
+            levels = (
+                (center - distance, Side.BUY, "补买格"),
+                (center + distance, Side.SELL, "补卖格"),
+            )
+            for lv, side, why in levels:
+                if not self.config.dry_run and self._write_budget <= 0:
+                    logger.debug("本轮写请求预算已耗尽，剩余档位下轮继续补")
+                    return "；".join(acted) if acted else "阶梯已就位"
+                if lv not in self._orders and allowed(lv, side):
+                    m = await self._place(lv, side, inv_usd, why=why)
+                    if m:
+                        acted.append(m)
         return "；".join(acted) if acted else "阶梯已就位"
 
     def _cap_components(
@@ -1472,6 +1505,16 @@ class GridEngine:
             logger.info("[dry_run] %s", msg)
             self._orders[level] = {"id": f"dry-{level}", "side": side}
             return msg
+        if self._write_budget <= 0:
+            if not self._write_budget_exhausted_this_round:
+                self._counters["write_budget_exhausted_rounds"] += 1
+                self._write_budget_exhausted_this_round = True
+            logger.debug("本轮写请求预算已耗尽，跳过挂单：%s", msg)
+            return None
+        self._write_budget -= 1
+        if self._write_budget == 0 and not self._write_budget_exhausted_this_round:
+            self._counters["write_budget_exhausted_rounds"] += 1
+            self._write_budget_exhausted_this_round = True
         try:
             res = await self.ext.place_limit_order(self.config.market, side, qty, lp)
             data = getattr(res, "data", None)
@@ -1515,6 +1558,16 @@ class GridEngine:
             logger.info("[dry_run] %s：撤 格%d", why, level)
             self._orders.pop(level, None)
             return
+        if self._write_budget <= 0:
+            if not self._write_budget_exhausted_this_round:
+                self._counters["write_budget_exhausted_rounds"] += 1
+                self._write_budget_exhausted_this_round = True
+            logger.debug("本轮写请求预算已耗尽，跳过撤单：格%d", level)
+            return
+        self._write_budget -= 1
+        if self._write_budget == 0 and not self._write_budget_exhausted_this_round:
+            self._counters["write_budget_exhausted_rounds"] += 1
+            self._write_budget_exhausted_this_round = True
         try:
             await self.ext.cancel_order(rec["id"])
             self._orders.pop(level, None)  # 撤单成功后才删记录

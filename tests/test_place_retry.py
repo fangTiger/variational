@@ -176,6 +176,10 @@ def test_attempts_accumulate_and_exhaust_without_dropping() -> None:
     eng = _eng(ext)
     asyncio.run(eng._place(558, Side.BUY, 0.0, why="翻单"))
     for _ in range(12):
+        # 每轮写请求预算由 run_once 在轮次开头重置；本测试直接调用
+        # _handle_fills 绕过了 run_once，必须自己模拟这一步，
+        # 否则 12 轮共用一份预算，第一轮耗尽后余下轮次全被限流。
+        eng._write_budget = eng.config.max_writes_per_round
         asyncio.run(eng._handle_fills(0.0, blocked_side=None))
     assert 558 in eng._retry, "达上限后不得删除翻单意图"
     assert eng._retry[558]["exhausted"] is True
