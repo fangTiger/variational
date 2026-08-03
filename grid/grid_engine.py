@@ -95,7 +95,12 @@ class GridEngine:
             "bad_snapshot": 0,
             "orphan_adopted": 0,
         }
+        # 以下观测值仅在当前进程内累计，进程重启后与计数器一起清零。
         self._counters_started_at = time.time()
+        self._closed_loops = 0
+        self._realized_pnl_net = Decimal("0")
+        self._max_abs_inv_usd = 0.0
+        self._loop_fills: dict[int, dict] = {}
         self._mode = GridMode.NEUTRAL        # 上一轮 regime（迟滞用）
         self._running = False
         self._state: GridState | None = None
@@ -537,6 +542,16 @@ class GridEngine:
 
         mark_float = float(mark) if mark is not None else None
         inv_btc = float(inv) if inv is not None else None
+        inv_usd = (
+            inv_btc * mark_float
+            if inv_btc is not None and mark_float is not None
+            else None
+        )
+        if inv_usd is not None:
+            self._max_abs_inv_usd = max(self._max_abs_inv_usd, abs(inv_usd))
+        retry_exhausted = sum(
+            1 for entry in self._retry.values() if entry.get("exhausted")
+        )
         payload = {
             "ts": time.time(),
             "mark": mark_float,
@@ -550,11 +565,7 @@ class GridEngine:
                 else None
             ),
             "inv_btc": inv_btc,
-            "inv_usd": (
-                inv_btc * mark_float
-                if inv_btc is not None and mark_float is not None
-                else None
-            ),
+            "inv_usd": inv_usd,
             "band_low": state.band_low if state is not None else None,
             "band_high": state.band_high if state is not None else None,
             "frozen": state.frozen if state is not None else False,
@@ -569,6 +580,15 @@ class GridEngine:
                 "hard_stop_dist": self.config.hard_stop_dist,
                 "adx_off": self.config.adx_off,
             },
+            **self._counters,
+            "retry_pending": len(self._retry) - retry_exhausted,
+            "retry_exhausted": retry_exhausted,
+            "counters_started_at": self._counters_started_at,
+            "closed_loops": self._closed_loops,
+            "realized_pnl_net": float(self._realized_pnl_net),
+            "max_abs_inv_usd": self._max_abs_inv_usd,
+            # 适配器尚不提供资金费；该值只含成交价差减订单手续费。
+            "funding_included": False,
         }
         tmp = live_path.with_suffix(live_path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -743,6 +763,7 @@ class GridEngine:
 
         inv, mark = await self._inv()
         inv_usd = float(inv) * mark
+        self._max_abs_inv_usd = max(self._max_abs_inv_usd, abs(inv_usd))
         logger.info("price=%.0f ADX=%s mode=%s inv=%s(≈$%.0f) 挂单=%d",
                     price, f"{a[-1]:.1f}" if a[-1] else None, mode.value, inv, inv_usd, len(self._orders))
 
@@ -791,6 +812,7 @@ class GridEngine:
         side: Side,
         qty: Decimal | None,
         why: str,
+        is_replacement: bool = False,
     ) -> dict:
         """保留同档既有重试次数，只刷新本次挂单意图。"""
         entry = self._retry.setdefault(
@@ -799,12 +821,14 @@ class GridEngine:
                 "side": side,
                 "qty": qty,
                 "why": why,
+                "is_replacement": is_replacement,
                 "attempts": 0,
                 "exhausted": False,
                 "requested_at": time.time(),
             },
         )
         entry["side"], entry["qty"], entry["why"] = side, qty, why
+        entry["is_replacement"] = is_replacement
         entry.setdefault("attempts", 0)
         entry.setdefault("exhausted", False)
         entry.setdefault("requested_at", time.time())
@@ -1007,6 +1031,7 @@ class GridEngine:
                 why=entry.get("why", ""),
                 qty=entry.get("qty"),
                 retrying=True,
+                is_replacement=bool(entry.get("is_replacement", False)),
             )
             if placed is not None:
                 self._retry.pop(level, None)
@@ -1032,11 +1057,21 @@ class GridEngine:
         - 未知或非终态：保留记录并在下轮继续查询，禁止同格重复补单。
         - blocked_side：跳过即将挂出的同方向新单。
         """
+        self._max_abs_inv_usd = max(self._max_abs_inv_usd, abs(inv_usd))
         if self.config.dry_run:
             logger.debug("dry_run：跳过成交终态处理")
             return
         await self._drain_retry(inv_usd, blocked_side)
         open_ids = await self._open_ids()
+        if len(self._orders) >= 3 and not any(
+            rec["id"] in open_ids for rec in self._orders.values()
+        ):
+            self._counters["bad_snapshot"] += 1
+            logger.warning(
+                "本地跟踪的 %d 张订单均未出现在盘口，疑似坏快照；"
+                "继续查询历史终态",
+                len(self._orders),
+            )
         for lv, rec in self._orders.items():
             if rec["id"] in open_ids:
                 # 订单重新出现在盘口时解除终态待确认标记。
@@ -1064,6 +1099,8 @@ class GridEngine:
                 attempts = int(rec.get("status_lookup_attempts", 0)) + 1
                 rec["status_lookup_attempts"] = attempts
                 rec["status_pending"] = True
+                if attempts == 1:
+                    self._counters["terminal_unknown"] += 1
                 if (
                     attempts == _ORDER_STATUS_CRITICAL_RETRIES
                     or attempts % 100 == 0
@@ -1096,6 +1133,65 @@ class GridEngine:
             if status == "FILLED" or (
                 status in ("EXPIRED", "CANCELLED") and filled > 0
             ):
+                self._counters["fill_detected"] += 1
+                raw_fill_price = (
+                    getattr(o, "average_price", None)
+                    or getattr(o, "filled_price", None)
+                    or getattr(o, "fill_price", None)
+                )
+                fill_price = (
+                    Decimal(str(raw_fill_price))
+                    if raw_fill_price is not None
+                    else None
+                )
+                raw_fee = (
+                    getattr(o, "payed_fee", None)
+                    or getattr(o, "fee", None)
+                    or Decimal("0")
+                )
+                fill_fee = Decimal(str(raw_fee))
+                previous_fill = self._loop_fills.get(lv)
+                unmatched_fill_qty = filled
+                unmatched_fill_fee = fill_fee
+                if (
+                    previous_fill is not None
+                    and previous_fill["side"] is not rec["side"]
+                    and fill_price is not None
+                    and filled > 0
+                ):
+                    self._loop_fills.pop(lv, None)
+                    buy_price = (
+                        fill_price
+                        if rec["side"] is Side.BUY
+                        else previous_fill["price"]
+                    )
+                    sell_price = (
+                        fill_price
+                        if rec["side"] is Side.SELL
+                        else previous_fill["price"]
+                    )
+                    loop_qty = min(filled, previous_fill["qty"])
+                    previous_fee = (
+                        previous_fill["fee"]
+                        * loop_qty
+                        / previous_fill["qty"]
+                    )
+                    current_fee = fill_fee * loop_qty / filled
+                    self._realized_pnl_net += (
+                        (sell_price - buy_price) * loop_qty
+                        - previous_fee
+                        - current_fee
+                    )
+                    self._closed_loops += 1
+                    previous_remaining = previous_fill["qty"] - loop_qty
+                    if previous_remaining > 0:
+                        self._loop_fills[lv] = {
+                            **previous_fill,
+                            "qty": previous_remaining,
+                            "fee": previous_fill["fee"] - previous_fee,
+                        }
+                    unmatched_fill_qty = filled - loop_qty
+                    unmatched_fill_fee = fill_fee - current_fee
                 if rec["side"] is Side.BUY:      # 买成交 → 上一格挂卖止盈
                     next_level, next_side = lv + 1, Side.SELL
                     fill_why = f"{lv}买成交→挂卖"
@@ -1112,6 +1208,30 @@ class GridEngine:
                     next_level,
                     next_side.value,
                 )
+                if fill_price is not None and unmatched_fill_qty > 0:
+                    existing_fill = self._loop_fills.get(next_level)
+                    if (
+                        existing_fill is not None
+                        and existing_fill["side"] is rec["side"]
+                    ):
+                        merged_qty = existing_fill["qty"] + unmatched_fill_qty
+                        self._loop_fills[next_level] = {
+                            "side": rec["side"],
+                            "price": (
+                                existing_fill["price"] * existing_fill["qty"]
+                                + fill_price * unmatched_fill_qty
+                            )
+                            / merged_qty,
+                            "qty": merged_qty,
+                            "fee": existing_fill["fee"] + unmatched_fill_fee,
+                        }
+                    else:
+                        self._loop_fills[next_level] = {
+                            "side": rec["side"],
+                            "price": fill_price,
+                            "qty": unmatched_fill_qty,
+                            "fee": unmatched_fill_fee,
+                        }
                 if self._side_is_blocked(next_side, blocked_side):
                     logger.info(
                         "格%d 成交后的 %s 翻单被当前冻结方向 %s 阻止，已进入重试队列",
@@ -1120,10 +1240,23 @@ class GridEngine:
                         blocked_side,
                     )
                     qty = filled if filled > 0 else None
-                    self._queue_retry(next_level, next_side, qty, fill_why)
+                    self._queue_retry(
+                        next_level,
+                        next_side,
+                        qty,
+                        fill_why,
+                        is_replacement=True,
+                    )
                     continue
                 qty = filled if filled > 0 else None
-                await self._place(next_level, next_side, inv_usd, why=fill_why, qty=qty)
+                await self._place(
+                    next_level,
+                    next_side,
+                    inv_usd,
+                    why=fill_why,
+                    qty=qty,
+                    is_replacement=True,
+                )
             elif status in ("EXPIRED", "CANCELLED"):
                 logger.info(
                     "格%d 订单 %s 终态=%s 且无成交，准备原格 %s 重挂",
@@ -1142,6 +1275,7 @@ class GridEngine:
                     continue
                 await self._place(lv, rec["side"], inv_usd, why=f"格{lv}{status}重挂")
             else:
+                self._counters["rejected_terminal"] += 1
                 logger.warning("格%d 订单 %s 终态=REJECTED，仅移除不翻单", lv, rec["id"])
 
     async def _maintain_ladder(
@@ -1252,6 +1386,7 @@ class GridEngine:
         why: str = "",
         qty: Decimal | None = None,
         retrying: bool = False,
+        is_replacement: bool = False,
     ) -> str | None:
         if level in self._orders:
             self._counters["dup_skipped"] += 1
@@ -1269,7 +1404,6 @@ class GridEngine:
         lp = self._level_price(level)
         qty = qty if qty is not None else Decimal(str(self.config.unit_usd)) / lp
         msg = f"{why}：{side.value} {qty:.6f}@{lp:.0f}(格{level})"
-        is_replacement = "翻单" in why or "成交→" in why
         if self.config.dry_run:
             logger.info("[dry_run] %s", msg)
             self._orders[level] = {"id": f"dry-{level}", "side": side}
@@ -1282,7 +1416,7 @@ class GridEngine:
                 getattr(data, "status", None) or getattr(res, "status", "") or ""
             ).upper()
             if status.rsplit(".", 1)[-1] == "REJECTED":
-                self._queue_retry(level, side, qty, why)
+                self._queue_retry(level, side, qty, why, is_replacement)
                 if is_replacement:
                     self._counters["replacement_failed"] += 1
                 logger.warning(
@@ -1292,7 +1426,7 @@ class GridEngine:
                 )
                 return None
             if not oid:
-                self._queue_retry(level, side, qty, why)
+                self._queue_retry(level, side, qty, why, is_replacement)
                 if is_replacement:
                     self._counters["replacement_failed"] += 1
                 logger.warning("%s → 响应缺少订单 ID，已进入重试队列", msg)
@@ -1303,7 +1437,7 @@ class GridEngine:
             logger.info("%s → id=%s", msg, oid)
             return msg
         except Exception as exc:  # noqa: BLE001
-            self._queue_retry(level, side, qty, why)
+            self._queue_retry(level, side, qty, why, is_replacement)
             if is_replacement:
                 self._counters["replacement_failed"] += 1
             logger.warning("挂单失败 %s：%s；已进入重试队列", msg, exc)
