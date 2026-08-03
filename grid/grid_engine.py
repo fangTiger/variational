@@ -64,7 +64,7 @@ class GridConfig:
     adx_resume: float = 999.0            # 迟滞：OFF 后 ADX 须回落到此值以下才恢复
     donchian_period: int = 48
     candle_lookback: int = 200
-    poll_interval: float = 30.0
+    poll_interval: float = 10.0
     dry_run: bool = True
     trend_aware: bool = False
     band_k: float = 1.75
@@ -114,8 +114,11 @@ class GridEngine:
         self._last_closes: list[float] = []
         self._last_mark: float | None = None
         self._last_inv: Decimal | float | None = None
+        self._last_liquidation_price: float | None = None
         self._current_tpsl: tuple[Decimal, Decimal] | None = None
         self._cap_rejection_state: dict[Side, dict] = {}
+        self._consecutive_failures = 0
+        self._last_success_ts = time.time()
 
     @property
     def _log_step(self) -> float:
@@ -173,10 +176,22 @@ class GridEngine:
             self._orders[lv] = {"id": getattr(o, "id", None), "side": side}
         return orders
 
-    async def _inv(self) -> tuple[Decimal, float]:
-        pos = await self.ext.get_position(self.config.market)
-        stats = await self.ext._client.info.get_market_statistics(market_name=self.config.market)
-        price = float(stats.data.mark_price)
+    async def _inv(self, position=None) -> tuple[Decimal, float]:
+        """一次读取仓位，并优先复用其中的 mark 与清算价。"""
+        pos = position or await self.ext.get_position(self.config.market)
+        raw = getattr(pos, "raw", None)
+        raw_mark = getattr(raw, "mark_price", None)
+        raw_liq = getattr(raw, "liquidation_price", None)
+        self._last_liquidation_price = (
+            float(raw_liq) if raw_liq is not None and float(raw_liq) > 0 else None
+        )
+        if raw_mark is not None and float(raw_mark) > 0:
+            price = float(raw_mark)
+        else:
+            stats = await self.ext._client.info.get_market_statistics(
+                market_name=self.config.market
+            )
+            price = float(stats.data.mark_price)
         return pos.signed_size, price
 
     @staticmethod
@@ -242,7 +257,13 @@ class GridEngine:
             return None
         return tick if tick is not None and tick > 0 else None
 
-    async def _advance_band(self, mark: float, mode: GridMode) -> None:
+    async def _advance_band(
+        self,
+        mark: float,
+        mode: GridMode,
+        *,
+        signed_size: Decimal | None = None,
+    ) -> None:
         """推进 ACTIVE/FROZEN 两态；既有 band 在越界时绝不随 mark 移动。"""
         if self._state is None:
             if mode is not GridMode.NEUTRAL:
@@ -311,8 +332,10 @@ class GridEngine:
         if self._neutral_bars < max(1, self.config.recenter_bars):
             return
 
-        pos = await self.ext.get_position(self.config.market)
-        if pos.signed_size != 0:
+        if signed_size is None:
+            pos = await self.ext.get_position(self.config.market)
+            signed_size = pos.signed_size
+        if signed_size != 0:
             return
         try:
             open_orders = await self.ext.get_open_orders(self.config.market)
@@ -349,9 +372,13 @@ class GridEngine:
         liq_buffer = Decimal(str(self.config.liq_buffer_pct))
         max_loss_pct = Decimal(str(self.config.max_equity_loss_pct))
 
-        liq_price: Decimal | None = None
+        liq_price = (
+            Decimal(str(self._last_liquidation_price))
+            if self._last_liquidation_price is not None
+            else None
+        )
         liquidation_getter = getattr(self.ext, "get_liquidation_info", None)
-        if callable(liquidation_getter):
+        if liq_price is None and callable(liquidation_getter):
             try:
                 liquidation_info = await liquidation_getter(self.config.market)
             except Exception as exc:  # noqa: BLE001
@@ -589,13 +616,31 @@ class GridEngine:
             "max_abs_inv_usd": self._max_abs_inv_usd,
             # 适配器尚不提供资金费；该值只含成交价差减订单手续费。
             "funding_included": False,
+            "consecutive_failures": self._consecutive_failures,
+            "last_success_ts": self._last_success_ts,
         }
         tmp = live_path.with_suffix(live_path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, live_path)
 
+    def _dump_connectivity(self) -> None:
+        """即使整轮失败，也只更新失联字段并原子写入 live 快照。"""
+        live_path = Path(self.config.state_path).parent / "grid_live.json"
+        live_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            payload = json.loads(live_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            payload = {}
+        payload.update(
+            consecutive_failures=self._consecutive_failures,
+            last_success_ts=self._last_success_ts,
+        )
+        tmp = live_path.with_suffix(live_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, live_path)
+
     async def _run_once_trend_aware(self) -> str:
-        """趋势感知单轮：硬止损前置，再做门控、band 推进与受限铺单。"""
+        """趋势感知单轮：保护性执行优先，K 线失败只跳过补格。"""
         if self._state is None:
             self._state = load_state(self.config.state_path)
         if self._state is not None and self._state.halted:
@@ -605,14 +650,11 @@ class GridEngine:
             if inv == 0:
                 self._current_tpsl = None
             else:
-                stats = await self.ext._client.info.get_market_statistics(
-                    market_name=self.config.market
-                )
-                mark = float(stats.data.mark_price)
+                inv, mark = await self._inv(position=pos)
                 self._last_mark = mark
                 await self._maintain_tpsl(mark, inv)
                 # halted 只禁止新增报价，既有硬止损风险管理仍继续执行。
-                if await self._check_hard_stop():
+                if await self._check_hard_stop(signed_size=inv, mark=mark):
                     await self._dump_live(
                         mark=self._last_mark,
                         mode=self._mode,
@@ -628,7 +670,12 @@ class GridEngine:
             )
             return "HALTED：禁止新增报价"
 
-        if await self._check_hard_stop():
+        inv, mark = await self._inv()
+        self._last_inv = inv
+        self._last_mark = mark
+        inv_usd = float(inv) * mark
+
+        if await self._check_hard_stop(signed_size=inv, mark=mark):
             await self._dump_live(
                 mark=self._last_mark,
                 mode=self._mode,
@@ -645,12 +692,37 @@ class GridEngine:
             )
             return "HALTED：禁止新增报价"
 
-        r = await self.ext._client.info.get_candles_history(
-            market_name=self.config.market,
-            candle_type="trades",
-            interval="PT1H",
-            limit=self.config.candle_lookback,
-        )
+        tpsl_confirmed = await self._maintain_tpsl(mark, inv)
+        state = self._state
+        frozen = state is not None and state.frozen
+        if self._mode is GridMode.OFF:
+            blocked_side = "BOTH"
+        elif frozen:
+            # fail-closed 哨兵没有可判定的突破方向，必须冻结双侧。
+            blocked_side = state.blocked_side or "BOTH"
+        else:
+            # K 线尚未读取，保护性动作沿用上一轮迟滞门控结果。
+            blocked_side = state.blocked_side if state is not None else "BOTH"
+        # _handle_fills 内部会先 drain retry；外层不得重复调用。
+        await self._handle_fills(inv_usd, blocked_side=blocked_side)
+
+        try:
+            r = await self.ext._client.info.get_candles_history(
+                market_name=self.config.market,
+                candle_type="trades",
+                interval="PT1H",
+                limit=self.config.candle_lookback,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("K线获取失败，已处理成交并跳过补格：%s", exc)
+            await self._dump_live(
+                mark=mark,
+                mode=self._mode,
+                inv=inv,
+                closes=self._last_closes,
+            )
+            return "K线获取失败：已处理成交，跳过补格"
+
         candles = sorted(r.data, key=lambda k: int(k.timestamp))
         highs = drop_forming_candle([float(k.high) for k in candles])
         lows = drop_forming_candle([float(k.low) for k in candles])
@@ -678,18 +750,13 @@ class GridEngine:
             0.0,
         )
 
-        inv, mark = await self._inv()
-        self._last_inv = inv
-        self._last_mark = mark
-        inv_usd = float(inv) * mark
-        await self._advance_band(mark, mode)
+        await self._advance_band(mark, mode, signed_size=inv)
 
         state = self._state
         if state is not None and state.halted:
             await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
             return "HALTED：禁止新增报价"
 
-        tpsl_confirmed = await self._maintain_tpsl(mark, inv)
         frozen = state is not None and state.frozen
         valid_active = (
             state is not None
@@ -699,7 +766,6 @@ class GridEngine:
         if mode is GridMode.OFF:
             blocked_side = "BOTH"
         elif frozen:
-            # fail-closed 哨兵没有可判定的突破方向，必须冻结双侧。
             blocked_side = state.blocked_side or "BOTH"
         else:
             blocked_side = state.blocked_side if state is not None else "BOTH"
@@ -720,7 +786,6 @@ class GridEngine:
         )
 
         if mode is GridMode.OFF or not valid_active:
-            await self._handle_fills(inv_usd, blocked_side=blocked_side)
             await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
             return (
                 "OFF：暂停新增报价"
@@ -728,7 +793,6 @@ class GridEngine:
                 else "FROZEN：仅处理已有订单"
             )
 
-        await self._handle_fills(inv_usd, blocked_side=state.blocked_side)
         if not tpsl_confirmed:
             await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
             return "TPSL 未确认：仅处理已有订单"
@@ -1457,17 +1521,39 @@ class GridEngine:
         except Exception as exc:  # noqa: BLE001
             logger.warning("撤单失败 格%d：%s（保留记录下轮重试）", level, exc)
 
-    async def _check_hard_stop(self) -> bool:
-        """检查距强平价距离；空仓与有仓但缺失清算信息必须区别处理。"""
-        pos = await self.ext.get_position(self.config.market)
-        signed_size = pos.signed_size
+    async def _check_hard_stop(
+        self,
+        *,
+        signed_size: Decimal | None = None,
+        mark: float | None = None,
+    ) -> bool:
+        """检查距强平价距离；可复用本轮已读取的仓位与 mark。"""
+        if signed_size is None:
+            pos = await self.ext.get_position(self.config.market)
+            signed_size = pos.signed_size
+            raw = getattr(pos, "raw", None)
+            raw_mark = getattr(raw, "mark_price", None)
+            raw_liq = getattr(raw, "liquidation_price", None)
+            mark = float(raw_mark) if raw_mark is not None else mark
+            self._last_liquidation_price = (
+                float(raw_liq)
+                if raw_liq is not None and float(raw_liq) > 0
+                else None
+            )
         self._last_inv = signed_size
         if signed_size == 0:
             self._last_dist_to_liq = None
             return False
 
-        liquidation_info = await self.ext.get_liquidation_info(self.config.market)
-        if liquidation_info is None:
+        liq = self._last_liquidation_price
+        if mark is None or liq is None:
+            liquidation_info = await self.ext.get_liquidation_info(
+                self.config.market
+            )
+            if liquidation_info is not None:
+                mark, liq = map(float, liquidation_info)
+                self._last_liquidation_price = liq
+        if mark is None or liq is None:
             self._last_dist_to_liq = None
             logger.error(
                 "硬止损检查进入 fail-safe：当前有仓位 %s，但无法取得清算价",
@@ -1475,7 +1561,6 @@ class GridEngine:
             )
             return False
 
-        mark, liq = liquidation_info
         self._last_mark = float(mark)
         self._last_dist_to_liq = dist_to_liq_pct(
             float(mark),
@@ -1668,10 +1753,34 @@ class GridEngine:
                     self.config.dry_run, self.config.spacing_pct * 100,
                     self.config.levels_per_side, self.config.max_inventory_usd)
         while self._running:
+            started = time.monotonic()
             try:
                 await self.run_once()
             except Exception as exc:  # noqa: BLE001
-                logger.exception("本轮异常：%s", exc)
+                self._consecutive_failures += 1
+                elapsed = time.monotonic() - started
+                logger.exception("本轮异常（耗时 %.2f 秒）：%s", elapsed, exc)
+                if self._consecutive_failures == 5:
+                    disconnected_minutes = (
+                        time.time() - self._last_success_ts
+                    ) / 60
+                    logger.critical(
+                        "引擎连续失败 %d 轮，已失联 %.1f 分钟",
+                        self._consecutive_failures,
+                        disconnected_minutes,
+                    )
+                try:
+                    self._dump_connectivity()
+                except Exception as snapshot_exc:  # noqa: BLE001
+                    logger.exception("失败轮次写入 live 快照失败：%s", snapshot_exc)
+            else:
+                self._consecutive_failures = 0
+                self._last_success_ts = time.time()
+                logger.info("本轮完成，耗时 %.2f 秒", time.monotonic() - started)
+                try:
+                    self._dump_connectivity()
+                except Exception as snapshot_exc:  # noqa: BLE001
+                    logger.exception("成功轮次更新 live 快照失败：%s", snapshot_exc)
             await asyncio.sleep(self.config.poll_interval)
 
     def stop(self) -> None:

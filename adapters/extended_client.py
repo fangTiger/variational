@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 
@@ -43,6 +44,13 @@ from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
 
 # 统一 Side 与 SDK OrderSide 的映射
 _SIDE_TO_SDK = {Side.BUY: OrderSide.BUY, Side.SELL: OrderSide.SELL}
+
+
+def build_client_config(name: str):
+    """构造 SDK 配置，并把单次 HTTP 请求超时收紧到 10 秒。"""
+    config = get_config_by_name(name.upper())
+    defaults = replace(config.defaults, request_timeout_seconds=10)
+    return replace(config, defaults=defaults)
 
 
 def filter_grid_orders(open_orders: list) -> list:
@@ -104,7 +112,7 @@ class ExtendedClient(ExchangeAdapter):
             private_key=private.lower(),
             vault=int(vault),
         )
-        rest = RestApiClient(get_config_by_name(cfg_name), stark_account)
+        rest = RestApiClient(build_client_config(cfg_name), stark_account)
         return cls(rest)
 
     async def connect(self) -> None:
