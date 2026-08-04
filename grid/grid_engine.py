@@ -181,7 +181,9 @@ class GridEngine:
                 continue
             lv = self._price_level(price)
             side = Side.BUY if "BUY" in str(getattr(o, "side", "")).upper() else Side.SELL
-            self._orders[lv] = {"id": getattr(o, "id", None), "side": side}
+            self._orders[lv] = {"id": getattr(o, "id", None), "side": side,
+                                "reduce_only": bool(getattr(o, "reduce_only", False)),
+                                "qty": getattr(o, "qty", None) or getattr(o, "amount", None)}
         return orders
 
     async def _inv(self, position=None) -> tuple[Decimal, float]:
@@ -808,6 +810,9 @@ class GridEngine:
             blocked_side,
         )
 
+        if frozen:
+            await self._maintain_recovery_ladder(mark, inv, inv_usd)
+
         if mode is GridMode.OFF or not valid_active:
             await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
             return (
@@ -1238,6 +1243,16 @@ class GridEngine:
                 continue
 
             self._orders.pop(lv, None)
+            if rec.get("reduce_only"):
+                if status == "FILLED" or (
+                    status in ("EXPIRED", "CANCELLED") and filled > 0
+                ):
+                    self._counters["fill_detected"] += 1
+                if status == "REJECTED":
+                    self._counters["rejected_terminal"] += 1
+                logger.info("格%d reduce-only 减仓单 %s 终态=%s、filled_qty=%s，闭环不翻单",
+                            lv, rec["id"], status, filled)
+                continue
             if status == "FILLED" or (
                 status in ("EXPIRED", "CANCELLED") and filled > 0
             ):
@@ -1417,6 +1432,67 @@ class GridEngine:
                         acted.append(m)
         return "；".join(acted) if acted else "阶梯已就位"
 
+    async def _maintain_recovery_ladder(
+        self,
+        price: float,
+        signed_size: Decimal,
+        inv_usd: float,
+    ) -> str | None:
+        state = self._state
+        signed_size = Decimal(str(signed_size))
+        if (
+            state is None
+            or not state.frozen
+            or not self._has_valid_band(state)
+            or state.blocked_side not in ("BUY", "SELL")
+            or signed_size == 0
+        ):
+            return None
+        unit = Decimal(str(self.config.unit_usd))
+        if unit <= 0 or self.config.levels_per_side <= 0:
+            return None
+
+        side = Side.SELL if signed_size > 0 else Side.BUY
+        direction = 1 if signed_size > 0 else -1
+        remaining = abs(signed_size)
+        levels = min(
+            self.config.levels_per_side,
+            math.ceil(float((remaining * Decimal(str(price))) / unit)),
+        )
+        center = self._price_level(price)
+        acted: list[str] = []
+
+        for distance in range(1, levels + 1):
+            if remaining <= 0:
+                break
+            level = center + direction * distance
+            existing = self._orders.get(level)
+            if existing is not None:
+                if existing.get("reduce_only") and existing["side"] is side:
+                    existing_qty = Decimal(str(existing.get("qty") or 0))
+                    remaining -= min(remaining, max(Decimal("0"), existing_qty))
+                continue
+            if not self.config.dry_run and self._write_budget <= 0:
+                logger.debug("本轮写请求预算已耗尽，剩余 FROZEN 减仓阶梯下轮继续")
+                break
+            level_price = self._level_price(level)
+            qty = remaining if distance == levels else min(remaining, unit / level_price)
+            placed = await self._place(
+                level,
+                side,
+                inv_usd,
+                why="FROZEN减仓",
+                qty=qty,
+                reduce_only=True,
+            )
+            if placed is None:
+                if not self.config.dry_run and self._write_budget <= 0:
+                    break
+                continue
+            remaining -= qty
+            acted.append(placed)
+        return "；".join(acted) if acted else None
+
     def _cap_components(
         self,
         side: Side,
@@ -1425,7 +1501,8 @@ class GridEngine:
         """返回库存上限算式的四项，供判断与日志共享。"""
         unit = self.config.unit_usd
         inventory_usd = inv_usd if side is Side.BUY else -inv_usd
-        pending_usd = sum(unit for rec in self._orders.values() if rec["side"] is side)
+        pending_usd = sum(unit for rec in self._orders.values()
+                          if rec["side"] is side and not rec.get("reduce_only"))
         return inventory_usd, pending_usd, unit, self.config.max_inventory_usd
 
     def _within_cap(self, side: Side, inv_usd: float) -> bool:
@@ -1480,6 +1557,7 @@ class GridEngine:
         qty: Decimal | None = None,
         retrying: bool = False,
         is_replacement: bool = False,
+        reduce_only: bool = False,
     ) -> str | None:
         if level in self._orders:
             self._counters["dup_skipped"] += 1
@@ -1491,15 +1569,22 @@ class GridEngine:
             self._counters["dup_skipped"] += 1
             logger.debug("格%d 在重试队列中，普通补格跳过", level)
             return None
-        if not self._within_cap(side, inv_usd):
+        if not reduce_only and not self._within_cap(side, inv_usd):
             self._log_cap_rejection(level, side, inv_usd, why)
             return None
         lp = self._level_price(level)
         qty = qty if qty is not None else Decimal(str(self.config.unit_usd)) / lp
-        msg = f"{why}：{side.value} {qty:.6f}@{lp:.0f}(格{level})"
+        msg = f"{why}：{side.value} {qty:.6f}@{lp:.0f}(格{level}){' reduce-only' if reduce_only else ''}"
+
+        def remember_failed() -> str:
+            if reduce_only:
+                return ""
+            self._queue_retry(level, side, qty, why, is_replacement)
+            return "，已进入重试队列"
+
         if self.config.dry_run:
             logger.info("[dry_run] %s", msg)
-            self._orders[level] = {"id": f"dry-{level}", "side": side}
+            self._orders[level] = {"id": f"dry-{level}", "side": side, "reduce_only": reduce_only, "qty": qty}
             return msg
         if self._write_budget <= 0:
             if not self._write_budget_exhausted_this_round:
@@ -1512,38 +1597,40 @@ class GridEngine:
             self._counters["write_budget_exhausted_rounds"] += 1
             self._write_budget_exhausted_this_round = True
         try:
-            res = await self.ext.place_limit_order(self.config.market, side, qty, lp)
+            res = await self.ext.place_limit_order(self.config.market, side, qty, lp,
+                                                   reduce_only=reduce_only)
             data = getattr(res, "data", None)
             oid = getattr(data, "id", None) or getattr(res, "id", None)
             status = str(
                 getattr(data, "status", None) or getattr(res, "status", "") or ""
             ).upper()
             if status.rsplit(".", 1)[-1] == "REJECTED":
-                self._queue_retry(level, side, qty, why, is_replacement)
+                note = remember_failed()
                 if is_replacement:
                     self._counters["replacement_failed"] += 1
                 logger.warning(
-                    "%s → 被拒(%s)，已进入重试队列",
+                    "%s → 被拒(%s)%s",
                     msg,
                     getattr(data, "status_reason", None),
+                    note,
                 )
                 return None
             if not oid:
-                self._queue_retry(level, side, qty, why, is_replacement)
+                note = remember_failed()
                 if is_replacement:
                     self._counters["replacement_failed"] += 1
-                logger.warning("%s → 响应缺少订单 ID，已进入重试队列", msg)
+                logger.warning("%s → 响应缺少订单 ID%s", msg, note)
                 return None
-            self._orders[level] = {"id": oid, "side": side}
+            self._orders[level] = {"id": oid, "side": side, "reduce_only": reduce_only, "qty": qty}
             if is_replacement:
                 self._counters["replacement_placed"] += 1
             logger.info("%s → id=%s", msg, oid)
             return msg
         except Exception as exc:  # noqa: BLE001
-            self._queue_retry(level, side, qty, why, is_replacement)
+            note = remember_failed()
             if is_replacement:
                 self._counters["replacement_failed"] += 1
-            logger.warning("挂单失败 %s：%s；已进入重试队列", msg, exc)
+            logger.warning("挂单失败 %s：%s%s", msg, exc, note)
             return None
 
     async def _cancel(self, level: int, why: str = "") -> None:
