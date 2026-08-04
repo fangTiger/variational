@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -134,6 +135,132 @@ def test_hard_stop_confirms_flat(tmp_path) -> None:
     assert ext.grid_cancelled >= 1                 # 撤了网格单
     assert any(ro for (_, _, ro) in ext.market_orders)  # 用了 reduce_only 平仓
     assert ext.tpsl_cancelled >= 1                 # 归零后才撤 TPSL
+
+
+def test_hard_stop_uses_position_liquidation_for_distance(tmp_path) -> None:
+    """position.raw 有有效强平价时，直接计算距强平距离。"""
+
+    class NoLiquidationRestExt(StopExt):
+        async def get_liquidation_info(self, market):
+            raise AssertionError("已有 position.raw 时不应再查清算价")
+
+    position = Position(
+        market="BTC-USD",
+        signed_size=Decimal("0.01"),
+        raw=SimpleNamespace(mark_price="100", liquidation_price="80"),
+    )
+    ext = NoLiquidationRestExt(positions=[0.01])
+    eng = _eng(ext, tmp_path / "s.json")
+
+    triggered = asyncio.run(
+        eng._check_hard_stop(
+            signed_size=position.signed_size,
+            mark=100.0,
+            position=position,
+        )
+    )
+
+    assert triggered is False
+    assert abs((eng._last_dist_to_liq or 0) - 0.20) < 1e-9
+
+
+def test_hard_stop_skips_when_position_has_no_liquidation_price(
+    tmp_path,
+    caplog,
+) -> None:
+    """position.raw 的 liquidation_price=0 表示不存在强平价，不应进入 ERROR。"""
+
+    class NoLiquidationRestExt(StopExt):
+        async def get_liquidation_info(self, market):
+            raise AssertionError("liq=0 已可判定为无强平价，不应额外查询")
+
+    position = Position(
+        market="BTC-USD",
+        signed_size=Decimal("0.00262"),
+        raw=SimpleNamespace(mark_price="63500", liquidation_price="0"),
+    )
+    ext = NoLiquidationRestExt(positions=[position.signed_size])
+    eng = _eng(ext, tmp_path / "s.json")
+
+    with caplog.at_level(logging.DEBUG, logger="grid_engine"):
+        triggered = asyncio.run(
+            eng._check_hard_stop(
+                signed_size=position.signed_size,
+                mark=63500.0,
+                position=position,
+            )
+        )
+
+    assert triggered is False
+    assert eng._last_dist_to_liq is None
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("不存在强平价" in r.message for r in caplog.records)
+
+
+def test_run_once_reuses_position_with_zero_liquidation_price(
+    tmp_path,
+    caplog,
+) -> None:
+    """趋势感知主循环复用本轮 position，liq=0 时不额外查清算价。"""
+
+    class ZeroLiquidationRunExt(RunExt):
+        async def get_position(self, market):
+            self.calls.append("position")
+            self.position_reads += 1
+            return Position(
+                market=market,
+                signed_size=Decimal("0.00262"),
+                raw=SimpleNamespace(mark_price="63500", liquidation_price="0"),
+            )
+
+        async def get_liquidation_info(self, market):
+            raise AssertionError("本轮 position 已包含 liq=0，不应额外查询")
+
+    ext = ZeroLiquidationRunExt(positions=[0.00262], liq=None, mark=63500.0)
+    eng = GridEngine(
+        ext,
+        GridConfig(
+            dry_run=True,
+            trend_aware=True,
+            exchange_tpsl=False,
+            state_path=str(tmp_path / "s.json"),
+        ),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="grid_engine"):
+        result = asyncio.run(eng.run_once(include_slow=False))
+
+    assert result == "快速执行完成"
+    assert ext.calls.count("position") == 1
+    assert "liquidation" not in ext.calls
+    assert eng._last_dist_to_liq is None
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_hard_stop_position_unavailable_keeps_failsafe_error(
+    tmp_path,
+    caplog,
+) -> None:
+    """完全拿不到仓位数据时，保留 ERROR + fail-safe。"""
+
+    class BrokenPositionExt(StopExt):
+        async def get_position(self, market):
+            raise RuntimeError("position timeout")
+
+    ext = BrokenPositionExt(positions=[0.01], liq=None)
+    eng = _eng(ext, tmp_path / "s.json")
+
+    with caplog.at_level(logging.ERROR, logger="grid_engine"):
+        triggered = asyncio.run(eng._check_hard_stop())
+
+    assert triggered is False
+    assert eng._last_dist_to_liq is None
+    assert any(
+        r.levelno >= logging.ERROR
+        and "硬止损检查进入 fail-safe" in r.message
+        and "仓位数据" in r.message
+        for r in caplog.records
+    )
 
 
 def test_dry_run_maintain_tpsl_only_records_intent(tmp_path) -> None:

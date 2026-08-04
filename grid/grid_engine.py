@@ -662,7 +662,10 @@ class GridEngine:
                 self._last_mark = mark
                 await self._maintain_tpsl(mark, inv)
                 # halted 只禁止新增报价，既有硬止损风险管理仍继续执行。
-                if await self._check_hard_stop(signed_size=inv, mark=mark):
+                hard_stop_kwargs = {"signed_size": inv, "mark": mark}
+                if pos is not None:
+                    hard_stop_kwargs["position"] = pos
+                if await self._check_hard_stop(**hard_stop_kwargs):
                     await self._dump_live(
                         mark=self._last_mark,
                         mode=self._mode,
@@ -678,12 +681,21 @@ class GridEngine:
             )
             return "HALTED：禁止新增报价"
 
-        inv, mark = await self._inv()
+        pos = None
+        position_getter = getattr(self.ext, "get_position", None)
+        if callable(position_getter):
+            pos = await position_getter(self.config.market)
+            inv, mark = await self._inv(position=pos)
+        else:
+            inv, mark = await self._inv()
         self._last_inv = inv
         self._last_mark = mark
         inv_usd = float(inv) * mark
 
-        if await self._check_hard_stop(signed_size=inv, mark=mark):
+        hard_stop_kwargs = {"signed_size": inv, "mark": mark}
+        if pos is not None:
+            hard_stop_kwargs["position"] = pos
+        if await self._check_hard_stop(**hard_stop_kwargs):
             await self._dump_live(
                 mark=self._last_mark,
                 mode=self._mode,
@@ -1563,30 +1575,69 @@ class GridEngine:
         *,
         signed_size: Decimal | None = None,
         mark: float | None = None,
+        position=None,
     ) -> bool:
         """检查距强平价距离；可复用本轮已读取的仓位与 mark。"""
-        if signed_size is None:
-            pos = await self.ext.get_position(self.config.market)
+        pos = position
+        position_liq_seen = False
+        if pos is None and signed_size is None:
+            try:
+                pos = await self.ext.get_position(self.config.market)
+            except Exception as exc:  # noqa: BLE001
+                self._last_dist_to_liq = None
+                logger.error(
+                    "硬止损检查进入 fail-safe：无法取得仓位数据：%s",
+                    exc,
+                )
+                return False
+        if pos is not None:
             signed_size = pos.signed_size
             raw = getattr(pos, "raw", None)
-            raw_mark = getattr(raw, "mark_price", None)
-            raw_liq = getattr(raw, "liquidation_price", None)
-            mark = float(raw_mark) if raw_mark is not None else mark
-            self._last_liquidation_price = (
-                float(raw_liq)
-                if raw_liq is not None and float(raw_liq) > 0
-                else None
-            )
+            if raw is not None:
+                raw_mark = getattr(raw, "mark_price", None)
+                if raw_mark is not None and float(raw_mark) > 0:
+                    mark = float(raw_mark)
+                if hasattr(raw, "liquidation_price"):
+                    position_liq_seen = True
+                    raw_liq = getattr(raw, "liquidation_price", None)
+                    raw_liq_float = float(raw_liq) if raw_liq is not None else None
+                    self._last_liquidation_price = (
+                        raw_liq_float
+                        if raw_liq_float is not None and raw_liq_float > 0
+                        else None
+                    )
+        if signed_size is None:
+            self._last_dist_to_liq = None
+            logger.error("硬止损检查进入 fail-safe：无法取得仓位数据")
+            return False
         self._last_inv = signed_size
         if signed_size == 0:
             self._last_dist_to_liq = None
             return False
 
         liq = self._last_liquidation_price
-        if mark is None or liq is None:
-            liquidation_info = await self.ext.get_liquidation_info(
-                self.config.market
+        if liq is None and position_liq_seen:
+            self._last_dist_to_liq = None
+            if mark is not None:
+                self._last_mark = float(mark)
+            logger.debug(
+                "当前仓位不存在强平价（仓位规模远小于权益），跳过硬止损判定：持仓=%s",
+                signed_size,
             )
+            return False
+        if mark is None or liq is None:
+            try:
+                liquidation_info = await self.ext.get_liquidation_info(
+                    self.config.market
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._last_dist_to_liq = None
+                logger.error(
+                    "硬止损检查进入 fail-safe：当前有仓位 %s，但查询清算价失败：%s",
+                    signed_size,
+                    exc,
+                )
+                return False
             if liquidation_info is not None:
                 mark, liq = map(float, liquidation_info)
                 self._last_liquidation_price = liq
