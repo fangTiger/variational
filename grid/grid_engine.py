@@ -189,7 +189,7 @@ class GridEngine:
         return orders
 
     async def _inv(self, position=None) -> tuple[Decimal, float]:
-        """一次读取仓位，并优先复用其中的 mark 与清算价。"""
+        """一次读取仓位；mark 取实时行情，失败时才回退仓位值。"""
         pos = position or await self.ext.get_position(self.config.market)
         raw = getattr(pos, "raw", None)
         raw_mark = getattr(raw, "mark_price", None)
@@ -197,13 +197,22 @@ class GridEngine:
         self._last_liquidation_price = (
             float(raw_liq) if raw_liq is not None and float(raw_liq) > 0 else None
         )
-        if raw_mark is not None and float(raw_mark) > 0:
-            price = float(raw_mark)
-        else:
+        try:
             stats = await self.ext._client.info.get_market_statistics(
                 market_name=self.config.market
             )
             price = float(stats.data.mark_price)
+            if price <= 0:
+                raise ValueError(f"实时 mark 非正数：{price}")
+        except Exception as exc:  # noqa: BLE001
+            if raw_mark is None or float(raw_mark) <= 0:
+                raise
+            price = float(raw_mark)
+            logger.warning(
+                "实时 mark 获取失败，回落到 position.mark_price=%s（可能陈旧）：%s",
+                price,
+                exc,
+            )
         return pos.signed_size, price
 
     @staticmethod
@@ -1688,6 +1697,7 @@ class GridEngine:
         """检查距强平价距离；可复用本轮已读取的仓位与 mark。"""
         pos = position
         position_liq_seen = False
+        position_mark = None
         if pos is None and signed_size is None:
             try:
                 pos = await self.ext.get_position(self.config.market)
@@ -1704,7 +1714,7 @@ class GridEngine:
             if raw is not None:
                 raw_mark = getattr(raw, "mark_price", None)
                 if raw_mark is not None and float(raw_mark) > 0:
-                    mark = float(raw_mark)
+                    position_mark = float(raw_mark)
                 if hasattr(raw, "liquidation_price"):
                     position_liq_seen = True
                     raw_liq = getattr(raw, "liquidation_price", None)
@@ -1733,7 +1743,7 @@ class GridEngine:
                 signed_size,
             )
             return False
-        if mark is None or liq is None:
+        if liq is None:
             try:
                 liquidation_info = await self.ext.get_liquidation_info(
                     self.config.market
@@ -1747,15 +1757,40 @@ class GridEngine:
                 )
                 return False
             if liquidation_info is not None:
-                mark, liq = map(float, liquidation_info)
+                liquidation_mark, liq = map(float, liquidation_info)
+                if position_mark is None and liquidation_mark > 0:
+                    position_mark = liquidation_mark
                 self._last_liquidation_price = liq
-        if mark is None or liq is None:
+        if liq is None:
             self._last_dist_to_liq = None
             logger.error(
                 "硬止损检查进入 fail-safe：当前有仓位 %s，但无法取得清算价",
                 signed_size,
             )
             return False
+        if mark is None:
+            try:
+                stats = await self.ext._client.info.get_market_statistics(
+                    market_name=self.config.market
+                )
+                mark = float(stats.data.mark_price)
+                if mark <= 0:
+                    raise ValueError(f"实时 mark 非正数：{mark}")
+            except Exception as exc:  # noqa: BLE001
+                if position_mark is None or position_mark <= 0:
+                    self._last_dist_to_liq = None
+                    logger.error(
+                        "硬止损检查进入 fail-safe：当前有仓位 %s，但无法取得 mark：%s",
+                        signed_size,
+                        exc,
+                    )
+                    return False
+                mark = position_mark
+                logger.warning(
+                    "实时 mark 获取失败，回落到 position.mark_price=%s（可能陈旧）：%s",
+                    mark,
+                    exc,
+                )
 
         self._last_mark = float(mark)
         self._last_dist_to_liq = dist_to_liq_pct(

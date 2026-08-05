@@ -7,6 +7,8 @@ import logging
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from adapters import extended_client
 from adapters.base import Position
 from grid.grid_engine import GridConfig, GridEngine
@@ -83,20 +85,28 @@ def test_candle_failure_still_maintains_tpsl_and_handles_fills(
     assert result == "K线获取失败：已处理成交，跳过补格"
 
 
-def test_position_mark_and_liquidation_are_reused_within_round(tmp_path) -> None:
-    """一次持仓响应中的 mark/liq 必须同时供硬止损与 TPSL 使用。"""
+def test_inv_prefers_realtime_mark_and_keeps_position_size(tmp_path) -> None:
+    """实时 mark 优先，仓位数量与清算价仍复用 position。"""
 
     class Ext:
         def __init__(self) -> None:
             self.position_calls = 0
             self.liquidation_calls = 0
+            self.market_statistics_calls = 0
+
+            class Info:
+                async def get_market_statistics(inner_self, **kwargs):
+                    self.market_statistics_calls += 1
+                    return SimpleNamespace(data=SimpleNamespace(mark_price="101"))
+
+            self._client = SimpleNamespace(info=Info())
 
         async def get_position(self, market):
             self.position_calls += 1
             return Position(
                 market=market,
-                signed_size=Decimal("0.01"),
-                raw=SimpleNamespace(mark_price="100", liquidation_price="80"),
+                signed_size=Decimal("0.0123"),
+                raw=SimpleNamespace(mark_price="95", liquidation_price="80"),
             )
 
         async def get_liquidation_info(self, market):
@@ -116,18 +126,76 @@ def test_position_mark_and_liquidation_are_reused_within_round(tmp_path) -> None
     eng._state = GridState(95.0, 105.0, True, "BUY", False)
 
     inv, mark = asyncio.run(eng._inv())
-    assert asyncio.run(eng._check_hard_stop(signed_size=inv, mark=mark)) is False
-    assert asyncio.run(eng._maintain_tpsl(mark, inv)) is True
-    asyncio.run(
-        eng._advance_band(
-            mark,
-            GridMode.NEUTRAL,
-            signed_size=inv,
-        )
+
+    assert inv == Decimal("0.0123")
+    assert mark == 101.0
+    assert ext.position_calls == 1
+    assert ext.market_statistics_calls == 1
+    assert ext.liquidation_calls == 0
+
+
+@pytest.mark.parametrize("realtime_result", [RuntimeError("行情超时"), "0"])
+def test_inv_falls_back_to_position_mark_and_warns(
+    tmp_path,
+    caplog,
+    realtime_result,
+) -> None:
+    """实时行情异常或返回零时，回退 position mark 并明确告警。"""
+
+    class Info:
+        async def get_market_statistics(self, **kwargs):
+            if isinstance(realtime_result, Exception):
+                raise realtime_result
+            return SimpleNamespace(data=SimpleNamespace(mark_price=realtime_result))
+
+    position = Position(
+        market="BTC-USD",
+        signed_size=Decimal("0.0123"),
+        raw=SimpleNamespace(mark_price="95", liquidation_price="80"),
+    )
+    ext = SimpleNamespace(_client=SimpleNamespace(info=Info()))
+    eng = GridEngine(ext, GridConfig(state_path=str(tmp_path / "grid_state.json")))
+
+    with caplog.at_level(logging.WARNING, logger="grid_engine"):
+        inv, mark = asyncio.run(eng._inv(position=position))
+
+    assert inv == Decimal("0.0123")
+    assert mark == 95.0
+    assert any(
+        record.levelno == logging.WARNING
+        and "实时 mark 获取失败" in record.message
+        and "回落到 position.mark_price" in record.message
+        for record in caplog.records
     )
 
-    assert ext.position_calls == 1
-    assert ext.liquidation_calls == 0
+
+def test_hard_stop_prefers_realtime_mark_over_position_mark(tmp_path) -> None:
+    """硬止损直接接收 position 时，也不得使用其中的陈旧 mark。"""
+
+    class Info:
+        async def get_market_statistics(self, **kwargs):
+            return SimpleNamespace(data=SimpleNamespace(mark_price="100"))
+
+    position = Position(
+        market="BTC-USD",
+        signed_size=Decimal("0.01"),
+        raw=SimpleNamespace(mark_price="90", liquidation_price="80"),
+    )
+    ext = SimpleNamespace(_client=SimpleNamespace(info=Info()))
+    eng = GridEngine(
+        ext,
+        GridConfig(
+            dry_run=True,
+            hard_stop_dist=0.05,
+            state_path=str(tmp_path / "grid_state.json"),
+        ),
+    )
+
+    triggered = asyncio.run(eng._check_hard_stop(position=position))
+
+    assert triggered is False
+    assert eng._last_mark == 100.0
+    assert eng._last_dist_to_liq == pytest.approx(0.20)
 
 
 def test_failed_rounds_increment_counter_and_write_live_snapshot(
