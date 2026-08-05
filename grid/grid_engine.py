@@ -88,6 +88,7 @@ class GridEngine:
         self._fng_provider = fng_provider
         self._orders: dict[int, dict] = {}   # level -> {"id":..., "side": Side}
         self._retry: dict[int, dict] = {}
+        self._reject_cooldown: dict[int, dict] = {}
         self._counters = {
             "fill_detected": 0,
             "replacement_placed": 0,
@@ -95,6 +96,7 @@ class GridEngine:
             "terminal_unknown": 0,
             "rejected_terminal": 0,
             "dup_skipped": 0,
+            "reject_cooldown_skipped": 0,
             "bad_snapshot": 0,
             "orphan_adopted": 0,
             "write_budget_exhausted_rounds": 0,
@@ -1569,6 +1571,16 @@ class GridEngine:
             self._counters["dup_skipped"] += 1
             logger.debug("格%d 在重试队列中，普通补格跳过", level)
             return None
+        cooldown = self._reject_cooldown.get(level)
+        now = time.monotonic()
+        if cooldown and now < cooldown["until"]:
+            self._counters["reject_cooldown_skipped"] += 1
+            logger.debug(
+                "格%d 处于拒单冷却期，剩余 %.1f 秒，跳过挂单",
+                level,
+                cooldown["until"] - now,
+            )
+            return None
         if not reduce_only and not self._within_cap(side, inv_usd):
             self._log_cap_rejection(level, side, inv_usd, why)
             return None
@@ -1584,6 +1596,7 @@ class GridEngine:
 
         if self.config.dry_run:
             logger.info("[dry_run] %s", msg)
+            self._reject_cooldown.pop(level, None)
             self._orders[level] = {"id": f"dry-{level}", "side": side, "reduce_only": reduce_only, "qty": qty}
             return msg
         if self._write_budget <= 0:
@@ -1605,6 +1618,13 @@ class GridEngine:
                 getattr(data, "status", None) or getattr(res, "status", "") or ""
             ).upper()
             if status.rsplit(".", 1)[-1] == "REJECTED":
+                previous = self._reject_cooldown.get(level)
+                count = int(previous["count"]) + 1 if previous else 1
+                cooldown_seconds = min(30 * 2 ** min(count - 1, 4), 300)
+                self._reject_cooldown[level] = {
+                    "until": time.monotonic() + cooldown_seconds,
+                    "count": count,
+                }
                 note = remember_failed()
                 if is_replacement:
                     self._counters["replacement_failed"] += 1
@@ -1621,6 +1641,7 @@ class GridEngine:
                     self._counters["replacement_failed"] += 1
                 logger.warning("%s → 响应缺少订单 ID%s", msg, note)
                 return None
+            self._reject_cooldown.pop(level, None)
             self._orders[level] = {"id": oid, "side": side, "reduce_only": reduce_only, "qty": qty}
             if is_replacement:
                 self._counters["replacement_placed"] += 1
