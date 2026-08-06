@@ -5,7 +5,15 @@
 """
 from __future__ import annotations
 
-from grid.scaling import count_oscillations
+import math
+
+from grid.scaling import (
+    SIGMA_MULT_HIGH,
+    SIGMA_MULT_LOW,
+    count_oscillations,
+    estimate_sigma,
+    usable_window,
+)
 
 
 def test_no_oscillation_when_flat() -> None:
@@ -79,16 +87,6 @@ def test_extend_low_before_reversal() -> None:
     assert count_oscillations([100.0, 110.0, 108.0, 105.0, 110.0], s=0.01) == 2
 
 
-import math
-
-from grid.scaling import (
-    SIGMA_MULT_HIGH,
-    SIGMA_MULT_LOW,
-    estimate_sigma,
-    usable_window,
-)
-
-
 def test_estimate_sigma_matches_known_value() -> None:
     # 构造对数收益恒为 ±0.001 的序列，标准差应为 0.001
     prices = [100.0]
@@ -128,3 +126,37 @@ def test_usable_window_rejects_inverted_range() -> None:
     # σ 太小导致 tick 下界超过上界时必须报错而非静默返回空区间
     with pytest.raises(ValueError):
         usable_window(sigma=1e-12, tick=1.0, price=100.0)
+
+
+def test_estimate_sigma_rejects_non_positive_price() -> None:
+    """脏数据必须当场报错，不能静默过滤成偏小的 σ。
+
+    回归：[100.0, -5.0, 102.0] 原会静默返回 0.0，下游只看到误导性的
+    「σ 须为正」，真正病因（价格损坏）被掩盖。
+    """
+    import pytest
+    with pytest.raises(ValueError, match="非正值"):
+        estimate_sigma([100.0, -5.0, 102.0])
+    with pytest.raises(ValueError, match="非正值"):
+        estimate_sigma([100.0, 0.0])
+
+
+def test_estimate_sigma_single_return_yields_zero() -> None:
+    # 两个价格点只有一个收益，算不出样本标准差，返回 0.0
+    assert estimate_sigma([100.0, 105.0]) == 0.0
+
+
+def test_usable_window_rejects_non_positive_sigma() -> None:
+    import pytest
+    with pytest.raises(ValueError, match="σ 须为正"):
+        usable_window(sigma=0.0, tick=1.0, price=100.0)
+    with pytest.raises(ValueError, match="σ 须为正"):
+        usable_window(sigma=-1e-5, tick=1.0, price=100.0)
+
+
+def test_usable_window_rejects_non_positive_tick_or_price() -> None:
+    import pytest
+    with pytest.raises(ValueError, match="tick 与价格须为正"):
+        usable_window(sigma=3e-5, tick=0.0, price=100.0)
+    with pytest.raises(ValueError, match="tick 与价格须为正"):
+        usable_window(sigma=3e-5, tick=1.0, price=0.0)

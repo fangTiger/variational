@@ -79,14 +79,28 @@ def estimate_sigma(prices: Sequence[float]) -> float:
 
     这是定标窗口的尺子——窗口必须相对 σ 而非绝对格距来取，
     否则换个波动率环境就落进伪信号区。
+
+    非正价格一律报错而非静默跳过：静默过滤会让 σ 用更小的样本算出偏小值，
+    进而整体平移扫描窗口、毁掉 α，且下游只会看到误导性的「σ 须为正」。
+    脏数据必须当场暴露。
+
+    Args:
+        prices: 按时间排序的价格序列，全部须为正
+
+    Returns:
+        对数收益的样本标准差（n-1 分母）；有效收益不足 2 个时返回 0.0
+
+    Raises:
+        ValueError: 价格点少于 2 个，或存在非正价格
     """
     if len(prices) < 2:
         raise ValueError(f"至少需要 2 个价格点，收到 {len(prices)}")
-    rets = [
-        math.log(prices[i] / prices[i - 1])
-        for i in range(1, len(prices))
-        if prices[i] > 0 and prices[i - 1] > 0
-    ]
+    bad = [i for i, p in enumerate(prices) if p <= 0]
+    if bad:
+        raise ValueError(
+            f"价格序列含 {len(bad)} 个非正值，首个在下标 {bad[0]}（值 {prices[bad[0]]}）"
+        )
+    rets = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))]
     if len(rets) < 2:
         return 0.0
     mean = sum(rets) / len(rets)
