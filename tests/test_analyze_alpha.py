@@ -92,3 +92,29 @@ def test_split_by_regime_cuts_within_segment() -> None:
     buckets = split_by_regime([seg], series)
     assert "<20" in buckets and ">30" in buckets
     assert sum(len(s) for ss in buckets.values() for s in ss) <= len(seg)
+
+
+def test_analyze_prints_diagnostics_but_no_advice_when_out_of_window(capsys) -> None:
+    """操作点在窗口外时：诊断表要打印，方向性建议不许打印。
+
+    窗口外恰恰是最需要诊断信息排查原因的时候。
+    """
+    import math
+    import random
+    from tools.analyze_alpha import analyze
+
+    # 构造 σ=1e-5 的序列：窗口 [16σ, 64σ] = [0.016%, 0.064%]，
+    # 整体低于操作点 0.0986%，但仍高于 tick 下界（8×1/64000 = 0.0125%），
+    # 所以 usable_window 能正常建出窗口、只是操作点落在窗口外。
+    # σ 再小会触发「无可信区间」而走不到这条分支。
+    rng = random.Random(3)
+    price = 64000.0
+    seg = []
+    for i in range(3000):
+        price *= math.exp(rng.gauss(0.0, 1e-5))
+        seg.append({"p": price, "T": 1786000000000 + i * 100})
+    analyze([seg], "测试")
+    out = capsys.readouterr().out
+    assert "落在可信窗口外" in out
+    assert "振荡数" in out                      # 诊断表仍要打印
+    assert "→ 建议" not in out                  # 不许给方向性建议

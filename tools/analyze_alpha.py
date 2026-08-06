@@ -192,10 +192,12 @@ def analyze(segments: list[list[dict]], label: str) -> None:
     print(f"[{label}] 段数 {len(segments)}，成交 {total_points} 笔")
     print(f"每笔 σ = {sigma * 100:.5f}%，可信窗口 "
           f"[{low * 100:.4f}%, {high * 100:.4f}%]")
-    if not low <= OPERATING_SPACING <= high:
-        print(f"⚠ 操作点 {OPERATING_SPACING * 100:.4f}% 落在窗口外，"
-              f"结论对当前格距不适用，不给出方向性建议")
-        return
+    # 窗口外时仍打印全部诊断——那恰恰是最需要排查「为什么落在窗口外」的
+    # 时候；只在最后抑制方向性建议。
+    operating_in_window = low <= OPERATING_SPACING <= high
+    if not operating_in_window:
+        print(f"⚠ 操作点 {OPERATING_SPACING * 100:.4f}% 落在可信窗口外，"
+              f"下面的诊断仅供排查，不据此调整格距")
     print(f"{'格距':>10} {'振荡数':>10}")
     for s, n in zip(spacings, counts):
         print(f"{s * 100:>9.4f}% {n:>10}")
@@ -216,6 +218,10 @@ def analyze(segments: list[list[dict]], label: str) -> None:
           f"(中心 {center_s * 100:.4f}%, R²={r2:.3f})")
     if r2 < 0.9:
         print("⚠ R² < 0.9，幂律假设本身存疑，下述建议不可信")
+
+    if not operating_in_window:
+        print("\n→ 不适用：操作点在可信窗口外，本次不给出方向性建议")
+        return
 
     if alpha > 2.1:
         print("→ 建议：收窄格距（收益/风险比随 s 减小而上升）")
