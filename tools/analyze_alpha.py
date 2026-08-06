@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from bisect import bisect_right
 from pathlib import Path
 
 from grid.scaling import (
     count_oscillations,
-    estimate_sigma,
     fit_local_alpha,
     log_spaced,
     usable_window,
@@ -76,7 +77,7 @@ def load_trades(days: int | None) -> list[dict]:
     if not TRADES_DIR.exists():
         raise SystemExit(f"没有数据目录 {TRADES_DIR}，先把采集器跑起来")
     files = sorted(TRADES_DIR.glob("*.jsonl"))
-    if days is not None:
+    if days is not None and days > 0:
         files = files[-days:]
     rows: list[dict] = []
     for path in files:
@@ -108,17 +109,60 @@ def load_adx_series() -> list[tuple[float, float]]:
 
 
 def adx_at(series: list[tuple[float, float]], ts_ms: int) -> float | None:
-    """取不晚于该时刻的最近一条 ADX。regime 是慢变量，小时级对齐足够。"""
+    """取不晚于该时刻的最近一条 ADX。regime 是慢变量，小时级对齐足够。
+
+    用二分而非线性扫描——按 regime 切子段时本函数会被逐行调用。
+    """
     if not series:
         return None
-    ts = ts_ms / 1000.0
-    best = None
-    for sample_ts, adx in series:
-        if sample_ts <= ts:
-            best = adx
-        else:
-            break
-    return best
+    idx = bisect_right(series, (ts_ms / 1000.0, float("inf"))) - 1
+    return series[idx][1] if idx >= 0 else None
+
+
+def split_by_regime(segments: list[list[dict]],
+                    adx_series: list[tuple[float, float]]) -> dict[str, list[list[dict]]]:
+    """按 ADX 档位把段切成子段。
+
+    一段只在采集断线处才切，可以横跨数小时，期间 ADX 完全可能跨越
+    20/30 边界。若只用段首时间戳给整段定档，趋势期的振荡数会被误
+    归入震荡档，--by-regime 就失去意义。
+    """
+    buckets: dict[str, list[list[dict]]] = {}
+    for seg in segments:
+        current_bucket: str | None = None
+        current: list[dict] = []
+        for row in seg:
+            bucket = adx_bucket(adx_at(adx_series, row["T"]))
+            if bucket != current_bucket:
+                if len(current) >= 2 and current_bucket is not None:
+                    buckets.setdefault(current_bucket, []).append(current)
+                current = []
+                current_bucket = bucket
+            current.append(row)
+        if len(current) >= 2 and current_bucket is not None:
+            buckets.setdefault(current_bucket, []).append(current)
+    return buckets
+
+
+def segment_sigma(segments: list[list[dict]]) -> float:
+    """只用段内相邻收益估计 σ。
+
+    绝不能把各段拼接后再算——段与段之间那对价格是跨越缺口的假收益，
+    会把 σ 显著抬高（实测 15 段、段间跳变 0.2% 的场景虚高 438%），
+    进而整体平移扫描窗口，甚至把当前操作点排除在窗口之外。
+    这与逐段调用 count_oscillations 是同一条纪律。
+    """
+    rets = [
+        math.log(seg[i]["p"] / seg[i - 1]["p"])
+        for seg in segments
+        for i in range(1, len(seg))
+        if seg[i]["p"] > 0 and seg[i - 1]["p"] > 0
+    ]
+    if len(rets) < 2:
+        return 0.0
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var)
 
 
 def analyze(segments: list[list[dict]], label: str) -> None:
@@ -128,10 +172,10 @@ def analyze(segments: list[list[dict]], label: str) -> None:
         print(f"\n[{label}] 样本仅 {total_points} 笔，不足以拟合，跳过")
         return
 
-    # σ 由数据现算，窗口随之自动确定——写死绝对格距会落进伪信号区
-    all_prices = [r["p"] for seg in segments for r in seg]
-    sigma = estimate_sigma(all_prices)
-    ref_price = all_prices[0]
+    # σ 由数据现算，窗口随之自动确定——写死绝对格距会落进伪信号区。
+    # 只能用段内收益，绝不能拼接后算：段间那对价格是跨越缺口的假收益。
+    sigma = segment_sigma(segments)
+    ref_price = segments[-1][-1]["p"]  # 用最近的价格，不用最早的
     try:
         low, high = usable_window(sigma, tick=PRICE_TICK, price=ref_price)
     except ValueError as exc:
@@ -150,7 +194,8 @@ def analyze(segments: list[list[dict]], label: str) -> None:
           f"[{low * 100:.4f}%, {high * 100:.4f}%]")
     if not low <= OPERATING_SPACING <= high:
         print(f"⚠ 操作点 {OPERATING_SPACING * 100:.4f}% 落在窗口外，"
-              f"结论对当前格距不适用")
+              f"结论对当前格距不适用，不给出方向性建议")
+        return
     print(f"{'格距':>10} {'振荡数':>10}")
     for s, n in zip(spacings, counts):
         print(f"{s * 100:>9.4f}% {n:>10}")
@@ -165,16 +210,17 @@ def analyze(segments: list[list[dict]], label: str) -> None:
         print(f"{center_s * 100:>9.4f}% {alpha:>8.3f} {r2:>7.3f}")
 
     center_s, alpha, r2 = min(curve, key=lambda c: abs(c[0] - OPERATING_SPACING))
+    op_index = min(range(len(spacings)), key=lambda i: abs(spacings[i] - center_s))
+    op_osc = counts[op_index]
     print(f"\n操作点 {OPERATING_SPACING * 100:.4f}% 最近的局部 α = {alpha:.3f} "
           f"(中心 {center_s * 100:.4f}%, R²={r2:.3f})")
     if r2 < 0.9:
         print("⚠ R² < 0.9，幂律假设本身存疑，下述建议不可信")
 
-    mid_osc = counts[len(counts) // 2]
     if alpha > 2.1:
         print("→ 建议：收窄格距（收益/风险比随 s 减小而上升）")
-        if mid_osc < 50:
-            print(f"  但窗口中点振荡数仅 {mid_osc}，绝对收益很低——"
+        if op_osc < 50:
+            print(f"  但操作点附近振荡数仅 {op_osc}，绝对收益很低——"
                   f"若同时处于趋势档，正确动作是不做网格而非收窄。")
     elif alpha < 1.9:
         print("→ 建议：放宽格距（收益/风险比随 s 增大而上升）")
@@ -199,10 +245,7 @@ def main() -> None:
 
     if args.by_regime:
         adx_series = load_adx_series()
-        buckets: dict[str, list[list[dict]]] = {}
-        for seg in segments:
-            bucket = adx_bucket(adx_at(adx_series, seg[0]["T"]))
-            buckets.setdefault(bucket, []).append(seg)
+        buckets = split_by_regime(segments, adx_series)
         for name in ("<20", "20-30", ">30", "unknown"):
             if name in buckets:
                 analyze(buckets[name], f"ADX {name}")
