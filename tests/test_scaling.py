@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 
 from grid.scaling import (
+    MIN_TICKS_PER_GRID,
     SIGMA_MULT_HIGH,
     SIGMA_MULT_LOW,
     count_oscillations,
@@ -98,6 +99,21 @@ def test_estimate_sigma_matches_known_value() -> None:
     assert abs(sigma - 0.001) < 1e-4
 
 
+def test_estimate_sigma_uses_bessel_correction() -> None:
+    """锁死 n-1 分母。
+
+    这条必须用小样本精确值，不能用统计容差：Bessel 修正的相对误差是
+    O(1/2n)，200 样本下 n 与 n-1 的差只有 2.5e-6，比统计型测试的容差
+    小 40 倍，大样本测试对这类公式错误先天失明（变异测试实证：把分母
+    改成 n，211 个测试全绿）。
+
+    n=3 时两种分母的 σ 相差 18.35%，1e-12 容差必然抓住。
+    期望值经手算与 statistics.stdev 双向交叉验证。
+    """
+    prices = [100.0, 101.0, 100.0, 102.0]   # 3 个对数收益
+    assert abs(estimate_sigma(prices) - 0.015156641009734854) < 1e-12
+
+
 def test_estimate_sigma_zero_for_flat() -> None:
     assert estimate_sigma([100.0] * 50) == 0.0
 
@@ -106,6 +122,19 @@ def test_estimate_sigma_needs_two_points() -> None:
     import pytest
     with pytest.raises(ValueError):
         estimate_sigma([100.0])
+
+
+def test_calibration_constants_are_locked() -> None:
+    """定标常数直接锁值。
+
+    这三个数来自实测（布朗路径在 s/σ=16~64 内局部 α 收敛到 1.87~1.98），
+    改动它们会系统性平移扫描窗口。变异测试实证：把 SIGMA_MULT_LOW 改成 4
+    后布朗 α 降到 1.85~1.91，仍落在 (1.75, 2.25) 容差内不报警——所以必须
+    直接断言常量值，不能指望统计断言侧翼接住。
+    """
+    assert SIGMA_MULT_LOW == 16.0
+    assert SIGMA_MULT_HIGH == 64.0
+    assert MIN_TICKS_PER_GRID == 8
 
 
 def test_usable_window_scales_with_sigma() -> None:

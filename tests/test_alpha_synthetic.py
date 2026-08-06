@@ -4,6 +4,15 @@
 合成路径把算法本身钉死——不通过则不得使用实盘数据。
 
 容差取自用真实 grid/scaling.py 的实测值，不得为了让测试通过而调宽。
+
+本闸门只保证**宏观标度指数**正确，不保证 count_oscillations 的每个分支正确。
+变异测试实证：把「方向确立时覆盖真实极值」这个已修复的 Critical bug 复现回去，
+本文件 4 条测试全绿、α 小数点后 4 位不变——因为该 bug 只影响每条路径一次性的
+初始方向确立，被 20 万步的统计聚合稀释到噪声以下。
+
+它由 tests/test_scaling.py 的短序列单元测试守护（尤其是
+test_initial_extreme_survives_direction_commit）。那些测试是本闸门的必要补充，
+不可删除或弱化。
 """
 from __future__ import annotations
 
