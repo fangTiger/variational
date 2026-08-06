@@ -17,6 +17,7 @@ import json  # noqa: E402
 import logging  # noqa: E402
 import ssl  # noqa: E402
 from collections import deque  # noqa: E402
+from collections.abc import Iterable  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -41,6 +42,10 @@ MAX_BACKOFF_SECONDS = 60.0
 # 去重窗口上限。交易所不会重推很久以前的成交，5 万条约覆盖 11 小时，
 # 远超实际需要；无界 set 跑 30 天会累积到 100MB+。
 MAX_SEEN_IDS = 50_000
+
+# 重启后从磁盘回灌的 id 数量。实测流在连上时会补发约 50 笔 / 57 秒的
+# backlog，取 1000 留 20 倍余量。
+RECOVER_SEEN_LIMIT = 1000
 
 
 def parse_trades(msg: dict) -> list[dict]:
@@ -75,9 +80,10 @@ class TradeBuffer:
     """
 
     def __init__(self, max_gap_ms: int = DEFAULT_MAX_GAP_MS,
-                 last_ts: int | None = None) -> None:
-        self._seen: set[int] = set()
-        self._order: deque[int] = deque()
+                 last_ts: int | None = None,
+                 seen_ids: Iterable[int] = ()) -> None:
+        self._seen: set[int] = set(seen_ids)
+        self._order: deque[int] = deque(self._seen)
         self._last_ts = last_ts
         self._max_gap_ms = max_gap_ms
         self._pending_break = False
@@ -176,14 +182,49 @@ def recover_last_ts(out_dir: Path = OUT_DIR) -> int | None:
     return None
 
 
+def recover_recent_ids(out_dir: Path = OUT_DIR,
+                        limit: int = RECOVER_SEEN_LIMIT) -> list[int]:
+    """从已落盘文件末尾恢复最近若干成交 id，用于重启后对 backlog 去重。
+
+    公开成交流在连上时会补发一小段历史（实测约 50 笔 / 57 秒）。若不把
+    这些 id 回灌进去重集合，重启后这批已落盘的成交会被重复写入，抬高
+    下游的振荡计数。
+
+    Returns:
+        按时间正序排列的 id 列表；无历史数据时返回空列表
+    """
+    if not out_dir.exists():
+        return []
+    ids: list[int] = []
+    for path in sorted(out_dir.glob("*.jsonl"), reverse=True):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("gap") or "i" not in row:
+                continue
+            ids.append(int(row["i"]))
+            if len(ids) >= limit:
+                return list(reversed(ids))
+    return list(reversed(ids))
+
+
 async def run_forever() -> None:
     """长连接采集主循环，断线指数退避重连。"""
     last_ts = recover_last_ts()
-    buf = TradeBuffer(last_ts=last_ts)
+    buf = TradeBuffer(last_ts=last_ts, seen_ids=recover_recent_ids())
     if last_ts is not None:
         # 进程此前不在运行，这段空窗无法证明没丢数据
         buf.mark_discontinuity()
-        logger.info("从磁盘恢复 last_ts=%d，已标记启动断点", last_ts)
+        logger.info("从磁盘恢复 last_ts=%d、%d 个历史 id，已标记启动断点",
+                    last_ts, len(buf._seen))
 
     ctx = ssl.create_default_context(cafile=certifi.where())
     backoff = 1.0

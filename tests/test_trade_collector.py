@@ -1,6 +1,9 @@
 """采集器纯逻辑测试：解析、去重、缺口检测。不联网。"""
 from __future__ import annotations
 
+import asyncio
+import json
+
 from tools.trade_collector import TradeBuffer, parse_trades
 
 
@@ -124,3 +127,102 @@ def test_recover_last_ts_skips_gap_lines(tmp_path) -> None:
 def test_recover_last_ts_missing_dir(tmp_path) -> None:
     from tools.trade_collector import recover_last_ts
     assert recover_last_ts(tmp_path / "nonexistent") is None
+
+
+def test_recover_recent_ids_skips_gap_lines(tmp_path) -> None:
+    """恢复 id 时必须跳过 gap 标记行。"""
+    from tools.trade_collector import recover_recent_ids
+    f = tmp_path / "2026-08-06.jsonl"
+    f.write_text(
+        '{"i":1,"T":1000,"p":10.0,"q":1.0,"S":"BUY"}\n'
+        '{"gap":true,"from":1,"to":2}\n'
+        '{"i":2,"T":2000,"p":11.0,"q":1.0,"S":"SELL"}\n',
+        encoding="utf-8",
+    )
+    assert recover_recent_ids(tmp_path) == [1, 2]
+
+
+def test_restored_seen_ids_dedup_backlog(tmp_path) -> None:
+    """重启后流补发的 backlog 不得重复落盘。
+
+    实测公开成交流连上时会补发约 50 笔 / 57 秒历史；不恢复 _seen 会让
+    这批已落盘成交被重复写入，抬高下游振荡计数。
+    """
+    from tools.trade_collector import recover_recent_ids
+    f = tmp_path / "2026-08-06.jsonl"
+    f.write_text(
+        "".join(
+            '{"i":%d,"T":%d,"p":10.0,"q":1.0,"S":"BUY"}\n' % (i, 1_000_000 + i)
+            for i in range(1, 81)
+        ),
+        encoding="utf-8",
+    )
+    buf = TradeBuffer(seen_ids=recover_recent_ids(tmp_path))
+    backlog = [{"i": i, "T": 1_000_000 + i, "p": 10.0, "q": 1.0, "S": "BUY"}
+               for i in range(51, 81)]
+    live = [{"i": i, "T": 1_000_000 + i, "p": 10.0, "q": 1.0, "S": "BUY"}
+            for i in range(81, 86)]
+    assert buf.add(backlog) == []          # backlog 全部去重
+    assert len(buf.add(live)) == 5         # 新数据照常
+
+
+def test_run_forever_keeps_pending_break_through_empty_message(monkeypatch) -> None:
+    """重连后首批消息为空时，pending_break 不得被提前清除。
+
+    clear_discontinuity() 在 `if not rows: continue` 之后才执行，所以空
+    消息不会误清断点标记；真正到来的第一批有效数据仍应触发一次缺口
+    标记。用假 WebSocket 固化这条路径——不联网、不碰真实 data/trades/
+    （_append/_append_gap 全部打桩，从不触碰磁盘）。
+    """
+    import tools.trade_collector as collector
+
+    gap_calls: list[tuple[int, int]] = []
+    appended: list[list[dict]] = []
+
+    monkeypatch.setattr(collector, "recover_last_ts", lambda: 1000)
+    monkeypatch.setattr(collector, "recover_recent_ids", lambda: [])
+    monkeypatch.setattr(collector, "_append_gap",
+                         lambda start, end: gap_calls.append((start, end)))
+    monkeypatch.setattr(collector, "_append", lambda rows: appended.append(rows))
+
+    empty_msg = json.dumps({"data": []})
+    real_msg_1 = json.dumps({"data": [
+        {"i": 1, "T": 5000, "p": "10", "q": "1", "S": "BUY"}
+    ]})
+    real_msg_2 = json.dumps({"data": [
+        {"i": 2, "T": 5100, "p": "10", "q": "1", "S": "BUY"}
+    ]})
+
+    class _FakeConnection:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        def __aiter__(self):
+            return self._gen()
+
+        async def _gen(self):
+            yield empty_msg
+            yield real_msg_1
+            yield real_msg_2
+            raise asyncio.CancelledError  # 测试到此为止，让 run_forever 干净退出
+
+    monkeypatch.setattr(collector.websockets, "connect",
+                         lambda *a, **k: _FakeConnection())
+
+    async def _drive() -> None:
+        try:
+            await collector.run_forever()
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_drive())
+
+    # 空消息不清断点：真正的第一批数据（5000）仍应触发一次缺口标记
+    assert gap_calls == [(1000, 5000)]
+    # 两批有效数据都正常落盘（打桩），第二批不再触发缺口
+    assert len(appended) == 2
+    assert [r["i"] for r in appended[0]] == [1]
+    assert [r["i"] for r in appended[1]] == [2]
