@@ -77,3 +77,54 @@ def test_initial_downward_move_establishes_direction() -> None:
 def test_extend_low_before_reversal() -> None:
     # 下行途中不断刷新新低，最后反弹满一格才记转折
     assert count_oscillations([100.0, 110.0, 108.0, 105.0, 110.0], s=0.01) == 2
+
+
+import math
+
+from grid.scaling import (
+    SIGMA_MULT_HIGH,
+    SIGMA_MULT_LOW,
+    estimate_sigma,
+    usable_window,
+)
+
+
+def test_estimate_sigma_matches_known_value() -> None:
+    # 构造对数收益恒为 ±0.001 的序列，标准差应为 0.001
+    prices = [100.0]
+    for i in range(200):
+        prices.append(prices[-1] * math.exp(0.001 if i % 2 == 0 else -0.001))
+    sigma = estimate_sigma(prices)
+    assert abs(sigma - 0.001) < 1e-4
+
+
+def test_estimate_sigma_zero_for_flat() -> None:
+    assert estimate_sigma([100.0] * 50) == 0.0
+
+
+def test_estimate_sigma_needs_two_points() -> None:
+    import pytest
+    with pytest.raises(ValueError):
+        estimate_sigma([100.0])
+
+
+def test_usable_window_scales_with_sigma() -> None:
+    low, high = usable_window(sigma=0.00003, tick=1.0, price=64700.0)
+    assert abs(low - SIGMA_MULT_LOW * 0.00003) < 1e-12
+    assert abs(high - SIGMA_MULT_HIGH * 0.00003) < 1e-12
+
+
+def test_usable_window_respects_tick_floor() -> None:
+    # σ=4e-6 时 16σ=6.4e-5 低于 tick 下界 1.237e-4，下界应被顶上去；
+    # 同时 64σ=2.56e-4 仍高于下界，区间有效。
+    # 注意不能取过小的 σ（如 1e-9），那会触发下面的「无可信区间」分支。
+    low, high = usable_window(sigma=4e-6, tick=1.0, price=64700.0)
+    assert abs(low - 8 * 1.0 / 64700.0) < 1e-12
+    assert low < high
+
+
+def test_usable_window_rejects_inverted_range() -> None:
+    import pytest
+    # σ 太小导致 tick 下界超过上界时必须报错而非静默返回空区间
+    with pytest.raises(ValueError):
+        usable_window(sigma=1e-12, tick=1.0, price=100.0)

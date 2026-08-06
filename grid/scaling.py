@@ -61,3 +61,58 @@ def count_oscillations(prices: Sequence[float], s: float) -> int:
                 high = price
 
     return count
+
+
+# 可用窗口边界（单位：每笔波动 σ 的倍数）。
+# 实测依据：布朗路径在 s/σ = 16~64 区间内局部 α 收敛到 1.87~1.98；
+# 低于 16 采样相对格距太粗、α 被压低到 1.63（伪信号），
+# 高于 64 转折数太少、噪声主导。
+SIGMA_MULT_LOW = 16.0
+SIGMA_MULT_HIGH = 64.0
+
+# 每格至少要有这么多个价格 tick，否则格号被 tick 离散化扭曲。
+MIN_TICKS_PER_GRID = 8
+
+
+def estimate_sigma(prices: Sequence[float]) -> float:
+    """估计相邻样本对数收益的标准差。
+
+    这是定标窗口的尺子——窗口必须相对 σ 而非绝对格距来取，
+    否则换个波动率环境就落进伪信号区。
+    """
+    if len(prices) < 2:
+        raise ValueError(f"至少需要 2 个价格点，收到 {len(prices)}")
+    rets = [
+        math.log(prices[i] / prices[i - 1])
+        for i in range(1, len(prices))
+        if prices[i] > 0 and prices[i - 1] > 0
+    ]
+    if len(rets) < 2:
+        return 0.0
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var)
+
+
+def usable_window(sigma: float, tick: float, price: float) -> tuple[float, float]:
+    """给出可信的格距扫描区间 [low, high]。
+
+    下界同时受 σ 倍数和 tick 离散化两个约束，取二者较大值。
+
+    Raises:
+        ValueError: tick 下界超过 σ 上界时，说明该标的在当前波动率下
+            没有可信区间，必须报错而非静默返回空区间。
+    """
+    if sigma <= 0:
+        raise ValueError(f"σ 须为正：{sigma}")
+    if tick <= 0 or price <= 0:
+        raise ValueError(f"tick 与价格须为正：tick={tick} price={price}")
+    tick_floor = MIN_TICKS_PER_GRID * tick / price
+    low = max(SIGMA_MULT_LOW * sigma, tick_floor)
+    high = SIGMA_MULT_HIGH * sigma
+    if low >= high:
+        raise ValueError(
+            f"无可信区间：下界 {low:.6f} >= 上界 {high:.6f}"
+            f"（σ={sigma:.8f}, tick 下界={tick_floor:.6f}）"
+        )
+    return low, high
