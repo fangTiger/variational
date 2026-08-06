@@ -43,10 +43,8 @@ def count_oscillations(prices: Sequence[float], s: float) -> int:
                 low = price
             if price >= low * (1 + s):
                 direction = 1
-                high = price
             elif price <= high * (1 - s):
                 direction = -1
-                low = price
         elif direction > 0:
             if price > high:
                 high = price
