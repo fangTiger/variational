@@ -226,3 +226,10 @@ def test_run_forever_keeps_pending_break_through_empty_message(monkeypatch) -> N
     assert len(appended) == 2
     assert [r["i"] for r in appended[0]] == [1]
     assert [r["i"] for r in appended[1]] == [2]
+
+
+def test_buffer_preserves_seen_id_order(tmp_path) -> None:
+    """_order 必须保留传入的时间正序，不能用 set 重建而丢序。"""
+    ids = [1786021477974, 1786021477974 + 3_000_000, 1786021477974 + 6_000_000]
+    buf = TradeBuffer(seen_ids=ids)
+    assert list(buf._order) == ids

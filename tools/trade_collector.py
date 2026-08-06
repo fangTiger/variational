@@ -43,8 +43,9 @@ MAX_BACKOFF_SECONDS = 60.0
 # 远超实际需要；无界 set 跑 30 天会累积到 100MB+。
 MAX_SEEN_IDS = 50_000
 
-# 重启后从磁盘回灌的 id 数量。实测流在连上时会补发约 50 笔 / 57 秒的
-# backlog，取 1000 留 20 倍余量。
+# 重启后从磁盘回灌的 id 数量。实测流在连上时补发的 backlog 严格按笔数
+# 封顶、恒定 50 笔（连续 4 次探测笔数变化为 0，时间跨度 3.6~30.3s 剧烈
+# 波动，说明不是按时间封顶），取 1000 留 20 倍余量。
 RECOVER_SEEN_LIMIT = 1000
 
 
@@ -83,7 +84,7 @@ class TradeBuffer:
                  last_ts: int | None = None,
                  seen_ids: Iterable[int] = ()) -> None:
         self._seen: set[int] = set(seen_ids)
-        self._order: deque[int] = deque(self._seen)
+        self._order: deque[int] = deque(seen_ids)
         self._last_ts = last_ts
         self._max_gap_ms = max_gap_ms
         self._pending_break = False
