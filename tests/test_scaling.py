@@ -12,6 +12,8 @@ from grid.scaling import (
     SIGMA_MULT_LOW,
     count_oscillations,
     estimate_sigma,
+    fit_local_alpha,
+    log_spaced,
     usable_window,
 )
 
@@ -160,3 +162,64 @@ def test_usable_window_rejects_non_positive_tick_or_price() -> None:
         usable_window(sigma=3e-5, tick=0.0, price=100.0)
     with pytest.raises(ValueError, match="tick 与价格须为正"):
         usable_window(sigma=3e-5, tick=1.0, price=0.0)
+
+
+def test_log_spaced_endpoints_and_count() -> None:
+    pts = log_spaced(0.0002, 0.004, 15)
+    assert len(pts) == 15
+    assert abs(pts[0] - 0.0002) < 1e-12
+    assert abs(pts[-1] - 0.004) < 1e-12
+    # 对数均匀：相邻比值恒定
+    ratios = [pts[i + 1] / pts[i] for i in range(len(pts) - 1)]
+    assert max(ratios) - min(ratios) < 1e-9
+
+
+def test_log_spaced_validates_inputs() -> None:
+    import pytest
+    with pytest.raises(ValueError):
+        log_spaced(0.0, 0.004, 15)          # 下界非正
+    with pytest.raises(ValueError):
+        log_spaced(0.004, 0.0002, 15)       # 上下界颠倒
+    with pytest.raises(ValueError):
+        log_spaced(0.0002, 0.004, 1)        # 点数不足
+
+
+def test_fit_local_alpha_recovers_exact_power_law() -> None:
+    # 构造 N(s) = C * s^(-2)，局部斜率处处应为 2.0
+    spacings = log_spaced(0.0002, 0.004, 15)
+    counts = [round(1e6 * s ** -2.0) for s in spacings]
+    curve = fit_local_alpha(spacings, counts, window=5)
+    assert len(curve) == 11
+    for _s, alpha, r2 in curve:
+        assert abs(alpha - 2.0) < 0.05
+        assert r2 > 0.99
+
+
+def test_fit_local_alpha_recovers_slope_one() -> None:
+    # N(s) = C * s^(-1) → α = 1.0
+    spacings = log_spaced(0.0002, 0.004, 15)
+    counts = [round(1e4 * s ** -1.0) for s in spacings]
+    curve = fit_local_alpha(spacings, counts, window=5)
+    for _s, alpha, _r2 in curve:
+        assert abs(alpha - 1.0) < 0.05
+
+
+def test_fit_local_alpha_center_is_window_midpoint() -> None:
+    # 返回的第一个中心格距应是窗口中点（window=5 → 下标 2）
+    spacings = log_spaced(0.0002, 0.004, 15)
+    counts = [round(1e6 * s ** -2.0) for s in spacings]
+    curve = fit_local_alpha(spacings, counts, window=5)
+    assert abs(curve[0][0] - spacings[2]) < 1e-12
+
+
+def test_fit_local_alpha_skips_zero_counts() -> None:
+    # 零穿越点取不了对数，必须被跳过而不是崩溃
+    spacings = log_spaced(0.0002, 0.004, 15)
+    counts = [0] * 10 + [100, 80, 60, 40, 20]
+    curve = fit_local_alpha(spacings, counts, window=5)
+    assert isinstance(curve, list)
+    assert len(curve) == 1
+
+
+def test_fit_local_alpha_requires_enough_points() -> None:
+    assert fit_local_alpha([0.001, 0.002], [100, 50], window=5) == []

@@ -130,3 +130,69 @@ def usable_window(sigma: float, tick: float, price: float) -> tuple[float, float
             f"（σ={sigma:.8f}, tick 下界={tick_floor:.6f}）"
         )
     return low, high
+
+
+def log_spaced(low: float, high: float, count: int) -> list[float]:
+    """在 [low, high] 上取 count 个对数均匀点。
+
+    标度分析必须在对数尺度上均匀采样，等差采样会让小 s 区严重欠采样。
+    """
+    if low <= 0 or high <= low:
+        raise ValueError(f"区间非法：[{low}, {high}]")
+    if count < 2:
+        raise ValueError(f"点数须 >= 2：{count}")
+    ratio = (high / low) ** (1.0 / (count - 1))
+    return [low * ratio ** i for i in range(count)]
+
+
+def _ols_slope(xs: Sequence[float], ys: Sequence[float]) -> tuple[float, float]:
+    """二元最小二乘，返回 (斜率, R²)。纯 Python，不引入 numpy。"""
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    sxx = sum((x - mean_x) ** 2 for x in xs)
+    if sxx == 0:
+        raise ValueError("自变量无变化，无法拟合")
+    sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    slope = sxy / sxx
+    intercept = mean_y - slope * mean_x
+    ss_tot = sum((y - mean_y) ** 2 for y in ys)
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    return slope, r2
+
+
+def fit_local_alpha(
+    spacings: Sequence[float],
+    counts: Sequence[int],
+    window: int = 5,
+) -> list[tuple[float, float, float]]:
+    """在 log-log 平面上用滑动窗口拟合 N(s) ∝ s^(-α) 的局部斜率。
+
+    刻意不做全局拟合：价格路径存在尺度交叉（s 远大于单笔跳动时 α→2，
+    远小于时 α→1），全局拟合会把两个区间混成一个无意义的中间值。
+
+    Args:
+        spacings: 递增的格距序列
+        counts: 对应的转折次数
+        window: 滑动窗口点数，须为奇数以便取中心点
+
+    Returns:
+        [(窗口中心格距, 局部 α, R²), ...]；样本不足时返回空列表
+    """
+    pairs = [(s, c) for s, c in zip(spacings, counts) if c > 0 and s > 0]
+    if len(pairs) < window:
+        return []
+    logs = [(math.log(s), math.log(c)) for s, c in pairs]
+    out: list[tuple[float, float, float]] = []
+    for start in range(len(logs) - window + 1):
+        chunk = logs[start:start + window]
+        xs = [x for x, _ in chunk]
+        ys = [y for _, y in chunk]
+        try:
+            slope, r2 = _ols_slope(xs, ys)
+        except ValueError:
+            continue
+        center_s = pairs[start + window // 2][0]
+        out.append((center_s, -slope, r2))
+    return out
