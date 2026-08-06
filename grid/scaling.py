@@ -136,6 +136,17 @@ def log_spaced(low: float, high: float, count: int) -> list[float]:
     """在 [low, high] 上取 count 个对数均匀点。
 
     标度分析必须在对数尺度上均匀采样，等差采样会让小 s 区严重欠采样。
+
+    Args:
+        low: 区间下界，须为正
+        high: 区间上界，须严格大于 low
+        count: 采样点数，须 >= 2
+
+    Returns:
+        长度为 count 的对数均匀点列表，首尾恰为 low、high
+
+    Raises:
+        ValueError: low <= 0，或 high <= low，或 count < 2
     """
     if low <= 0 or high <= low:
         raise ValueError(f"区间非法：[{low}, {high}]")
@@ -146,7 +157,18 @@ def log_spaced(low: float, high: float, count: int) -> list[float]:
 
 
 def _ols_slope(xs: Sequence[float], ys: Sequence[float]) -> tuple[float, float]:
-    """二元最小二乘，返回 (斜率, R²)。纯 Python，不引入 numpy。"""
+    """二元最小二乘，返回 (斜率, R²)。纯 Python，不引入 numpy。
+
+    Args:
+        xs: 自变量序列
+        ys: 因变量序列，须与 xs 等长
+
+    Returns:
+        (斜率, R²)
+
+    Raises:
+        ValueError: xs 全部相同（自变量无变化，无法拟合）
+    """
     n = len(xs)
     mean_x = sum(xs) / n
     mean_y = sum(ys) / n
@@ -173,13 +195,31 @@ def fit_local_alpha(
     远小于时 α→1），全局拟合会把两个区间混成一个无意义的中间值。
 
     Args:
-        spacings: 递增的格距序列
-        counts: 对应的转折次数
-        window: 滑动窗口点数，须为奇数以便取中心点
+        spacings: 严格递增的格距序列
+        counts: 对应的转折次数，须与 spacings 等长
+        window: 滑动窗口点数，须为 >= 3 的奇数以便取中心点
 
     Returns:
         [(窗口中心格距, 局部 α, R²), ...]；样本不足时返回空列表
+
+    Raises:
+        ValueError: spacings 与 counts 长度不一致；window 不是 >= 3 的奇数；
+            spacings 非严格递增
     """
+    # 契约强制：本文件 estimate_sigma 已立下「脏数据当场暴露」的原则，
+    # 这里同理——用不完整或错位的数据算出的 α 会直接导致错误的收窄/放宽决策。
+    if len(spacings) != len(counts):
+        raise ValueError(
+            f"spacings 与 counts 长度不一致：{len(spacings)} vs {len(counts)}"
+        )
+    if window < 3 or window % 2 == 0:
+        raise ValueError(f"window 须为 >= 3 的奇数：{window}")
+    for i in range(1, len(spacings)):
+        if spacings[i] <= spacings[i - 1]:
+            raise ValueError(
+                f"spacings 须严格递增，下标 {i} 处 {spacings[i]} <= {spacings[i - 1]}"
+            )
+
     pairs = [(s, c) for s, c in zip(spacings, counts) if c > 0 and s > 0]
     if len(pairs) < window:
         return []
@@ -191,7 +231,7 @@ def fit_local_alpha(
         ys = [y for _, y in chunk]
         try:
             slope, r2 = _ols_slope(xs, ys)
-        except ValueError:
+        except ValueError:  # 守卫已排除，仅兜底极端浮点退化
             continue
         center_s = pairs[start + window // 2][0]
         out.append((center_s, -slope, r2))

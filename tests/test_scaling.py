@@ -223,3 +223,46 @@ def test_fit_local_alpha_skips_zero_counts() -> None:
 
 def test_fit_local_alpha_requires_enough_points() -> None:
     assert fit_local_alpha([0.001, 0.002], [100, 50], window=5) == []
+
+
+def test_fit_local_alpha_rejects_length_mismatch() -> None:
+    """zip 会静默截断，必须当场报错——用错位数据算出的 α 会误导交易决策。"""
+    import pytest
+    spacings = log_spaced(0.0002, 0.004, 15)
+    counts = [round(1e6 * s ** -2.0) for s in spacings][:8]
+    with pytest.raises(ValueError, match="长度不一致"):
+        fit_local_alpha(spacings, counts, window=5)
+
+
+def test_fit_local_alpha_rejects_bad_window() -> None:
+    """window<=0 原会抛 ZeroDivisionError 炸穿调用方；偶数会让中心标签偏移半格。"""
+    import pytest
+    spacings = log_spaced(0.0002, 0.004, 15)
+    counts = [round(1e6 * s ** -2.0) for s in spacings]
+    for bad in (0, -3, 4, 2):
+        with pytest.raises(ValueError, match="奇数"):
+            fit_local_alpha(spacings, counts, window=bad)
+
+
+def test_fit_local_alpha_accepts_window_three() -> None:
+    # 边界：3 是合法的最小窗口
+    spacings = log_spaced(0.0002, 0.004, 15)
+    counts = [round(1e6 * s ** -2.0) for s in spacings]
+    assert len(fit_local_alpha(spacings, counts, window=3)) == 13
+
+
+def test_fit_local_alpha_rejects_non_monotonic_spacings() -> None:
+    """非递增 spacings 原会静默丢掉一个窗口的 α 估计。"""
+    import pytest
+    spacings = [0.001] * 5 + [0.002, 0.003, 0.004, 0.005, 0.006]
+    counts = [100] * 5 + [90, 80, 70, 60, 50]
+    with pytest.raises(ValueError, match="严格递增"):
+        fit_local_alpha(spacings, counts, window=5)
+
+
+def test_ols_slope_rejects_constant_x() -> None:
+    """直接覆盖 _ols_slope 的退化分支（fit_local_alpha 的守卫之后它不再可达）。"""
+    import pytest
+    from grid.scaling import _ols_slope
+    with pytest.raises(ValueError, match="自变量无变化"):
+        _ols_slope([1.0, 1.0, 1.0], [1.0, 2.0, 3.0])
