@@ -16,6 +16,7 @@ import asyncio  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import ssl  # noqa: E402
+from collections import deque  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -30,12 +31,16 @@ WS_URL = (
 )
 OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "trades"
 
-# 相邻成交间隔超过此值即视为可能丢数据，写缺口标记。
+# 连接正常但长时间无数据时视为可能静默卡死，写缺口标记。
 # 实测正常成交间隔中位 0.196s、最大 23.8s，取 60s 留足余量。
 DEFAULT_MAX_GAP_MS = 60_000
 
 # 重连退避上限
 MAX_BACKOFF_SECONDS = 60.0
+
+# 去重窗口上限。交易所不会重推很久以前的成交，5 万条约覆盖 11 小时，
+# 远超实际需要；无界 set 跑 30 天会累积到 100MB+。
+MAX_SEEN_IDS = 50_000
 
 
 def parse_trades(msg: dict) -> list[dict]:
@@ -59,33 +64,55 @@ def parse_trades(msg: dict) -> list[dict]:
 
 
 class TradeBuffer:
-    """按交易所 id 去重，并检测时间缺口。"""
+    """按交易所 id 去重，并检测数据缺口。
 
-    def __init__(self, max_gap_ms: int = DEFAULT_MAX_GAP_MS) -> None:
+    缺口有三个来源，前两个是无歧义信号，第三个是启发式：
+      1. 断线重连——连接断过，无法证明期间没丢数据
+      2. 进程重启——我们根本不在运行
+      3. 连接正常但长时间无数据——可能是静默卡死，也可能只是市场清淡
+
+    前两者由调用方显式 mark_discontinuity() 告知，第三者用时间阈值兜底。
+    """
+
+    def __init__(self, max_gap_ms: int = DEFAULT_MAX_GAP_MS,
+                 last_ts: int | None = None) -> None:
         self._seen: set[int] = set()
-        self._last_ts: int | None = None
+        self._order: deque[int] = deque()
+        self._last_ts = last_ts
         self._max_gap_ms = max_gap_ms
+        self._pending_break = False
+
+    def mark_discontinuity(self) -> None:
+        """标记此后第一批数据之前存在不可证明的中断（重连/重启）。"""
+        self._pending_break = True
+
+    def clear_discontinuity(self) -> None:
+        """已为该中断写过标记，复位。"""
+        self._pending_break = False
 
     def add(self, rows: list[dict]) -> list[dict]:
-        """返回其中未见过的行，并推进最新时间戳。"""
+        """返回其中未见过的行，并推进最新时间戳。去重窗口有界。"""
         fresh = []
         for row in rows:
             if row["i"] in self._seen:
                 continue
             self._seen.add(row["i"])
+            self._order.append(row["i"])
+            if len(self._order) > MAX_SEEN_IDS:
+                self._seen.discard(self._order.popleft())
             fresh.append(row)
             if self._last_ts is None or row["T"] > self._last_ts:
                 self._last_ts = row["T"]
         return fresh
 
     def gap_since(self, ts_ms: int) -> tuple[int, int] | None:
-        """若 ts_ms 距已见过的最大时间戳超过阈值，返回 (起, 止)，否则 None。
+        """判断 ts_ms 之前是否存在数据缺口。
 
-        基于最大时间戳而非最后一条，避免乱序到达时误判。
+        没有前序数据时返回 None——无从谈起缺口，不是漏判。
         """
         if self._last_ts is None:
             return None
-        if ts_ms - self._last_ts > self._max_gap_ms:
+        if self._pending_break or ts_ms - self._last_ts > self._max_gap_ms:
             return (self._last_ts, ts_ms)
         return None
 
@@ -124,9 +151,40 @@ def _append_gap(start_ms: int, end_ms: int) -> None:
                    start_ms, end_ms, (end_ms - start_ms) / 1000)
 
 
+def recover_last_ts(out_dir: Path = OUT_DIR) -> int | None:
+    """从已落盘文件末尾恢复最后一笔成交的时间戳。
+
+    进程重启后必须接上停机前的时间线，否则停机期无法被标记成缺口。
+    跳过 gap 标记行，只取真实成交。
+    """
+    if not out_dir.exists():
+        return None
+    for path in sorted(out_dir.glob("*.jsonl"), reverse=True):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not row.get("gap") and "T" in row:
+                return int(row["T"])
+    return None
+
+
 async def run_forever() -> None:
     """长连接采集主循环，断线指数退避重连。"""
-    buf = TradeBuffer()
+    last_ts = recover_last_ts()
+    buf = TradeBuffer(last_ts=last_ts)
+    if last_ts is not None:
+        # 进程此前不在运行，这段空窗无法证明没丢数据
+        buf.mark_discontinuity()
+        logger.info("从磁盘恢复 last_ts=%d，已标记启动断点", last_ts)
+
     ctx = ssl.create_default_context(cafile=certifi.where())
     backoff = 1.0
     while True:
@@ -138,8 +196,13 @@ async def run_forever() -> None:
                 proxy=None,  # 本机有代理环境变量，须显式直连
             ) as ws:
                 logger.info("已连接公开成交流")
-                backoff = 1.0
+                got_message = False
                 async for raw in ws:
+                    if not got_message:
+                        # 收到首条消息才认为连接真的可用。若在建连瞬间就重置，
+                        # 服务端"握手后立刻断开"会导致 1 秒一次的重连风暴。
+                        got_message = True
+                        backoff = 1.0
                     rows = parse_trades(json.loads(raw))
                     if not rows:
                         continue
@@ -147,6 +210,7 @@ async def run_forever() -> None:
                     gap = buf.gap_since(newest)
                     if gap is not None:
                         _append_gap(*gap)
+                    buf.clear_discontinuity()
                     _append(buf.add(rows))
         except asyncio.CancelledError:
             raise
@@ -154,6 +218,10 @@ async def run_forever() -> None:
             logger.warning("连接中断，%.0f 秒后重连：%s", backoff, exc)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+        finally:
+            # 无论正常关闭还是异常断开，连接都已中断，
+            # 下一批数据之前存在不可证明的空窗。
+            buf.mark_discontinuity()
 
 
 def main() -> None:
