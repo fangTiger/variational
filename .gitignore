@@ -9,8 +9,9 @@ venv/
 env/
 .env
 
-# 日志
+# 日志（log/ 是历史笔误，实际目录是 logs/，两个都留着防回潮）
 log/
+logs/
 
 # IDE
 .idea/
@@ -21,7 +22,5 @@ secrets/
 *.session
 cookies.json
 
-# 运行数据快照
-data/*.jsonl
-data/*.json
-data/trades/
+# 运行数据快照（整目录忽略：原先按后缀列举会漏掉 .bak-* 等备份）
+data/
