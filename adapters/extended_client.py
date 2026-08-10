@@ -47,9 +47,17 @@ _SIDE_TO_SDK = {Side.BUY: OrderSide.BUY, Side.SELL: OrderSide.SELL}
 
 
 def build_client_config(name: str):
-    """构造 SDK 配置，并把单次 HTTP 请求超时收紧到 10 秒。"""
+    """构造 SDK 配置，并设置单次 HTTP 请求超时。
+
+    超时定为 25 秒的依据（2026-08-10 实测）：
+    - TCP 连接仅 40~50ms，链路本身不慢；
+    - 复用 keep-alive 连接时单请求 0.4~1.3s；
+    - 但连接重建时 TLS 握手要 0.5~3.1s，整请求 4~7.4s。
+    旧值 10 秒对"重建连接"这条路径只有约 1.5 倍余量，抖动即超时，
+    表现为整仓 TPSL 维护失败、当轮禁止新增风险仓（8/10 全天 27 次）。
+    """
     config = get_config_by_name(name.upper())
-    defaults = replace(config.defaults, request_timeout_seconds=10)
+    defaults = replace(config.defaults, request_timeout_seconds=25)
     return replace(config, defaults=defaults)
 
 

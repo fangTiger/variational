@@ -35,6 +35,10 @@ _STATE = Path(__file__).resolve().parent.parent / "data" / "grid_state.json"
 MARKET = "BTC-USD"
 
 
+class SnapshotInvalid(RuntimeError):
+    """快照读数不可信（接口超时/返回空），不应写入历史。"""
+
+
 def _process_alive() -> bool:
     try:
         r = subprocess.run(["pgrep", "-f", "tools.run_grid"], capture_output=True, text=True)
@@ -86,11 +90,18 @@ async def _snapshot() -> dict:
     await ext.connect()
     try:
         bal = await ext.get_balance()
-        equity = float(getattr(bal, "equity", 0) or 0)
+        raw_equity = getattr(bal, "equity", None)
+        # 接口超时/返回空时 equity 会是 None，旧代码把它当 0 记进历史，
+        # 会污染回撤统计并伪造"爆仓"假象；这里直接判为无效快照。
+        if raw_equity is None or float(raw_equity) <= 0:
+            raise SnapshotInvalid(f"权益读数无效：{raw_equity!r}")
+        equity = float(raw_equity)
         pos = await ext.get_position(MARKET)
         r = await ext._client.info.get_candles_history(
             market_name=MARKET, candle_type="trades", interval="PT1H", limit=200)
         candles = sorted(r.data, key=lambda k: int(k.timestamp))
+        if not candles:
+            raise SnapshotInvalid("K 线返回为空，无法计算现价与 regime")
         highs = [float(k.high) for k in candles]
         lows = [float(k.low) for k in candles]
         closes = [float(k.close) for k in candles]
@@ -138,9 +149,11 @@ def _record(snap: dict) -> None:
 
 
 def _load() -> list[dict]:
+    """读取历史快照，并剔除权益为 0 的坏记录（修复前遗留，会虚增回撤）。"""
     if not _FILE.exists():
         return []
-    return [json.loads(x) for x in _FILE.read_text(encoding="utf-8").splitlines() if x.strip()]
+    snaps = [json.loads(x) for x in _FILE.read_text(encoding="utf-8").splitlines() if x.strip()]
+    return [s for s in snaps if (s.get("equity") or 0) > 0]
 
 
 def _report() -> None:
@@ -190,7 +203,12 @@ def main() -> None:
     if args.report:
         _report()
         return
-    snap = asyncio.run(_snapshot())
+    try:
+        snap = asyncio.run(_snapshot())
+    except SnapshotInvalid as exc:
+        # 宁可漏记一次，也不能把假读数写进历史；下个周期 launchd 会自动重试
+        print(f"[跳过] 本次快照不可信，未记录：{exc}", flush=True)
+        raise SystemExit(1)
     _record(snap)
     status = "存活" if snap["alive"] else "⚠️未存活"
     print(f"[{status}] 权益${snap['equity']:.2f} PnL${snap['pnl_since_start']:+.2f} "
