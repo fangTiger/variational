@@ -47,6 +47,13 @@ _TPSL_EXCHANGE_TRIGGER_TOLERANCE_PCT = Decimal("0.000001")
 _ORDER_STATUS_CRITICAL_RETRIES = 3
 # 相同库存拒绝只在首次、状态变化或累计到整百次时打 INFO。
 _CAP_REJECTION_SUMMARY_EVERY = 100
+
+# 单轮耗时超过这个秒数就单独记一行——慢轮是排查网络超时的关键线索，不能汇总掉
+_SLOW_ROUND_LOG_S = 5.0
+# 正常轮次每这么多轮汇总一条（2.5 秒轮询下约 8 分钟）
+_ROUND_SUMMARY_EVERY = 200
+# 状态未变化时 trend-aware 的最小打点间隔（秒）；状态一变立即打，不受此限
+_TREND_LOG_MIN_INTERVAL_S = 120.0
 # 交易所时间与本机可能有轻微偏差；对账时允许一分钟时钟偏移。
 _RETRY_RECONCILE_CLOCK_SKEW_SECONDS = 60.0
 _RETRY_MAX_ATTEMPTS = 10
@@ -123,6 +130,8 @@ class GridEngine:
         self._last_liquidation_price: float | None = None
         self._current_tpsl: tuple[Decimal, Decimal] | None = None
         self._cap_rejection_state: dict[Side, dict] = {}
+        self._round_stats = {"n": 0, "sum": 0.0, "max": 0.0}
+        self._last_trend_log: tuple[float, tuple] | None = None
         self._consecutive_failures = 0
         self._last_success_ts = time.time()
         self._connectivity_critical = False
@@ -561,6 +570,42 @@ class GridEngine:
         )
         return True
 
+    def _log_round_complete(self, elapsed: float) -> None:
+        """正常轮次汇总记，慢轮单独记。
+
+        2026-08-11 实测：每轮一行「本轮完成」占了全天日志的 90%
+        （21095/23354 行、约 30MB/天），把成交和异常这些真正要看的行淹没了。
+        慢轮仍逐条保留——排查 TLS 握手超时全靠它。
+        """
+        if elapsed >= _SLOW_ROUND_LOG_S:
+            logger.info("本轮完成（慢），耗时 %.2f 秒", elapsed)
+            return
+        stats = self._round_stats
+        stats["n"] += 1
+        stats["sum"] += elapsed
+        stats["max"] = max(stats["max"], elapsed)
+        if stats["n"] >= _ROUND_SUMMARY_EVERY:
+            logger.info(
+                "近 %d 轮正常完成：平均 %.2f 秒，最慢 %.2f 秒",
+                stats["n"],
+                stats["sum"] / stats["n"],
+                stats["max"],
+            )
+            stats.update(n=0, sum=0.0, max=0.0)
+
+    def _should_log_trend(self, signature: tuple, now: float) -> bool:
+        """trend-aware 打点节流：状态一变立即打，没变则按最小间隔降频。
+
+        这些行是事后还原时间线的主要依据（8/10 那次停摆就是靠它定位的），
+        所以只降稳态频率，绝不丢状态变化。
+        """
+        last = self._last_trend_log
+        if last is not None and last[1] == signature:
+            if now - last[0] < _TREND_LOG_MIN_INTERVAL_S:
+                return False
+        self._last_trend_log = (now, signature)
+        return True
+
     @staticmethod
     def _effective_blocked_side(
         mode: GridMode,
@@ -824,20 +869,30 @@ class GridEngine:
         )
         blocked_side = self._effective_blocked_side(mode, state)
 
-        logger.info(
-            "trend-aware mark=%.0f mode=%s inv=%s(≈$%.0f) band=%s frozen=%s blocked=%s",
-            mark,
+        # 库存变动不进签名：它几乎每轮都在动，进了签名节流就形同虚设。
+        # 真正要立即可见的是 mode/frozen/blocked/band 这些状态量。
+        trend_signature = (
             mode.value,
-            inv,
-            inv_usd,
-            (
-                f"[{state.band_low:.0f},{state.band_high:.0f}]"
-                if state is not None and self._has_valid_band(state)
-                else None
-            ),
             frozen,
             blocked_side,
+            state.band_low if state is not None else None,
+            state.band_high if state is not None else None,
         )
+        if self._should_log_trend(trend_signature, time.monotonic()):
+            logger.info(
+                "trend-aware mark=%.0f mode=%s inv=%s(≈$%.0f) band=%s frozen=%s blocked=%s",
+                mark,
+                mode.value,
+                inv,
+                inv_usd,
+                (
+                    f"[{state.band_low:.0f},{state.band_high:.0f}]"
+                    if state is not None and self._has_valid_band(state)
+                    else None
+                ),
+                frozen,
+                blocked_side,
+            )
 
         if frozen:
             await self._maintain_recovery_ladder(mark, inv, inv_usd)
@@ -2039,7 +2094,7 @@ class GridEngine:
                 self._consecutive_failures = 0
                 self._last_success_ts = time.time()
                 self._connectivity_critical = False
-                logger.info("本轮完成，耗时 %.2f 秒", time.monotonic() - started)
+                self._log_round_complete(time.monotonic() - started)
                 try:
                     self._dump_connectivity()
                 except Exception as snapshot_exc:  # noqa: BLE001
