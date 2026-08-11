@@ -26,12 +26,13 @@ from pathlib import Path  # noqa: E402
 
 from adapters.extended_client import ExtendedClient  # noqa: E402
 from grid.grid_state import load_state  # noqa: E402
-from grid.regime import GridMode, adx, decide_mode, donchian_prev  # noqa: E402
+from grid.regime import adx, decide_mode, donchian_prev  # noqa: E402
 from grid.risk import dist_to_liq_pct  # noqa: E402
 
 _FILE = Path(__file__).resolve().parent.parent / "data" / "grid_monitor.jsonl"
 _BASELINE = Path(__file__).resolve().parent.parent / "data" / "grid_baseline.json"
 _STATE = Path(__file__).resolve().parent.parent / "data" / "grid_state.json"
+_LIVE = Path(__file__).resolve().parent.parent / "data" / "grid_live.json"
 MARKET = "BTC-USD"
 
 
@@ -65,6 +66,26 @@ def _read_grid_state(path: str | Path = _STATE) -> dict:
         "band_low": state.band_low,
         "band_high": state.band_high,
     }
+
+
+def _read_engine_live(path: str | Path = _LIVE, max_age_s: float = 300.0) -> dict | None:
+    """读引擎自己写的 live 快照；缺失/损坏/过期返回 None。
+
+    引擎是 mode 与封锁状态的唯一真相源。本模块曾用硬编码 adx_off=999 自行
+    重算 mode，与 launchd 实参（一度是 35/28）不同步，导致引擎已 OFF 停摆
+    19.5 小时而监控始终报 neutral（2026-08-11）。故改为优先采信引擎快照。
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001  损坏当作没有
+        return None
+    ts = d.get("ts")
+    if not isinstance(ts, (int, float)) or time.time() - ts > max_age_s:
+        return None  # 引擎卡死/停了，快照不可信
+    return d
 
 
 def _liquidation_distance_pct(
@@ -105,13 +126,9 @@ async def _snapshot() -> dict:
         highs = [float(k.high) for k in candles]
         lows = [float(k.low) for k in candles]
         closes = [float(k.close) for k in candles]
-        # 与实盘 launchd 参数一致：ADX 急停已禁用(1h ADX 长期徘徊致停机过半)，
-        # 急停只靠 96h Donchian 突破 + 库存上限 + 情绪极值
         a = adx(highs, lows, closes)
         up, lo = donchian_prev(highs, lows, 96)
         price = closes[-1]
-        mode = decide_mode(adx_val=a[-1], close=price, donchian_up=up[-1], donchian_lo=lo[-1],
-                           adx_off=999.0)
         inv = float(pos.signed_size)
         liquidation_info = await ext.get_liquidation_info(MARKET)
         liquidation_distance = _liquidation_distance_pct(liquidation_info, inv)
@@ -127,6 +144,25 @@ async def _snapshot() -> dict:
         _BASELINE.write_text(json.dumps({"equity": equity, "ts": time.time()}))
 
     grid_state = _read_grid_state()
+    # mode/封锁状态一律以引擎快照为准；引擎停了或快照过期才回退到本地重算，
+    # 并用 mode_source 标出来，避免回退值被当成引擎真实状态。
+    live = _read_engine_live()
+    if live is not None:
+        mode_value = live.get("mode")
+        mode_source = "engine"
+        grid_state["blocked_side"] = live.get(
+            "effective_blocked_side", grid_state.get("blocked_side")
+        )
+    else:
+        mode_value = decide_mode(
+            adx_val=a[-1],
+            close=price,
+            donchian_up=up[-1],
+            donchian_lo=lo[-1],
+            adx_off=999.0,
+        ).value
+        mode_source = "fallback"
+
     return {
         "ts": time.time(),
         "alive": _process_alive(),
@@ -136,7 +172,8 @@ async def _snapshot() -> dict:
         "inv_usd": inv * price,
         "price": price,
         "adx": round(a[-1], 1) if a[-1] else None,
-        "mode": mode.value,
+        "mode": mode_value,
+        "mode_source": mode_source,
         **grid_state,
         "dist_to_liq_pct": liquidation_distance,
     }
@@ -211,8 +248,13 @@ def main() -> None:
         raise SystemExit(1)
     _record(snap)
     status = "存活" if snap["alive"] else "⚠️未存活"
+    blocked = snap.get("blocked_side")
+    # 封锁状态必须显式打出来：OFF 停摆时 frozen=False，只看模式容易漏
+    blocked_text = f" ⛔封锁{blocked}" if blocked else ""
+    stale_text = "" if snap.get("mode_source") == "engine" else "(引擎快照过期，本地估算)"
     print(f"[{status}] 权益${snap['equity']:.2f} PnL${snap['pnl_since_start']:+.2f} "
-          f"库存{snap['inv_btc']:+.5f}BTC 模式{snap['mode']} ADX{snap['adx']}")
+          f"库存{snap['inv_btc']:+.5f}BTC 模式{snap['mode']}{stale_text}"
+          f"{blocked_text} ADX{snap['adx']}")
 
 
 if __name__ == "__main__":

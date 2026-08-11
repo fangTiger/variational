@@ -17,13 +17,18 @@ from grid.regime import GridMode
 from tools.run_grid import _build_parser
 
 
-def test_request_timeout_is_short() -> None:
-    """SDK 默认 500 秒会让一次卡顿冻结整个风控循环。"""
-    assert (
+def test_request_timeout_is_bounded() -> None:
+    """SDK 默认 500 秒会让一次卡顿冻结整个风控循环，必须收紧。
+
+    上界取 30 秒：2026-08-10 实测连接重建时 TLS 握手 0.5~3.1s、整请求可达
+    7.4s，原来的 10 秒只有约 1.5 倍余量，抖动即超时导致 TPSL 维护失败，
+    故放宽到 25 秒；但仍需远小于 SDK 默认值，避免卡死风控循环。
+    """
+    timeout = (
         extended_client.build_client_config("mainnet")
         .defaults.request_timeout_seconds
-        <= 10
     )
+    assert 10 <= timeout <= 30
 
 
 def test_candle_failure_still_maintains_tpsl_and_handles_fills(

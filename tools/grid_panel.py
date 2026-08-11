@@ -382,7 +382,12 @@ def render_html(live: dict, equity: dict) -> str:
     atr_pct = _num(live.get("atr_pct"))
     frozen = _truthy(live.get("frozen"))
     halted = _truthy(live.get("halted"))
-    blocked_side = live.get("blocked_side")
+    # 取生效值：OFF 合成的 BOTH 只存在于 effective_blocked_side，
+    # blocked_side 仅记 band 突破；旧快照无新字段时回退到后者。
+    if "effective_blocked_side" in live:
+        blocked_side = live["effective_blocked_side"]
+    else:
+        blocked_side = live.get("blocked_side")
     mode_raw = live.get("mode")
     mode = mode_raw.value if hasattr(mode_raw, "value") else _raw_text(mode_raw).lower()
 
@@ -429,8 +434,14 @@ def render_html(live: dict, equity: dict) -> str:
     pnl_text = _fmt_signed(equity.get("pnl_since_start"))
 
     badges = []
-    if frozen:
-        badges.append(f'<span class="badge hot">frozen 冻结 {escape(_raw_text(blocked_side))}</span>')
+    # 以生效封锁方向为准：OFF 模式 frozen=False 但双向禁挂，
+    # 只看 frozen 会把停摆显示成"frozen 否"的正常态。
+    if blocked_side:
+        badges.append(
+            f'<span class="badge hot">'
+            f'{"frozen 冻结" if frozen else "已封锁"} '
+            f'{escape(_raw_text(blocked_side))}</span>'
+        )
     else:
         badges.append('<span class="badge">frozen 否</span>')
     if halted:

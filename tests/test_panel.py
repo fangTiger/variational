@@ -127,6 +127,33 @@ def test_render_missing_equity_no_crash() -> None:
     assert "—" in html
 
 
+def test_off_mode_shows_blocked_not_frozen_no() -> None:
+    """OFF 停摆时 frozen=False，面板不能显示成"frozen 否"的正常态。
+
+    回归 2026-08-11：引擎日志 blocked=BOTH，而快照里只有 band 突破用的
+    blocked_side=None，面板据此显示未冻结，19.5 小时停摆无人察觉。
+    """
+    html = render_html(
+        _live(
+            mode="off",
+            frozen=False,
+            blocked_side=None,
+            effective_blocked_side="BOTH",
+        ),
+        {},
+    )
+    assert "BOTH" in html
+    assert "frozen 否" not in html
+
+
+def test_blocked_side_falls_back_when_field_absent() -> None:
+    """旧快照没有 effective_blocked_side 时回退到 blocked_side。"""
+    live = _live(frozen=True, blocked_side="BUY")
+    live.pop("effective_blocked_side", None)
+    html = render_html(live, {})
+    assert "BUY" in html
+
+
 def test_render_no_live_data() -> None:
     html = render_html({}, {})
     assert "未运行" in html or "无数据" in html

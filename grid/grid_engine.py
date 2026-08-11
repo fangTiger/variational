@@ -561,6 +561,28 @@ class GridEngine:
         )
         return True
 
+    @staticmethod
+    def _effective_blocked_side(
+        mode: GridMode,
+        state: "GridState | None",
+    ) -> str | None:
+        """本轮**真正生效**的冻结方向（唯一真相源，日志与快照共用）。
+
+        与只记 band 突破的 state.blocked_side 不是一回事：OFF 要合成 BOTH、
+        frozen 无方向时兜底 BOTH。2026-08-11 的停摆里引擎日志是 blocked=BOTH
+        而快照写的 state.blocked_side 是 None，面板因此把 OFF 显示成正常——
+        所以这里抽成一处，避免两边再次漂移。
+        """
+        if mode is GridMode.OFF:
+            return "BOTH"
+        if state is None:
+            return "BOTH"
+        if state.halted:
+            return "BOTH"
+        if state.frozen:
+            return state.blocked_side or "BOTH"
+        return state.blocked_side
+
     async def _dump_live(
         self,
         mark: float | None,
@@ -618,6 +640,7 @@ class GridEngine:
             "band_high": state.band_high if state is not None else None,
             "frozen": state.frozen if state is not None else False,
             "blocked_side": state.blocked_side if state is not None else None,
+            "effective_blocked_side": self._effective_blocked_side(mode, state),
             "halted": state.halted if state is not None else False,
             "dist_to_liq_pct": self._last_dist_to_liq,
             "cfg": {
@@ -799,12 +822,7 @@ class GridEngine:
             and not state.frozen
             and self._has_valid_band(state)
         )
-        if mode is GridMode.OFF:
-            blocked_side = "BOTH"
-        elif frozen:
-            blocked_side = state.blocked_side or "BOTH"
-        else:
-            blocked_side = state.blocked_side if state is not None else "BOTH"
+        blocked_side = self._effective_blocked_side(mode, state)
 
         logger.info(
             "trend-aware mark=%.0f mode=%s inv=%s(≈$%.0f) band=%s frozen=%s blocked=%s",
