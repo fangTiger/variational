@@ -48,12 +48,16 @@ def _engine(tmp_path, equity, limit=0.12, **kw):
     return eng
 
 
-def _record_halt(eng):
+def _record_halt(eng, succeed=True):
+    """替换平仓链。succeed=False 模拟撤单/平仓失败（_go_off_confirmed 会返回 False）。"""
+
     async def _fake(signed_size):
         eng.halted_with = signed_size
-        return True
+        eng.halt_calls += 1
+        return succeed
 
     eng.halted_with = None
+    eng.halt_calls = 0
     return _fake
 
 
@@ -159,6 +163,87 @@ def test_peak_file_is_valid_json(tmp_path):
 
 
 # ---------- 复利场景（这个熔断存在的理由） ----------
+
+# ---------- 平仓失败路径（Codex 审计 P0-1） ----------
+
+def test_flatten_failure_is_recorded_not_silently_swallowed(tmp_path, caplog):
+    """平仓链失败时必须留下 CRITICAL 痕迹并安排重试，不能谎报已熔断。
+
+    谎报的后果：残仓继续成交，而 halted 分支会提前 return，
+    平仓将永不重试——2026-08-10 "冻结但库存卡死"的同类失效。
+    """
+    import logging
+
+    eng = _engine(tmp_path, equity=870.0)
+    eng._go_off_confirmed = _record_halt(eng, succeed=False)
+    eng._save_equity_peak(1000.0)
+
+    with caplog.at_level(logging.CRITICAL, logger="grid_engine"):
+        assert asyncio.run(eng._check_equity_drawdown()) is True
+
+    assert "平仓链未完成" in caplog.text
+    assert eng._last_halt_retry_ts > 0  # 已安排重试
+
+
+def test_flatten_success_does_not_schedule_retry(tmp_path):
+    eng = _engine(tmp_path, equity=870.0)
+    eng._save_equity_peak(1000.0)
+    assert asyncio.run(eng._check_equity_drawdown()) is True
+    assert eng._last_halt_retry_ts == 0.0  # 成功就不需要重试
+
+
+# ---------- 出入金保护（Codex 审计 P0-2） ----------
+
+def test_withdrawal_reseeds_peak_instead_of_halting(tmp_path):
+    """一笔 12% 的出金不该被当成回撤去平掉真仓位。"""
+    eng = _engine(tmp_path, equity=1000.0)
+    asyncio.run(eng._check_equity_drawdown())      # 播种 peak=1000
+    eng._last_equity_check_ts = 0.0                # 解除限频
+
+    eng.ext._equity = 870.0                        # 模拟出金 13%
+    assert asyncio.run(eng._check_equity_drawdown()) is False
+    assert eng.halted_with is None                 # 没有平仓
+    assert eng._load_equity_peak() == 870.0        # 基准已按新本金重置
+
+
+def test_deposit_reseeds_peak(tmp_path):
+    """入金抬高权益后，峰值须跟上，否则后续正常波动会被误判。"""
+    eng = _engine(tmp_path, equity=1000.0)
+    asyncio.run(eng._check_equity_drawdown())
+    eng._last_equity_check_ts = 0.0
+
+    eng.ext._equity = 1500.0                       # 入金 50%
+    assert asyncio.run(eng._check_equity_drawdown()) is False
+    assert eng._load_equity_peak() == 1500.0
+
+
+def test_gradual_loss_still_halts(tmp_path):
+    """缓慢下跌（每次跳变小于阈值）必须照常熔断——出入金保护不能变成漏洞。"""
+    eng = _engine(tmp_path, equity=1000.0)
+    asyncio.run(eng._check_equity_drawdown())      # peak=1000
+
+    for equity in (960.0, 920.0, 880.0, 870.0):    # 每步约 4%，均低于 8% 跳变阈值
+        eng._last_equity_check_ts = 0.0
+        eng.ext._equity = equity
+        fired = asyncio.run(eng._check_equity_drawdown())
+        if fired:
+            break
+
+    assert fired is True
+    assert eng.halted_with is not None
+
+
+# ---------- 限频（Codex 审计 P1） ----------
+
+def test_balance_failure_still_consumes_rate_limit(tmp_path):
+    """取余额失败也要占用限频窗口，否则网络差时会每 2.5 秒重试一次。"""
+    eng = _engine(tmp_path, equity=800.0, fail_balance=True)
+    eng._save_equity_peak(1000.0)
+    asyncio.run(eng._check_equity_drawdown())
+    calls = eng.ext.balance_calls
+    asyncio.run(eng._check_equity_drawdown())
+    assert eng.ext.balance_calls == calls
+
 
 def test_compounding_leg_losses_eventually_breach():
     """每腿 10% 连亏：第 2 腿之后累计就超过 12% 熔断线。

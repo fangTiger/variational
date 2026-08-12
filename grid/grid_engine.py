@@ -56,6 +56,11 @@ _ROUND_SUMMARY_EVERY = 200
 _TREND_LOG_MIN_INTERVAL_S = 120.0
 # 净值回撤熔断的检查间隔（秒）。回撤是慢变量，不需要每轮查 balance
 _EQUITY_CHECK_INTERVAL_S = 60.0
+# halted 且仍有仓位时，重试平仓链的间隔（秒）
+_HALT_RETRY_INTERVAL_S = 60.0
+# 相邻两次权益检查之间的跳变超过此比例，判定为出入金而非行情，重新播种峰值。
+# 60 秒内权益变动 8% 在行情上极罕见，在出入金上很常见。
+_EQUITY_JUMP_PCT = 0.08
 # 交易所时间与本机可能有轻微偏差；对账时允许一分钟时钟偏移。
 _RETRY_RECONCILE_CLOCK_SKEW_SECONDS = 60.0
 _RETRY_MAX_ATTEMPTS = 10
@@ -138,6 +143,8 @@ class GridEngine:
         self._cap_rejection_state: dict[Side, dict] = {}
         self._equity_peak: float | None = None
         self._last_equity_check_ts: float = 0.0
+        self._last_equity_seen: float | None = None
+        self._last_halt_retry_ts: float = 0.0
         self._round_stats = {"n": 0, "sum": 0.0, "max": 0.0}
         self._last_trend_log: tuple[float, tuple] | None = None
         self._consecutive_failures = 0
@@ -750,6 +757,16 @@ class GridEngine:
                 inv, mark = await self._inv(position=pos)
                 self._last_mark = mark
                 await self._maintain_tpsl(mark, inv)
+                # halted 却仍有仓位 = 上一次平仓链没走完（撤单或平仓失败）。
+                # 本分支会提前 return，熔断检查够不到这里，所以必须在这里重试，
+                # 否则残单继续成交、库存卡死，只剩 TPSL 一道兜底。
+                halt_retry_due = (
+                    time.time() - self._last_halt_retry_ts >= _HALT_RETRY_INTERVAL_S
+                )
+                if halt_retry_due:
+                    self._last_halt_retry_ts = time.time()
+                    logger.warning("halted 状态仍有持仓 %s，重试确认平仓链", inv)
+                    await self._go_off_confirmed(inv)
                 # halted 只禁止新增报价，既有硬止损风险管理仍继续执行。
                 hard_stop_kwargs = {"signed_size": inv, "mark": mark}
                 if pos is not None:
@@ -1834,13 +1851,15 @@ class GridEngine:
         balance_getter = getattr(self.ext, "get_balance", None)
         if not callable(balance_getter):
             return False
+        # 先记时间戳再发请求：失败也要走限频，否则网络差时会每轮重试、
+        # 把 balance 查询压成 2.5 秒一次
+        self._last_equity_check_ts = now
         try:
             balance = await balance_getter()
         except Exception as exc:  # noqa: BLE001
             # 查不到权益就不判定——宁可漏防，不可凭陈旧数据误平仓
             logger.warning("回撤熔断取权益失败，本次跳过：%s", exc)
             return False
-        self._last_equity_check_ts = now
         raw_equity = (
             balance.get("equity")
             if isinstance(balance, dict)
@@ -1849,6 +1868,24 @@ class GridEngine:
         if raw_equity is None or float(raw_equity) <= 0:
             return False
         equity = float(raw_equity)
+
+        # 出入金会凭空改变权益，和行情亏损无法从数值上区分。相邻两次检查（60 秒）
+        # 之间跳变 8% 以上，在行情里极罕见、在出入金里很常见——按资金流处理：
+        # 重新播种峰值而不是熔断。否则一笔 12% 的出金就会平掉真仓位。
+        previous = self._last_equity_seen
+        self._last_equity_seen = equity
+        if previous is not None and previous > 0:
+            jump = abs(equity - previous) / previous
+            if jump >= _EQUITY_JUMP_PCT:
+                logger.warning(
+                    "权益在一个检查周期内跳变 %.1f%%（%.2f → %.2f），"
+                    "判定为出入金而非行情，重新播种回撤基准",
+                    jump * 100,
+                    previous,
+                    equity,
+                )
+                self._save_equity_peak(equity)
+                return False
 
         peak = self._load_equity_peak()
         if peak is None or equity > peak:
@@ -1872,7 +1909,18 @@ class GridEngine:
         except Exception as exc:  # noqa: BLE001
             logger.exception("回撤熔断取仓位失败，仍强制停机：%s", exc)
             signed_size = Decimal("0")
-        await self._go_off_confirmed(signed_size)
+        # _go_off_confirmed 在撤单/查仓/平仓任一失败时返回 False。绝不能忽略它——
+        # 谎报"已熔断"会让残仓继续成交，而 halted 分支又提前 return，
+        # 平仓将永不重试（2026-08-10 "冻结但库存卡死"的同类失效）。
+        flattened = await self._go_off_confirmed(signed_size)
+        if not flattened:
+            logger.critical(
+                "回撤熔断平仓链未完成（持仓=%s）；halted 已持久化，"
+                "将在 halted 路径按 %.0f 秒间隔持续重试",
+                signed_size,
+                _HALT_RETRY_INTERVAL_S,
+            )
+            self._last_halt_retry_ts = time.time()
         return True
 
     async def _check_hard_stop(
