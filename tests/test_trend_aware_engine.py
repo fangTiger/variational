@@ -560,7 +560,12 @@ def test_run_once_checks_hard_stop_before_candles(tmp_path) -> None:
 
 
 def test_run_once_halted_returns_before_candles(tmp_path) -> None:
-    """持久化 HALTED 状态禁止拉 K 线和任何新增报价。"""
+    """持久化 HALTED 状态禁止拉 K 线和任何新增报价。
+
+    进程启动后第一次遇到 halted 会把确认平仓链跑一遍（查仓位/核残单），
+    因为"空仓"不等于"收摊完成"——撤单或撤 TPSL 失败会留下普通挂单，
+    成交后重新开仓。所以这里只锁死两条：不拉 K 线、不下新单。
+    """
     ext = RunExt(positions=[0.0])
     eng = _eng(ext, tmp_path / "s.json")
     eng._state = GridState(95.0, 105.0, True, "BUY", True)
@@ -568,8 +573,24 @@ def test_run_once_halted_returns_before_candles(tmp_path) -> None:
     result = asyncio.run(eng.run_once())
 
     assert result.startswith("HALTED")
-    assert ext.calls == ["position"]
+    assert "candles" not in ext.calls
     assert ext.placed == []
+
+
+def test_run_once_halted_settles_once_then_stops_retrying(tmp_path) -> None:
+    """收摊确认跑通一次后就该停手，不能每 60 秒空转一遍确认链。"""
+    ext = RunExt(positions=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    eng = _eng(ext, tmp_path / "s.json")
+    eng._state = GridState(95.0, 105.0, True, "BUY", True)
+
+    asyncio.run(eng.run_once())
+    assert eng._halt_settled is True
+
+    calls_after_first = len(ext.calls)
+    eng._last_halt_retry_ts = 0.0          # 即便节流窗口到期
+    asyncio.run(eng.run_once())
+    # 已 settled，第二轮只该查一次仓位，不再重跑确认链
+    assert len(ext.calls) - calls_after_first == 1
 
 
 def test_run_once_drops_forming_candle_and_builds_active_band(

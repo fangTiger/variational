@@ -185,44 +185,49 @@ def test_flatten_failure_is_recorded_not_silently_swallowed(tmp_path, caplog):
     assert eng._last_halt_retry_ts > 0  # 已安排重试
 
 
-def test_flatten_success_does_not_schedule_retry(tmp_path):
+def test_flatten_success_reports_no_failure(tmp_path, caplog):
+    """平仓成功时不应出现"未完成"告警；但仍占用节流窗口，
+    避免同一分钟内又把确认链跑一遍。"""
+    import logging
+
     eng = _engine(tmp_path, equity=870.0)
     eng._save_equity_peak(1000.0)
-    assert asyncio.run(eng._check_equity_drawdown()) is True
-    assert eng._last_halt_retry_ts == 0.0  # 成功就不需要重试
+    with caplog.at_level(logging.CRITICAL, logger="grid_engine"):
+        assert asyncio.run(eng._check_equity_drawdown()) is True
+    assert "平仓链未完成" not in caplog.text
+    assert eng._halt_retry_due() is False  # 窗口已被占用
 
 
-# ---------- 出入金保护（Codex 审计 P0-2） ----------
+# ---------- 快速亏损不得绕过熔断（Codex 复审实测出来的新 P0） ----------
 
-def test_withdrawal_reseeds_peak_instead_of_halting(tmp_path):
-    """一笔 12% 的出金不该被当成回撤去平掉真仓位。"""
+def test_fast_losses_cannot_bypass_halt(tmp_path):
+    """回归：曾用"权益跳变 ≥8% 判为出入金"猜资金流，结果真实快速亏损也 ≥8%。
+
+    Codex 实测 1000→900→810 两次 10% 亏损被逐次判成出入金、逐次重置峰值，
+    熔断永不触发——比没有熔断更糟。这个用例锁死该行为不得复现。
+    """
     eng = _engine(tmp_path, equity=1000.0)
     asyncio.run(eng._check_equity_drawdown())      # 播种 peak=1000
-    eng._last_equity_check_ts = 0.0                # 解除限频
 
-    eng.ext._equity = 870.0                        # 模拟出金 13%
-    assert asyncio.run(eng._check_equity_drawdown()) is False
-    assert eng.halted_with is None                 # 没有平仓
-    assert eng._load_equity_peak() == 870.0        # 基准已按新本金重置
+    fired = False
+    for equity in (900.0, 810.0):                  # 每步 10%，都超过旧的 8% 阈值
+        eng._last_equity_check_ts = 0.0
+        eng.ext._equity = equity
+        fired = asyncio.run(eng._check_equity_drawdown())
+        if fired:
+            break
 
-
-def test_deposit_reseeds_peak(tmp_path):
-    """入金抬高权益后，峰值须跟上，否则后续正常波动会被误判。"""
-    eng = _engine(tmp_path, equity=1000.0)
-    asyncio.run(eng._check_equity_drawdown())
-    eng._last_equity_check_ts = 0.0
-
-    eng.ext._equity = 1500.0                       # 入金 50%
-    assert asyncio.run(eng._check_equity_drawdown()) is False
-    assert eng._load_equity_peak() == 1500.0
+    assert fired is True, "快速亏损绕过了熔断"
+    assert eng._load_equity_peak() == 1000.0, "峰值被亏损重置了"
 
 
 def test_gradual_loss_still_halts(tmp_path):
-    """缓慢下跌（每次跳变小于阈值）必须照常熔断——出入金保护不能变成漏洞。"""
+    """缓慢下跌同样要熔断。"""
     eng = _engine(tmp_path, equity=1000.0)
-    asyncio.run(eng._check_equity_drawdown())      # peak=1000
+    asyncio.run(eng._check_equity_drawdown())
 
-    for equity in (960.0, 920.0, 880.0, 870.0):    # 每步约 4%，均低于 8% 跳变阈值
+    fired = False
+    for equity in (960.0, 920.0, 880.0, 870.0):
         eng._last_equity_check_ts = 0.0
         eng.ext._equity = equity
         fired = asyncio.run(eng._check_equity_drawdown())
@@ -231,6 +236,17 @@ def test_gradual_loss_still_halts(tmp_path):
 
     assert fired is True
     assert eng.halted_with is not None
+
+
+# ---------- 收摊节流：三条路径共用一个闸（Codex 复审 P1） ----------
+
+def test_halt_retry_is_throttled_across_paths(tmp_path):
+    """halted 分支、硬止损、回撤熔断都会调平仓链，各自计时会叠成撤单风暴。"""
+    eng = _engine(tmp_path, equity=1000.0)
+    assert eng._halt_retry_due() is True     # 首次放行
+    assert eng._halt_retry_due() is False    # 同一窗口内立刻再问 → 挡住
+    eng._last_halt_retry_ts = 0.0
+    assert eng._halt_retry_due() is True     # 窗口过后重新放行
 
 
 # ---------- 限频（Codex 审计 P1） ----------

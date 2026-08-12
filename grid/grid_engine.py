@@ -145,6 +145,9 @@ class GridEngine:
         self._last_equity_check_ts: float = 0.0
         self._last_equity_seen: float | None = None
         self._last_halt_retry_ts: float = 0.0
+        # 确认平仓链是否已跑完（空仓 + 残单清净 + TPSL 已撤）。收干净就别再空跑；
+        # 进程重启后复位为 False，会再确认一次——幂等，且能兜住重启前的残留。
+        self._halt_settled = False
         self._round_stats = {"n": 0, "sum": 0.0, "max": 0.0}
         self._last_trend_log: tuple[float, tuple] | None = None
         self._consecutive_failures = 0
@@ -751,22 +754,18 @@ class GridEngine:
             pos = await self.ext.get_position(self.config.market)
             inv = pos.signed_size
             self._last_inv = inv
+            # 空仓 ≠ 收摊完成：撤单或撤 TPSL 失败会留下普通挂单，它们成交后
+            # 会重新开仓，halted 就白停了。所以只要还没确认收干净，无论有无
+            # 仓位都要把确认链跑完；跑通一次后置位，不再空转。
+            if not self._halt_settled and self._halt_retry_due():
+                logger.warning("halted 未收摊完成（持仓=%s），重试确认平仓链", inv)
+                self._halt_settled = await self._go_off_confirmed(inv)
             if inv == 0:
                 self._current_tpsl = None
             else:
                 inv, mark = await self._inv(position=pos)
                 self._last_mark = mark
                 await self._maintain_tpsl(mark, inv)
-                # halted 却仍有仓位 = 上一次平仓链没走完（撤单或平仓失败）。
-                # 本分支会提前 return，熔断检查够不到这里，所以必须在这里重试，
-                # 否则残单继续成交、库存卡死，只剩 TPSL 一道兜底。
-                halt_retry_due = (
-                    time.time() - self._last_halt_retry_ts >= _HALT_RETRY_INTERVAL_S
-                )
-                if halt_retry_due:
-                    self._last_halt_retry_ts = time.time()
-                    logger.warning("halted 状态仍有持仓 %s，重试确认平仓链", inv)
-                    await self._go_off_confirmed(inv)
                 # halted 只禁止新增报价，既有硬止损风险管理仍继续执行。
                 hard_stop_kwargs = {"signed_size": inv, "mark": mark}
                 if pos is not None:
@@ -1794,6 +1793,19 @@ class GridEngine:
         except Exception as exc:  # noqa: BLE001
             logger.warning("撤单失败 格%d：%s（保留记录下轮重试）", level, exc)
 
+    def _halt_retry_due(self) -> bool:
+        """收摊重试的统一节流闸。到点返回 True 并立即占用窗口。
+
+        必须是唯一入口：halted 分支、硬止损、回撤熔断三条路径都会调用
+        _go_off_confirmed，各自计时就会在同一分钟内叠加成撤单/API 风暴
+        （实测 halted 下硬止损路径每轮都触发，绕过了原来只加在一处的限频）。
+        """
+        now = time.time()
+        if now - self._last_halt_retry_ts < _HALT_RETRY_INTERVAL_S:
+            return False
+        self._last_halt_retry_ts = now
+        return True
+
     def _peak_path(self) -> Path:
         return Path(self.config.state_path).parent / "equity_peak.json"
 
@@ -1869,23 +1881,17 @@ class GridEngine:
             return False
         equity = float(raw_equity)
 
-        # 出入金会凭空改变权益，和行情亏损无法从数值上区分。相邻两次检查（60 秒）
-        # 之间跳变 8% 以上，在行情里极罕见、在出入金里很常见——按资金流处理：
-        # 重新播种峰值而不是熔断。否则一笔 12% 的出金就会平掉真仓位。
-        previous = self._last_equity_seen
+        # 【曾经在这里用"权益跳变 ≥8% 判为出入金"来避免出金误熔断，已移除】
+        # 那是个危险的猜测：真实的快速亏损同样会 ≥8%。实测 1000→900→810 两次
+        # 10% 亏损会被逐次判成出入金、逐次重置峰值，熔断**永不触发**——
+        # 比没有熔断更糟，因为它给出虚假的安全感。
+        #
+        # 现在的取舍很直白：宁可在出入金后误触发一次（平仓+停机+人工复位，
+        # 损失小且可恢复），也不能让真实亏损绕过熔断（损失大且不可逆）。
+        # 出入金后请人工删除 data/equity_peak.json 重新播种。
+        # TODO: 交易所 /api/v1/user/assetOperations 提供真实资金流水，
+        #       接入后可精确扣除出入金，届时才谈得上自动处理。
         self._last_equity_seen = equity
-        if previous is not None and previous > 0:
-            jump = abs(equity - previous) / previous
-            if jump >= _EQUITY_JUMP_PCT:
-                logger.warning(
-                    "权益在一个检查周期内跳变 %.1f%%（%.2f → %.2f），"
-                    "判定为出入金而非行情，重新播种回撤基准",
-                    jump * 100,
-                    previous,
-                    equity,
-                )
-                self._save_equity_peak(equity)
-                return False
 
         peak = self._load_equity_peak()
         if peak is None or equity > peak:
@@ -1912,15 +1918,16 @@ class GridEngine:
         # _go_off_confirmed 在撤单/查仓/平仓任一失败时返回 False。绝不能忽略它——
         # 谎报"已熔断"会让残仓继续成交，而 halted 分支又提前 return，
         # 平仓将永不重试（2026-08-10 "冻结但库存卡死"的同类失效）。
+        self._halt_retry_due()  # 占用节流窗口，避免本轮之后立刻又被重试一次
         flattened = await self._go_off_confirmed(signed_size)
+        self._halt_settled = flattened
         if not flattened:
             logger.critical(
                 "回撤熔断平仓链未完成（持仓=%s）；halted 已持久化，"
-                "将在 halted 路径按 %.0f 秒间隔持续重试",
+                "将按 %.0f 秒间隔持续重试直到收摊完成",
                 signed_size,
                 _HALT_RETRY_INTERVAL_S,
             )
-            self._last_halt_retry_ts = time.time()
         return True
 
     async def _check_hard_stop(
@@ -2049,6 +2056,11 @@ class GridEngine:
             signed_size,
             self.config.hard_stop_dist * 100,
         )
+        # 已 halted 说明收摊在进行中，此时每轮再调一次平仓链只会造成撤单风暴；
+        # 首次触发（尚未 halted）必须立刻执行，不受节流限制。
+        already_halting = self._state is not None and self._state.halted
+        if already_halting and not self._halt_retry_due():
+            return True
         await self._go_off_confirmed(signed_size)
         return True
 
