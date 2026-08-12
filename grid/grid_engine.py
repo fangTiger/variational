@@ -54,6 +54,8 @@ _SLOW_ROUND_LOG_S = 5.0
 _ROUND_SUMMARY_EVERY = 200
 # 状态未变化时 trend-aware 的最小打点间隔（秒）；状态一变立即打，不受此限
 _TREND_LOG_MIN_INTERVAL_S = 120.0
+# 净值回撤熔断的检查间隔（秒）。回撤是慢变量，不需要每轮查 balance
+_EQUITY_CHECK_INTERVAL_S = 60.0
 # 交易所时间与本机可能有轻微偏差；对账时允许一分钟时钟偏移。
 _RETRY_RECONCILE_CLOCK_SKEW_SECONDS = 60.0
 _RETRY_MAX_ATTEMPTS = 10
@@ -83,6 +85,10 @@ class GridConfig:
     exchange_tpsl: bool = True
     liq_buffer_pct: float = 0.12
     max_equity_loss_pct: float = 0.10
+    # 净值自峰值回撤熔断。max_equity_loss_pct 是**每腿**保护——TPSL 的单向棘轮
+    # 在仓位翻向时重置，而网格库存频繁穿零，连续阴跌里每腿各亏 10% 会 0.9ⁿ 复利。
+    # 这是唯一的跨腿约束。设 0 或负数可关闭。
+    max_drawdown_pct: float = 0.12
     flat_confirmation_interval: float = 0.05
     max_writes_per_round: int = 10
     max_by_id_lookups_per_round: int = 10
@@ -130,6 +136,8 @@ class GridEngine:
         self._last_liquidation_price: float | None = None
         self._current_tpsl: tuple[Decimal, Decimal] | None = None
         self._cap_rejection_state: dict[Side, dict] = {}
+        self._equity_peak: float | None = None
+        self._last_equity_check_ts: float = 0.0
         self._round_stats = {"n": 0, "sum": 0.0, "max": 0.0}
         self._last_trend_log: tuple[float, tuple] | None = None
         self._consecutive_failures = 0
@@ -784,6 +792,15 @@ class GridEngine:
                 closes=self._last_closes,
             )
             return "HALTED：硬止损已触发"
+        # 跨腿保护：硬止损与 TPSL 都是"单腿"约束，只有它盯着累计净值
+        if await self._check_equity_drawdown():
+            await self._dump_live(
+                mark=self._last_mark,
+                mode=self._mode,
+                inv=self._last_inv,
+                closes=self._last_closes,
+            )
+            return "HALTED：净值回撤熔断已触发"
         if self._state is not None and self._state.halted:
             await self._dump_live(
                 mark=self._last_mark,
@@ -1759,6 +1776,104 @@ class GridEngine:
             self._orders.pop(level, None)  # 撤单成功后才删记录
         except Exception as exc:  # noqa: BLE001
             logger.warning("撤单失败 格%d：%s（保留记录下轮重试）", level, exc)
+
+    def _peak_path(self) -> Path:
+        return Path(self.config.state_path).parent / "equity_peak.json"
+
+    def _load_equity_peak(self) -> float | None:
+        """读回历史峰值权益。
+
+        必须持久化：峰值只存内存的话，重启就重置，连续阴跌里每重启一次
+        保护就失效一次——而实盘恰恰会因为网络问题反复重启。
+        """
+        if self._equity_peak is not None:
+            return self._equity_peak
+        try:
+            data = json.loads(self._peak_path().read_text(encoding="utf-8"))
+            peak = float(data.get("peak") or 0)
+        except Exception:  # noqa: BLE001  缺失或损坏都当作没有历史峰值
+            return None
+        self._equity_peak = peak if peak > 0 else None
+        return self._equity_peak
+
+    def _save_equity_peak(self, peak: float) -> None:
+        self._equity_peak = peak
+        path = self._peak_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({"peak": peak, "ts": time.time()}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+
+    @staticmethod
+    def drawdown_breached(equity: float, peak: float, limit: float) -> bool:
+        """纯判定：净值自峰值回撤是否达到熔断线。limit<=0 表示关闭。"""
+        if limit <= 0 or peak <= 0 or equity <= 0:
+            return False
+        return (peak - equity) / peak >= limit
+
+    async def _check_equity_drawdown(self) -> bool:
+        """净值自峰值回撤熔断（跨腿保护），触发则全平停机。
+
+        触发后走与硬止损相同的 _go_off_confirmed 落地路径，并持久化 halted，
+        **不会自动恢复**——自动恢复会在同一段行情里反复触发、越平越亏。
+        复位需人工处理 data/grid_state.json 的 halted 字段。
+
+        这是一次性 kill switch，不是方向性冻结：它把两侧一起停掉并平仓，
+        不存在"只冻结一侧导致成交后无法翻单"的失效模式（见 2026-08-10 事故）。
+        """
+        limit = self.config.max_drawdown_pct
+        if limit <= 0:
+            return False
+        now = time.time()
+        # 限频：熔断不需要秒级精度，每轮查一次 balance 会平白增加超时面
+        if now - self._last_equity_check_ts < _EQUITY_CHECK_INTERVAL_S:
+            return False
+        balance_getter = getattr(self.ext, "get_balance", None)
+        if not callable(balance_getter):
+            return False
+        try:
+            balance = await balance_getter()
+        except Exception as exc:  # noqa: BLE001
+            # 查不到权益就不判定——宁可漏防，不可凭陈旧数据误平仓
+            logger.warning("回撤熔断取权益失败，本次跳过：%s", exc)
+            return False
+        self._last_equity_check_ts = now
+        raw_equity = (
+            balance.get("equity")
+            if isinstance(balance, dict)
+            else getattr(balance, "equity", None)
+        )
+        if raw_equity is None or float(raw_equity) <= 0:
+            return False
+        equity = float(raw_equity)
+
+        peak = self._load_equity_peak()
+        if peak is None or equity > peak:
+            self._save_equity_peak(equity)
+            return False
+
+        if not self.drawdown_breached(equity, peak, limit):
+            return False
+
+        logger.critical(
+            "触发净值回撤熔断：当前权益 %.2f，历史峰值 %.2f，回撤 %.2f%% ≥ 阈值 %.2f%%；"
+            "将全平并停机，需人工复位",
+            equity,
+            peak,
+            (peak - equity) / peak * 100,
+            limit * 100,
+        )
+        try:
+            pos = await self.ext.get_position(self.config.market)
+            signed_size = pos.signed_size
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("回撤熔断取仓位失败，仍强制停机：%s", exc)
+            signed_size = Decimal("0")
+        await self._go_off_confirmed(signed_size)
+        return True
 
     async def _check_hard_stop(
         self,

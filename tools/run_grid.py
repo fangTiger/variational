@@ -48,6 +48,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unit", type=float, default=50.0, help="每格名义USD")
     p.add_argument("--levels", type=int, default=4, help="上下各挂几格（受库存上限与±5%限价约束）")
     p.add_argument("--max-inv", type=float, default=400.0, help="最大库存名义USD")
+    p.add_argument("--max-drawdown", type=float, default=0.12,
+                   help="净值自峰值回撤熔断阈值(跨腿保护；触发后全平停机需人工复位，0=禁用)")
     p.add_argument("--adx-off", type=float, default=999.0,
                    help="ADX熔断阈值(默认999=禁用；调低才启用强趋势保护)")
     p.add_argument("--adx-resume", type=float, default=999.0,
@@ -74,6 +76,7 @@ def _grid_config(args: argparse.Namespace) -> GridConfig:
         unit_usd=args.unit,
         levels_per_side=args.levels,
         max_inventory_usd=args.max_inv,
+        max_drawdown_pct=args.max_drawdown,
         adx_off=args.adx_off,
         adx_resume=args.adx_resume,
         donchian_period=args.donchian,
