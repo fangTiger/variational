@@ -40,6 +40,11 @@ _LIVE_STALE_S = 600
 _MONITOR_STALE_S = 2 * 3600
 # 网格被封锁多久算"停摆"——OFF 短暂穿越是正常的，持续数小时不是
 _BLOCKED_ALERT_S = 2 * 3600
+# 多久没有一轮成功算"连不上交易所"。注意不能用快照时间判断：失败轮次同样会
+# 更新 grid_live.json，只有 last_success_ts 才反映真实连通性。
+# 2026-08-13 DNS 故障 3 小时、3686 个连接错误，而进程活着、快照在更新，
+# 原有六条判据一条都没触发，告警全程静默。
+_NO_SUCCESS_ALERT_S = 900
 # 库存/权益超过这个倍数就该知会一声（满仓上限由 --max-inv 控制，这里只报警）
 _LEVERAGE_WARN = 3.0
 
@@ -122,6 +127,21 @@ def collect_alerts(now: float | None = None) -> list[Alert]:
 
         if live.get("halted"):
             alerts.append(Alert("halted", "⛔ 引擎已 halted", "硬止损触发，需人工介入"))
+
+        # 连通性：进程活着 ≠ 连得上交易所
+        last_success = live.get("last_success_ts")
+        if isinstance(last_success, (int, float)) and last_success > 0:
+            since_success = now - float(last_success)
+            if since_success > _NO_SUCCESS_ALERT_S:
+                fails = live.get("consecutive_failures") or 0
+                alerts.append(
+                    Alert(
+                        "no_success",
+                        "⛔ 连不上交易所",
+                        f"已 {_fmt_age(since_success)} 没有一轮成功"
+                        f"（连续失败 {fails} 轮），网格无法挂单成交",
+                    )
+                )
 
         # 停摆判据：mode=off 或双向封锁。这是 8/10 那次 19.5 小时停摆的盲区——
         # 当时 frozen=False，只看 frozen/halted 的旧检测完全没反应。
