@@ -44,9 +44,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--live", action="store_true", help="真实下单（默认 dry_run）")
     p.add_argument("--interval", type=float, default=2.5)
     p.add_argument("--slow-interval", type=float, default=30.0)
-    p.add_argument("--spacing", type=float, default=0.02, help="格距（默认2%）")
+    # argparse 会对 help 做 %% 格式化，字面百分号必须转义，否则 --help 直接崩
+    p.add_argument("--spacing", type=float, default=0.02, help="格距（默认2%%）")
     p.add_argument("--unit", type=float, default=50.0, help="每格名义USD")
-    p.add_argument("--levels", type=int, default=4, help="上下各挂几格（受库存上限与±5%限价约束）")
+    p.add_argument("--levels", type=int, default=4, help="上下各挂几格（受库存上限与±5%%限价约束）")
     p.add_argument("--max-inv", type=float, default=400.0, help="最大库存名义USD")
     p.add_argument("--max-drawdown", type=float, default=0.12,
                    help="净值自峰值回撤熔断阈值(跨腿保护；触发后全平停机需人工复位，0=禁用)")
