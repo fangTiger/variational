@@ -15,7 +15,8 @@ BTC 永续合约的**中性网格策略**实盘系统，跑在 [Extended](https:
 需要 Python 3.11。
 
 ```bash
-git clone <repo> && cd variational
+git clone git@github.com:fangTiger/variational.git
+cd variational
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
@@ -34,24 +35,155 @@ X10_GRID_VAULT_ID=...
 
 `.env` 已在 `.gitignore` 中，不会入库。
 
-### 3. 先跑 dry_run
-
-**不要一上来就用 `--live`。** 默认就是 dry_run，只打印下单意图、不碰账户：
-
-```bash
-PYTHONPATH=. .venv/bin/python -m tools.run_grid \
-    --trend-aware --spacing 0.001 --unit 50 --levels 10 --max-inv 500
-```
-
-观察日志确认行为符合预期后，再加 `--live`。
-
-### 4. 跑测试
+### 3. 跑测试确认环境正常
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
 ```
 
 当前 288 passed。改任何代码前后都应该跑一遍。
+
+---
+
+## 启动方式
+
+### 先分清楚：这个仓库有两套系统
+
+| 系统 | 入口 | 交易所 | 状态 |
+|---|---|---|---|
+| **BTC 中性网格** | `tools/run_grid.py` | **Extended** | ✅ 实盘运行中，是本项目主体 |
+| 跨所对冲刷积分 | `tools/run_hedge_bot.py` | Variational + Extended | ⛔ 已停用，保留作参考 |
+
+**下面所有内容都是 Extended 网格的。** 两套系统用不同的账户前缀：网格用 `X10_GRID_`，对冲用 `X10_`（见 `--account` 参数）。
+
+### 方式一：手动前台运行（调试用）
+
+**dry_run —— 默认模式，只打印下单意图、不碰账户。第一次务必先跑这个：**
+
+```bash
+cd /Users/captain/python/variational
+PYTHONPATH=. .venv/bin/python -m tools.run_grid \
+    --trend-aware --spacing 0.001 --unit 50 --levels 10 --max-inv 500
+```
+
+**实盘 —— 加 `--live` 就是真金白银下单。** 以下是当前生产环境的完整参数，可直接复制：
+
+```bash
+cd /Users/captain/python/variational
+PYTHONPATH=. .venv/bin/python -m tools.run_grid \
+    --live --trend-aware \
+    --spacing 0.000986 --unit 166 --levels 30 --max-inv 2500 \
+    --max-drawdown 0.12 --hard-stop-dist 0.12 \
+    --interval 2.5 --slow-interval 30 --min-half-frac 0.03 \
+    --adx-off 999 --adx-resume 999 --donchian 96
+```
+
+各参数含义：
+
+| 参数 | 当前值 | 说明 |
+|---|---|---|
+| `--spacing` | 0.000986 | 格距 ≈0.0986%，约 0.35×小时 ATR |
+| `--unit` | 166 | 每格名义金额（USD） |
+| `--levels` | 30 | 上下各挂 30 档 |
+| `--max-inv` | 2500 | 库存上限（USD）。**挂单也计入此额度** |
+| `--max-drawdown` | 0.12 | 净值自峰值回撤 12% → 全平停机，需人工复位 |
+| `--hard-stop-dist` | 0.12 | 距强平价 12% → 硬止损 |
+| `--interval` | 2.5 | 快轮询秒数，格距必须与它配套 |
+| `--slow-interval` | 30 | 慢路径（拉 K 线、重算 band）秒数 |
+| `--min-half-frac` | 0.03 | band 半宽下限占价格比例 |
+| `--adx-off` / `--adx-resume` | 999 / 999 | ADX 熔断，999 = **禁用**（理由见「历史教训」） |
+| `--donchian` | 96 | Donchian 周期，仅用于日志，不触发急停 |
+| `--account` | X10_GRID | 账户环境变量前缀，用 `X10` 则切到对冲账户 |
+
+看全部参数：`PYTHONPATH=. .venv/bin/python -m tools.run_grid --help`
+
+### 方式二：launchd 常驻（生产用）
+
+生产环境跑 5 个服务，plist 放在 `~/Library/LaunchAgents/`：
+
+| 服务 Label | 入口 | 调度 | 作用 |
+|---|---|---|---|
+| `com.variational.grid-bot` | `python -m tools.run_grid --live ...` | KeepAlive（崩溃自动拉起） | **网格引擎主进程** |
+| `com.variational.grid-monitor` | `python -m tools.grid_monitor` | 每 3600 秒 | 权益快照 → `data/grid_monitor.jsonl` |
+| `com.variational.alert-check` | `python -m tools.alert_check` | 每 900 秒 | 异常推 macOS 通知 |
+| `com.variational.anchor-check` | `tools/run_anchor_check.sh` | 每天 9:00 / 21:00 | 健康巡检 → `logs/anchor-check.log` |
+| `com.variational.trade-collector` | `python -m tools.trade_collector` | KeepAlive | 逐笔成交采集 → `data/trades/` |
+
+**plist 模板**（以 grid-bot 为例，其余照此改 Label / ProgramArguments / 调度键）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.variational.grid-bot</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/captain/python/variational/.venv/bin/python</string>
+		<string>-m</string><string>tools.run_grid</string>
+		<string>--live</string><string>--trend-aware</string>
+		<string>--spacing</string><string>0.000986</string>
+		<string>--unit</string><string>166</string>
+		<string>--levels</string><string>30</string>
+		<string>--max-inv</string><string>2500</string>
+		<string>--max-drawdown</string><string>0.12</string>
+		<string>--hard-stop-dist</string><string>0.12</string>
+		<string>--interval</string><string>2.5</string>
+		<string>--slow-interval</string><string>30</string>
+		<string>--min-half-frac</string><string>0.03</string>
+		<string>--adx-off</string><string>999</string>
+		<string>--adx-resume</string><string>999</string>
+		<string>--donchian</string><string>96</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict><key>PYTHONPATH</key><string>/Users/captain/python/variational</string></dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/captain/python/variational</string>
+	<key>KeepAlive</key><true/>
+	<key>RunAtLoad</key><true/>
+	<key>ThrottleInterval</key><integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/captain/python/variational/logs/grid-bot.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/captain/python/variational/logs/grid-bot.err.log</string>
+</dict>
+</plist>
+```
+
+> ⚠️ **plist 不在版本控制里**（含绝对路径，且改动频繁）。改完记得同步更新本文档，否则参数变更没有任何痕迹。
+
+部署与控制：
+
+```bash
+# 首次加载
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.variational.grid-bot.plist
+
+# 查看状态（第二列是上次退出码，0 = 正常）
+launchctl list | grep variational
+
+# 重启（仅重新加载代码，不重读 plist）
+launchctl kickstart -k gui/$(id -u)/com.variational.grid-bot
+
+# 停止
+launchctl bootout gui/$(id -u)/com.variational.grid-bot
+```
+
+### 方式三：辅助工具（按需手动跑）
+
+```bash
+# 网页面板 http://localhost:8787
+nohup .venv/bin/python -m tools.grid_panel --port 8787 > logs/grid-panel.out.log 2>&1 &
+
+# 权益/回撤汇总
+PYTHONPATH=. .venv/bin/python -m tools.grid_monitor --report
+
+# 手动跑一次告警检查（--dry-run 只打印不弹通知）
+PYTHONPATH=. .venv/bin/python -m tools.alert_check --dry-run
+
+# 断网前紧急收摊：撤单 + 平仓
+PYTHONPATH=. .venv/bin/python -m tools.go_dark
+```
 
 ---
 
@@ -106,23 +238,15 @@ PYTHONPATH=. .venv/bin/python -m tools.run_grid \
 
 ## 日常运维
 
-### launchd 服务
-
-所有服务的 plist 在 `~/Library/LaunchAgents/`：
-
-| 服务 | 频率 | 作用 |
-|---|---|---|
-| `com.variational.grid-bot` | 常驻（KeepAlive） | 网格引擎主进程 |
-| `com.variational.grid-monitor` | 每小时 | 权益快照 |
-| `com.variational.alert-check` | 每 15 分钟 | 异常告警 |
-| `com.variational.anchor-check` | 每天 9:00 / 21:00 | 健康巡检 |
-| `com.variational.trade-collector` | 常驻 | 逐笔成交采集 |
+### 看日志
 
 ```bash
-launchctl list | grep variational          # 看状态（第二列是上次退出码）
-tail -f logs/grid-bot.err.log              # 看引擎日志
-launchctl kickstart -k gui/$(id -u)/com.variational.grid-bot   # 重启（仅重载代码）
+tail -f logs/grid-bot.err.log                    # 引擎主日志（成交/挂单/异常）
+tail -20 logs/alert-check.log                    # 告警检查记录
+tail -40 logs/anchor-check.log                   # 每日巡检报告
 ```
+
+引擎日志已做降噪：正常轮次每 200 轮汇总一行，只有耗时 ≥5 秒的**慢轮**才逐条记录（那是排查网络超时的关键线索）。同类连接错误每 50 次折叠成一条，避免故障期日志爆炸。
 
 ### 改参数（有坑，务必按顺序）
 
