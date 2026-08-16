@@ -75,6 +75,7 @@ class HedgeState:
     hedge: Position | None = None
     net_delta: Decimal = Decimal(0)
     action_taken: str = ""
+    primary_notional_exceeded: bool = False
 
 
 class HedgeEngine:
@@ -169,6 +170,7 @@ class HedgeEngine:
                 return state
             primary_notional = abs(p_size) * mark_price
             if primary_notional > max_notional:
+                state.primary_notional_exceeded = True
                 state.action_taken = (
                     f"⚠️ primary 名义金额 {primary_notional} 超过上限 {max_notional}，"
                     "拒绝再平衡并保持已有对冲仓不动"

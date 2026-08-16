@@ -12,15 +12,21 @@ ensure_ssl_cert()
 
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
+import json  # noqa: E402
 import os  # noqa: E402
+import time  # noqa: E402
 from decimal import Decimal  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 from adapters.extended_client import ExtendedClient  # noqa: E402
 from adapters.lighter_client import LighterClient  # noqa: E402
-from engine.hedge_engine import HedgeConfig, HedgeEngine  # noqa: E402
+from engine.hedge_engine import HedgeConfig, HedgeEngine, HedgeState  # noqa: E402
 from infra.logger import get_logger  # noqa: E402
 
 logger = get_logger("lighter_hedge")
+
+_ROOT = Path(__file__).resolve().parent.parent
+_HEDGE_SNAPSHOT = _ROOT / "data" / "lighter_hedge.jsonl"
 
 
 class StartupError(RuntimeError):
@@ -70,7 +76,67 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Decimal("0.02"),
         help="净 delta 再平衡比例阈值（默认 0.02）",
     )
+    parser.add_argument(
+        "--min-hedge-free-margin-ratio",
+        type=Decimal,
+        default=Decimal("0.20"),
+        help="Extended 可用保证金率告警阈值（默认 0.20）",
+    )
     return parser
+
+
+def _append_snapshot(payload: dict, path: Path | None = None) -> None:
+    """向对冲历史追加一条 JSON 快照。"""
+    target = _HEDGE_SNAPSHOT if path is None else path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _build_snapshot_callback(
+    hedge,
+    *,
+    interval: float,
+    rebalance_threshold_ratio: Decimal,
+    min_hedge_free_margin_ratio: Decimal,
+):
+    """构造每轮快照回调；保证金查询失败也必须保留心跳。"""
+
+    async def snapshot(state: HedgeState) -> None:
+        margin_ratio = None
+        margin_error = None
+        try:
+            margin_ratio = await hedge.get_free_margin_ratio()
+        except Exception as exc:  # noqa: BLE001  保证金失败不能吞掉心跳
+            margin_error = str(exc)
+            logger.warning("读取 Extended 可用保证金率失败：%s", exc)
+
+        primary_ok = state.primary is not None
+        hedge_ok = state.hedge is not None
+        payload = {
+            "ts": time.time(),
+            "interval": interval,
+            "primary_size": (
+                str(state.primary.signed_size) if primary_ok else None
+            ),
+            "hedge_size": str(state.hedge.signed_size) if hedge_ok else None,
+            "net_delta": str(state.net_delta) if primary_ok and hedge_ok else None,
+            "action": state.action_taken,
+            "primary_read_ok": primary_ok,
+            "hedge_read_ok": hedge_ok,
+            "primary_notional_exceeded": state.primary_notional_exceeded,
+            "rebalance_threshold_ratio": str(rebalance_threshold_ratio),
+            "hedge_free_margin_ratio": (
+                str(Decimal(str(margin_ratio)))
+                if margin_ratio is not None
+                else None
+            ),
+            "min_hedge_free_margin_ratio": str(min_hedge_free_margin_ratio),
+            "hedge_margin_error": margin_error,
+        }
+        _append_snapshot(payload)
+
+    return snapshot
 
 
 def _env_value(name: str) -> str | None:
@@ -130,6 +196,7 @@ def _startup_summary(
             f"Extended 账户前缀：{account_prefix}",
             f"标的：{args.market} → {args.hedge_market}",
             f"名义上限：{args.max_primary_notional} USD",
+            f"保证金率告警阈值：{args.min_hedge_free_margin_ratio:.0%}",
             f"dry_run：{not args.live}",
         ]
     )
@@ -155,6 +222,12 @@ async def _main(args: argparse.Namespace) -> None:
             primary,
             hedge,
             config,
+            on_snapshot=_build_snapshot_callback(
+                hedge,
+                interval=args.interval,
+                rebalance_threshold_ratio=args.rebalance_threshold,
+                min_hedge_free_margin_ratio=args.min_hedge_free_margin_ratio,
+            ),
             on_auth_error=None,
         )
 

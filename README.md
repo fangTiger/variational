@@ -41,7 +41,7 @@ X10_GRID_VAULT_ID=...
 .venv/bin/python -m pytest tests/ -q
 ```
 
-当前 288 passed。改任何代码前后都应该跑一遍。
+当前测试基线见最近一次全量运行结果。改任何代码前后都应该跑一遍。
 
 ---
 
@@ -55,7 +55,26 @@ X10_GRID_VAULT_ID=...
 | 跨所对冲刷积分 | `tools/run_hedge_bot.py` | Variational + Extended | ⛔ 已停用，保留作参考 |
 | Lighter RH 积分对冲 | `tools/run_lighter_hedge.py` | Lighter RH + Extended | 🆕 默认 dry-run，使用独立 `X10_HEDGE_` 账户 |
 
-**下面所有内容都是 Extended 网格的。** 三套系统使用不同账户前缀：网格用 `X10_GRID_`，旧对冲用 `X10_`，Lighter RH 对冲用 `X10_HEDGE_`；三者不得复用 vault。
+三套系统使用不同账户前缀：网格用 `X10_GRID_`，旧对冲用 `X10_`，Lighter RH 对冲用 `X10_HEDGE_`；三者不得复用 vault。
+
+### Lighter RH 对冲启动
+
+先确认 `.env` 已配置 `LIGHTER_RH_L1_ADDRESS` 和独立的 `X10_HEDGE_*` 凭据。默认 dry-run 只读两腿并打印对冲意图：
+
+```bash
+cd /Users/captain/python/variational
+PYTHONPATH=. .venv/bin/python -m tools.run_lighter_hedge
+```
+
+确认地址、account index、vault 隔离和目标对冲量无误后，才可显式启用实盘：
+
+```bash
+PYTHONPATH=. .venv/bin/python -m tools.run_lighter_hedge --live
+```
+
+默认每 30 秒向 `data/lighter_hedge.jsonl` 追加一条心跳，包含两腿仓位、净敞口、本轮动作和 Extended 可用保证金率。`tools.alert_check` 会检查心跳、连续净敞口偏离、primary 名义超限、连续读取失败和保证金不足；保证金告警阈值可用 `--min-hedge-free-margin-ratio` 调整，默认 20%。
+
+下面的前台参数与模板说明以 Extended 网格为主；Lighter 对冲的常驻 plist 另见后文。
 
 ### 方式一：手动前台运行（调试用）
 
@@ -100,11 +119,12 @@ PYTHONPATH=. .venv/bin/python -m tools.run_grid \
 
 ### 方式二：launchd 常驻（生产用）
 
-生产环境跑 5 个服务，plist 放在 `~/Library/LaunchAgents/`：
+生产环境共 6 个服务；已安装的 plist 放在 `~/Library/LaunchAgents/`，Lighter 对冲的可审查源文件保存在仓库 `deploy/`：
 
 | 服务 Label | 入口 | 调度 | 作用 |
 |---|---|---|---|
 | `com.variational.grid-bot` | `python -m tools.run_grid --live ...` | KeepAlive（崩溃自动拉起） | **网格引擎主进程** |
+| `com.variational.lighter-hedge` | `python -m tools.run_lighter_hedge --live` | KeepAlive（崩溃自动拉起） | Lighter RH → Extended 自动对冲；心跳写入 `data/lighter_hedge.jsonl` |
 | `com.variational.grid-monitor` | `python -m tools.grid_monitor` | 每 3600 秒 | 权益快照 → `data/grid_monitor.jsonl` |
 | `com.variational.alert-check` | `python -m tools.alert_check` | 每 900 秒 | 异常推 macOS 通知 |
 | `com.variational.anchor-check` | `tools/run_anchor_check.sh` | 每天 9:00 / 21:00 | 健康巡检 → `logs/anchor-check.log` |
@@ -152,7 +172,20 @@ PYTHONPATH=. .venv/bin/python -m tools.run_grid \
 </plist>
 ```
 
-> ⚠️ **plist 不在版本控制里**（含绝对路径，且改动频繁）。改完记得同步更新本文档，否则参数变更没有任何痕迹。
+> ⚠️ 网格等既有 plist 仍由机器本地维护。Lighter 对冲以仓库内 `deploy/com.variational.lighter-hedge.plist` 为准，修改参数时先改并审查仓库源文件，再由人工复制安装。
+
+Lighter 对冲首次安装与启动由人执行，本仓库任务不会自动运行这些命令：
+
+```bash
+# 先检查仓库源文件；确认 --live、账户前缀、上限和告警阈值
+plutil -lint deploy/com.variational.lighter-hedge.plist
+
+# 人工安装后再加载
+cp deploy/com.variational.lighter-hedge.plist \
+    ~/Library/LaunchAgents/com.variational.lighter-hedge.plist
+launchctl bootstrap gui/$(id -u) \
+    ~/Library/LaunchAgents/com.variational.lighter-hedge.plist
+```
 
 部署与控制：
 
@@ -243,6 +276,7 @@ PYTHONPATH=. .venv/bin/python -m tools.go_dark
 
 ```bash
 tail -f logs/grid-bot.err.log                    # 引擎主日志（成交/挂单/异常）
+tail -f logs/lighter-hedge.err.log               # Lighter 对冲标准错误
 tail -20 logs/alert-check.log                    # 告警检查记录
 tail -40 logs/anchor-check.log                   # 每日巡检报告
 ```
@@ -283,6 +317,7 @@ grep "网格引擎启动" logs/grid-bot.err.log | tail -1
 
 ```bash
 cat data/grid_live.json | python3 -m json.tool     # 引擎实时快照
+tail -3 data/lighter_hedge.jsonl                   # Lighter 对冲最近三轮心跳
 PYTHONPATH=. .venv/bin/python -m tools.grid_monitor --report    # 权益/回撤汇总
 PYTHONPATH=. .venv/bin/python -m tools.alert_check --dry-run    # 手动跑一次告警检查
 nohup .venv/bin/python -m tools.grid_panel --port 8787 &        # 网页面板

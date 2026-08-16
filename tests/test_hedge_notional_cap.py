@@ -95,6 +95,7 @@ def test_primary_notional_above_cap_refuses_rebalance_without_order() -> None:
 
     assert "名义金额 200" in state.action_taken
     assert "超过上限 150" in state.action_taken
+    assert state.primary_notional_exceeded is True
     primary.market_order.assert_not_awaited()
     hedge.market_order.assert_not_awaited()
 

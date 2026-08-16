@@ -21,14 +21,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import time
+from collections import deque
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _LIVE = _ROOT / "data" / "grid_live.json"
 _MONITOR = _ROOT / "data" / "grid_monitor.jsonl"
+_HEDGE_MONITOR = _ROOT / "data" / "lighter_hedge.jsonl"
 _ALERT_STATE = _ROOT / "data" / "alert_state.json"
 
 # 同一条告警的静默期：避免每轮调度都弹同样的通知把人训练成无视通知
@@ -47,6 +51,31 @@ _BLOCKED_ALERT_S = 2 * 3600
 _NO_SUCCESS_ALERT_S = 900
 # 库存/权益超过这个倍数就该知会一声（满仓上限由 --max-inv 控制，这里只报警）
 _LEVERAGE_WARN = 3.0
+
+# Lighter 对冲默认每 30 秒一轮；实际心跳会携带 interval 并覆盖该兜底值。
+_HEDGE_DEFAULT_INTERVAL_S = 30.0
+# alert-check 每 900 秒运行一次；保留两个调度周期，避免严重异常在检查前恢复后漏报。
+_HEDGE_EVENT_LOOKBACK_S = 30 * 60
+# 容忍轻微时钟漂移；更远的未来时间必须视为损坏，不能让 age<0 绕过 stale。
+_HEDGE_FUTURE_TOLERANCE_S = 60
+
+_HEDGE_REQUIRED_FIELDS = frozenset(
+    {
+        "ts",
+        "interval",
+        "primary_size",
+        "hedge_size",
+        "net_delta",
+        "action",
+        "primary_read_ok",
+        "hedge_read_ok",
+        "primary_notional_exceeded",
+        "rebalance_threshold_ratio",
+        "hedge_free_margin_ratio",
+        "min_hedge_free_margin_ratio",
+        "hedge_margin_error",
+    }
+)
 
 
 @dataclass
@@ -78,6 +107,262 @@ def _read_last_monitor() -> dict | None:
         if row.get("equity"):
             return row
     return None
+
+
+def _read_recent_jsonl(path: Path, limit: int) -> list[dict]:
+    """流式读取最后若干条有效 JSON 对象，坏行不会阻断告警。"""
+    rows: deque[dict] = deque(maxlen=limit)
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:  # noqa: BLE001  部分写入或历史坏行直接跳过
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except OSError:
+        return []
+    return list(rows)
+
+
+def _decimal_field(row: dict, key: str) -> Decimal | None:
+    """安全读取 Decimal 字段；缺失或非法值返回 None。"""
+    value = row.get(key)
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _finite_float(value) -> float | None:
+    """解析有限浮点数，拒绝会绕过比较的 NaN 与 Infinity。"""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _snapshot_validation_error(row: dict, now: float | None = None) -> str | None:
+    """校验告警依赖的快照结构，防止格式变化静默绕过所有判据。"""
+    missing = sorted(_HEDGE_REQUIRED_FIELDS - row.keys())
+    if missing:
+        return f"缺少字段：{', '.join(missing)}"
+
+    timestamp = _finite_float(row.get("ts"))
+    interval = _finite_float(row.get("interval"))
+    if timestamp is None:
+        return "ts 不是有限数"
+    if now is not None and timestamp > now + _HEDGE_FUTURE_TOLERANCE_S:
+        return "ts 超前当前时间超过 60 秒"
+    if interval is None or interval <= 0:
+        return "interval 不是正的有限数"
+
+    for key in ("primary_read_ok", "hedge_read_ok", "primary_notional_exceeded"):
+        if not isinstance(row.get(key), bool):
+            return f"{key} 不是布尔值"
+    if not isinstance(row.get("action"), str):
+        return "action 不是字符串"
+
+    threshold = _decimal_field(row, "rebalance_threshold_ratio")
+    margin_threshold = _decimal_field(row, "min_hedge_free_margin_ratio")
+    if threshold is None or threshold < 0:
+        return "rebalance_threshold_ratio 无效"
+    if margin_threshold is None or margin_threshold < 0:
+        return "min_hedge_free_margin_ratio 无效"
+
+    primary_size = _decimal_field(row, "primary_size")
+    hedge_size = _decimal_field(row, "hedge_size")
+    net_delta = _decimal_field(row, "net_delta")
+    if row["primary_read_ok"] and primary_size is None:
+        return "primary 读取成功但仓位无效"
+    if row["hedge_read_ok"] and hedge_size is None:
+        return "hedge 读取成功但仓位无效"
+    if row["primary_read_ok"] and row["hedge_read_ok"] and net_delta is None:
+        return "两腿读取成功但净敞口无效"
+
+    margin_ratio = row.get("hedge_free_margin_ratio")
+    margin_error = row.get("hedge_margin_error")
+    if margin_ratio is None:
+        if not isinstance(margin_error, str) or not margin_error:
+            return "保证金率缺失且没有失败原因"
+    elif _decimal_field(row, "hedge_free_margin_ratio") is None:
+        return "hedge_free_margin_ratio 无效"
+    return None
+
+
+def _net_delta_status(row: dict) -> tuple[Decimal, Decimal, bool] | None:
+    """返回（偏离比例、阈值、是否超限）；读数不完整时返回 None。"""
+    if row.get("primary_read_ok") is not True:
+        return None
+    if row.get("hedge_read_ok") is not True:
+        return None
+    primary_size = _decimal_field(row, "primary_size")
+    hedge_size = _decimal_field(row, "hedge_size")
+    net_delta = _decimal_field(row, "net_delta")
+    threshold = _decimal_field(row, "rebalance_threshold_ratio")
+    if None in (primary_size, hedge_size, net_delta, threshold):
+        return None
+    single_leg = max(abs(primary_size), abs(hedge_size))
+    ratio = abs(net_delta) / single_leg if single_leg > 0 else Decimal(0)
+    return ratio, threshold, ratio > threshold
+
+
+def _collect_lighter_hedge_alerts(now: float) -> list[Alert]:
+    """从持久化快照判断 Lighter 对冲的五类严重异常。"""
+    rows = _read_recent_jsonl(_HEDGE_MONITOR, limit=512)
+    if not rows:
+        return [
+            Alert(
+                "lighter_hedge_missing",
+                "⛔ Lighter 对冲心跳缺失",
+                "data/lighter_hedge.jsonl 没有有效记录，机器人可能尚未启动或已失联",
+            )
+        ]
+
+    alerts: list[Alert] = []
+    latest = rows[-1]
+    latest_validation_error = _snapshot_validation_error(latest, now)
+    parsed_latest_ts = _finite_float(latest.get("ts"))
+    parsed_interval = _finite_float(latest.get("interval"))
+    heartbeat_fields_valid = (
+        parsed_latest_ts is not None
+        and parsed_latest_ts <= now + _HEDGE_FUTURE_TOLERANCE_S
+        and parsed_interval is not None
+        and parsed_interval > 0
+    )
+    latest_ts = parsed_latest_ts if parsed_latest_ts is not None else 0
+    interval = parsed_interval
+    if interval is None or interval <= 0:
+        interval = _HEDGE_DEFAULT_INTERVAL_S
+    stale_after = 3 * interval
+    age = now - latest_ts
+    if not heartbeat_fields_valid or latest_ts <= 0 or age > stale_after:
+        alerts.append(
+            Alert(
+                "lighter_hedge_stale",
+                "⛔ Lighter 对冲心跳陈旧",
+                f"已 {_fmt_age(max(age, 0))} 没有更新（门槛 {stale_after:.0f} 秒），"
+                "机器人可能崩溃或卡死",
+            )
+        )
+
+    # 保留两个 alert-check 调度周期内的事件。否则一次短暂但严重的超限，
+    # 会在 900 秒定时检查到来前被后续健康快照覆盖，重新制造静默盲区。
+    event_rows = []
+    for row in rows:
+        row_ts = _finite_float(row.get("ts"))
+        if row_ts is None:
+            continue
+        if (
+            now - _HEDGE_EVENT_LOOKBACK_S
+            <= row_ts
+            <= now + _HEDGE_FUTURE_TOLERANCE_S
+        ):
+            event_rows.append(row)
+
+    invalid_error = latest_validation_error
+    if invalid_error is None:
+        for row in reversed(event_rows):
+            invalid_error = _snapshot_validation_error(row, now)
+            if invalid_error is not None:
+                break
+    if invalid_error is not None:
+        alerts.append(
+            Alert(
+                "lighter_hedge_invalid",
+                "⛔ Lighter 对冲快照无效",
+                f"监控字段缺失或损坏：{invalid_error}；API 或快照格式可能已变化",
+            )
+        )
+
+    # 单轮偏离通常是再平衡中间态；任意连续两轮都超阈值才喊人。
+    net_delta_event = None
+    for previous, current in zip(event_rows, event_rows[1:]):
+        previous_status = _net_delta_status(previous)
+        current_status = _net_delta_status(current)
+        if (
+            previous_status is not None
+            and current_status is not None
+            and previous_status[2]
+            and current_status[2]
+        ):
+            net_delta_event = current_status
+    if net_delta_event is not None:
+        ratio, threshold, _ = net_delta_event
+        alerts.append(
+            Alert(
+                "lighter_hedge_net_delta",
+                "⛔ Lighter 对冲净敞口持续偏离",
+                f"连续 2 轮未收敛，偏离 {ratio:.1%} > 阈值 {threshold:.1%}",
+            )
+        )
+
+    notional_event = next(
+        (
+            row
+            for row in reversed(event_rows)
+            if row.get("primary_notional_exceeded") is True
+        ),
+        None,
+    )
+    if notional_event is not None:
+        action = str(notional_event.get("action") or "primary 名义上限已触发")
+        alerts.append(
+            Alert(
+                "lighter_hedge_notional_cap",
+                "⛔ Lighter primary 名义超限",
+                f"{action}；请立即到 RH Wallet 手动缩仓",
+            )
+        )
+
+    failure_run = 0
+    max_failure_run = 0
+    for row in event_rows:
+        if row.get("primary_read_ok") is False:
+            failure_run += 1
+            max_failure_run = max(max_failure_run, failure_run)
+        else:
+            failure_run = 0
+    if max_failure_run >= 3:
+        alerts.append(
+            Alert(
+                "lighter_hedge_primary_read",
+                "⛔ Lighter primary 连续读取失败",
+                f"曾连续 {max_failure_run} 轮读不到 Lighter，"
+                "引擎已停止动仓以避免裸腿",
+            )
+        )
+
+    margin_event = None
+    for row in reversed(event_rows):
+        free_margin_ratio = _decimal_field(row, "hedge_free_margin_ratio")
+        min_free_margin_ratio = _decimal_field(
+            row, "min_hedge_free_margin_ratio"
+        )
+        if (
+            free_margin_ratio is not None
+            and min_free_margin_ratio is not None
+            and free_margin_ratio < min_free_margin_ratio
+        ):
+            margin_event = (free_margin_ratio, min_free_margin_ratio)
+            break
+    if margin_event is not None:
+        free_margin_ratio, min_free_margin_ratio = margin_event
+        alerts.append(
+            Alert(
+                "lighter_hedge_margin",
+                "⛔ Extended 对冲腿保证金不足",
+                f"可用保证金率 {free_margin_ratio:.1%} < 阈值 {min_free_margin_ratio:.1%}",
+            )
+        )
+    return alerts
 
 
 def _bot_running() -> bool:
@@ -182,6 +467,7 @@ def collect_alerts(now: float | None = None) -> list[Alert]:
                 )
             )
 
+    alerts.extend(_collect_lighter_hedge_alerts(now))
     return alerts
 
 
@@ -213,7 +499,8 @@ def _blocked_since(now: float) -> float | None:
 
 
 def _load_cooldown() -> dict:
-    return _read_json(_ALERT_STATE) or {}
+    state = _read_json(_ALERT_STATE)
+    return state if isinstance(state, dict) else {}
 
 
 def _save_cooldown(state: dict) -> None:
@@ -223,16 +510,28 @@ def _save_cooldown(state: dict) -> None:
     tmp.replace(_ALERT_STATE)
 
 
-def notify(title: str, body: str) -> None:
-    """弹 macOS 通知。失败不抛错——告警本身不该把调用方搞崩。"""
+def notify(title: str, body: str) -> bool:
+    """弹 macOS 通知；返回是否真正发送成功，失败不抛错。"""
     script = (
         f'display notification {json.dumps(body)} '
         f'with title {json.dumps(title)} sound name "Basso"'
     )
     try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+        result = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, timeout=10
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"  (通知发送失败：{exc})")
+        return False
+    if result.returncode != 0:
+        error = (
+            result.stderr.decode(errors="replace")
+            if isinstance(result.stderr, bytes)
+            else result.stderr
+        )
+        print(f"  (通知发送失败，osascript={result.returncode}：{error or '无错误信息'})")
+        return False
+    return True
 
 
 def main() -> None:
@@ -249,18 +548,25 @@ def main() -> None:
 
     state = _load_cooldown()
     fired = []
+    cooldown_changed = False
     for alert in alerts:
-        last = float(state.get(alert.key) or 0)
-        if not args.force and now - last < _COOLDOWN_S:
+        last = _finite_float(state.get(alert.key))
+        elapsed = now - last if last is not None else None
+        if (
+            not args.force
+            and elapsed is not None
+            and 0 <= elapsed < _COOLDOWN_S
+        ):
             print(f"  (冷却中，跳过) {alert.title}：{alert.body}")
             continue
         print(f"  {alert.title}：{alert.body}")
         if not args.dry_run:
-            notify(alert.title, alert.body)
-            state[alert.key] = now
+            if notify(alert.title, alert.body):
+                state[alert.key] = now
+                cooldown_changed = True
         fired.append(alert)
 
-    if fired and not args.dry_run:
+    if cooldown_changed:
         _save_cooldown(state)
     raise SystemExit(1 if fired else 0)
 

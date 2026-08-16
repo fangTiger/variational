@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONPATH</key>
+		<string>/Users/captain/python/variational</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.variational.lighter-hedge</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/captain/python/variational/.venv/bin/python</string>
+		<string>-m</string>
+		<string>tools.run_lighter_hedge</string>
+		<string>--live</string>
+		<string>--account</string>
+		<string>X10_HEDGE</string>
+		<string>--market</string>
+		<string>BTC</string>
+		<string>--hedge-market</string>
+		<string>BTC-USD</string>
+		<string>--max-primary-notional</string>
+		<string>1300</string>
+		<string>--interval</string>
+		<string>30</string>
+		<string>--rebalance-threshold</string>
+		<string>0.02</string>
+		<string>--min-hedge-free-margin-ratio</string>
+		<string>0.20</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/captain/python/variational/logs/lighter-hedge.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/captain/python/variational/logs/lighter-hedge.out.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/captain/python/variational</string>
+</dict>
+</plist>
