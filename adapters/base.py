@@ -57,6 +57,8 @@ class ExchangeAdapter(ABC):
 
     #: 适配器名称，用于日志（子类覆盖）
     name: str = "exchange"
+    #: 是否允许引擎自动改变仓位；人工只读腿必须覆盖为 False。
+    supports_trading: bool = True
 
     @abstractmethod
     async def connect(self) -> None:

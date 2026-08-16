@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
+import pytest
+
 from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
 from engine.hedge_engine import HedgeConfig, HedgeEngine
 from engine.risk import RiskAction, RiskManager
@@ -105,19 +107,43 @@ def test_single_leg_failure_skips_cycle() -> None:
 def test_primary_auth_error_propagates_for_selfheal() -> None:
     """primary 会话失效应向上抛出，交给 run_forever 做 Cookie 自愈。"""
 
+    class VariationalAuthError(Exception):
+        pass
+
     class _VarAuthAdapter(FakeAdapter):
         async def get_position(self, market):
-            raise type("VariationalAuthError", (Exception,), {})("会话失效")
+            raise VariationalAuthError("会话失效")
 
     primary = _VarAuthAdapter("primary")
     hedge = FakeAdapter("hedge", size=Decimal("1"))
+    config = HedgeConfig(
+        dry_run=False,
+        auth_error_types=(VariationalAuthError,),
+    )
+    engine = HedgeEngine(primary, hedge, config)
+
+    with pytest.raises(VariationalAuthError, match="会话失效"):
+        asyncio.run(engine.run_once())
+
+
+def test_auth_error_suffix_without_configuration_is_regular_read_failure() -> None:
+    """空异常配置不能再凭类名后缀触发自愈。"""
+
+    class UnconfiguredAuthError(Exception):
+        pass
+
+    class _UnconfiguredAuthAdapter(FakeAdapter):
+        async def get_position(self, market):
+            raise UnconfiguredAuthError("普通读取失败")
+
+    primary = _UnconfiguredAuthAdapter("primary")
+    hedge = FakeAdapter("hedge", size=Decimal("1"))
     engine = HedgeEngine(primary, hedge, HedgeConfig(dry_run=False))
 
-    import pytest
+    state = asyncio.run(engine.run_once())
 
-    with pytest.raises(Exception) as ei:
-        asyncio.run(engine.run_once())
-    assert type(ei.value).__name__ == "VariationalAuthError"
+    assert "primary 读取失败" in state.action_taken
+    assert primary.orders == [] and hedge.orders == []
 
 
 def test_flatten_both_when_leg_near_liquidation() -> None:
