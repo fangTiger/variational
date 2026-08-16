@@ -22,6 +22,7 @@ from pathlib import Path
 
 from adapters.base import Side
 from grid.band import blocked_side_for_breach, compute_band, is_out_of_band
+from grid.fill_log import append_fill, build_fill_record
 from grid.grid_state import GridState, load_state, save_state
 from grid.regime import (
     GridMode,
@@ -121,6 +122,8 @@ class GridEngine:
         }
         # 以下观测值仅在当前进程内累计，进程重启后与计数器一起清零。
         self._counters_started_at = time.time()
+        # 每次进程启动生成，用来识别一段数据出自哪次运行
+        self._engine_run_id = f"run-{int(self._counters_started_at)}"
         self._closed_loops = 0
         self._realized_pnl_net = Decimal("0")
         self._max_abs_inv_usd = 0.0
@@ -1384,6 +1387,20 @@ class GridEngine:
                     if raw_fill_price is not None
                     else None
                 )
+                if fill_price is not None and filled > 0:
+                    append_fill(
+                        Path(self.config.state_path).parent / "fills.jsonl",
+                        build_fill_record(
+                            fill_id=str(rec["id"]),
+                            ts=time.time(),
+                            # 闭环键取较低格：BUY@lv 与 SELL@(lv+1) 属同一闭环
+                            level=lv if rec["side"] is Side.BUY else lv - 1,
+                            side=rec["side"].value,
+                            price=fill_price,
+                            qty=filled,
+                            engine_run_id=self._engine_run_id,
+                        ),
+                    )
                 previous_fill = self._loop_fills.get(lv)
                 unmatched_fill_qty = filled
                 if (

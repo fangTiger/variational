@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from adapters.base import Side
+from grid.attribution.pairing import pair_fills
 from grid.grid_engine import GridConfig, GridEngine
 from grid.regime import GridMode
 
@@ -150,7 +151,7 @@ def test_retry_preserves_explicit_replacement_flag() -> None:
     assert 48 not in eng._retry
 
 
-def test_opposite_fills_form_one_closed_loop_from_actual_prices() -> None:
+def test_opposite_fills_form_one_closed_loop_from_actual_prices(tmp_path) -> None:
     """realized_pnl_net 按实际成交价累计纯价差，不含手续费。"""
     first_fill = _history_order(
         "buy-1",
@@ -160,7 +161,7 @@ def test_opposite_fills_form_one_closed_loop_from_actual_prices() -> None:
         payed_fee="0.2",
     )
     ext = CounterExt(history=[first_fill])
-    eng = _engine(ext)
+    eng = _engine(ext, state_path=str(tmp_path / "grid_state.json"))
     eng._orders = {48: {"id": "buy-1", "side": Side.BUY}}
 
     asyncio.run(eng._handle_fills(0.0, blocked_side=None))
@@ -178,9 +179,14 @@ def test_opposite_fills_form_one_closed_loop_from_actual_prices() -> None:
 
     assert eng._closed_loops == 1
     assert eng._realized_pnl_net == Decimal("20")
+    fills = [
+        json.loads(line)
+        for line in (tmp_path / "fills.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(pair_fills(fills)) == 1
 
 
-def test_partial_loop_keeps_unmatched_open_leg() -> None:
+def test_partial_loop_keeps_unmatched_open_leg(tmp_path) -> None:
     """部分反向成交只配对已有数量，剩余腿留待下次配对。"""
     ext = CounterExt(
         history=[
@@ -193,7 +199,7 @@ def test_partial_loop_keeps_unmatched_open_leg() -> None:
             )
         ]
     )
-    eng = _engine(ext)
+    eng = _engine(ext, state_path=str(tmp_path / "grid_state.json"))
     eng._orders = {48: {"id": "buy-1", "side": Side.BUY}}
     asyncio.run(eng._handle_fills(0.0, blocked_side=None))
 
