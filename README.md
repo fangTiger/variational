@@ -47,14 +47,15 @@ X10_GRID_VAULT_ID=...
 
 ## 启动方式
 
-### 先分清楚：这个仓库有两套系统
+### 先分清楚：这个仓库有三套系统
 
 | 系统 | 入口 | 交易所 | 状态 |
 |---|---|---|---|
 | **BTC 中性网格** | `tools/run_grid.py` | **Extended** | ✅ 实盘运行中，是本项目主体 |
 | 跨所对冲刷积分 | `tools/run_hedge_bot.py` | Variational + Extended | ⛔ 已停用，保留作参考 |
+| Lighter RH 积分对冲 | `tools/run_lighter_hedge.py` | Lighter RH + Extended | 🆕 默认 dry-run，使用独立 `X10_HEDGE_` 账户 |
 
-**下面所有内容都是 Extended 网格的。** 两套系统用不同的账户前缀：网格用 `X10_GRID_`，对冲用 `X10_`（见 `--account` 参数）。
+**下面所有内容都是 Extended 网格的。** 三套系统使用不同账户前缀：网格用 `X10_GRID_`，旧对冲用 `X10_`，Lighter RH 对冲用 `X10_HEDGE_`；三者不得复用 vault。
 
 ### 方式一：手动前台运行（调试用）
 

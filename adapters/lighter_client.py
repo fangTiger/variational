@@ -64,9 +64,10 @@ class LighterClient(ExchangeAdapter):
         self._raise_api_error(data, context="账户反查")
 
         candidates: list[dict[str, Any]] = []
-        accounts = data.get("accounts")
-        if isinstance(accounts, list):
-            candidates.extend(item for item in accounts if isinstance(item, dict))
+        for key in ("sub_accounts", "accounts"):
+            accounts = data.get(key)
+            if isinstance(accounts, list):
+                candidates.extend(item for item in accounts if isinstance(item, dict))
         account = data.get("account")
         if isinstance(account, dict):
             candidates.append(account)
