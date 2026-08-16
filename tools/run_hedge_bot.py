@@ -24,7 +24,11 @@ import asyncio  # noqa: E402
 import json  # noqa: E402
 
 from adapters.extended_client import ExtendedClient  # noqa: E402
-from adapters.variational_client import Session, VariationalClient  # noqa: E402
+from adapters.variational_client import (  # noqa: E402
+    Session,
+    VariationalAuthError,
+    VariationalClient,
+)
 from engine.hedge_engine import HedgeConfig, HedgeEngine  # noqa: E402
 from tracking.track_equity_util import snapshot_and_append  # noqa: E402
 
@@ -58,6 +62,7 @@ async def _main(live: bool, interval: float, flatten_proximity: float, min_free_
         poll_interval=interval,
         flatten_proximity=Decimal(str(flatten_proximity)),
         min_free_margin_ratio=Decimal(str(min_free_margin)),
+        auth_error_types=(VariationalAuthError,),
     )
     engine = HedgeEngine(var, ext, config)
 

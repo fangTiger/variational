@@ -41,6 +41,13 @@ class HedgeConfig:
     rebalance_threshold_ratio: Decimal = Decimal("0.02")
     dry_run: bool = True                        # 只算不下单
 
+    # primary 由人工操作时可限制机器人自动跟随的最大名义金额；None 表示关闭。
+    max_primary_notional: Decimal | None = None
+
+    # primary 抛出这些异常时交给 run_forever 的既有自愈回调处理。
+    # 默认空元组，避免引擎依赖任何具体交易所的异常类。
+    auth_error_types: tuple[type[Exception], ...] = field(default_factory=tuple)
+
     # ---- 保护（高仓位策略：放宽按比例降险，改为逼近清仓价即两腿一起平）----
     # 主保护：任一腿标记价距其清仓价 < 此比例 → 两腿一起平（delta 中性，净损失仅磨损）
     flatten_proximity: Decimal = Decimal("0.08")
@@ -92,6 +99,10 @@ class HedgeEngine:
         self._on_auth_error = on_auth_error
         self._running = False
 
+    def _is_auth_error(self, exc: Exception) -> bool:
+        """仅按显式配置的异常类型判断是否进入 primary 会话自愈。"""
+        return isinstance(exc, self.config.auth_error_types)
+
     async def connect(self) -> None:
         """连接两腿。"""
         await asyncio.gather(self.primary.connect(), self.hedge.connect())
@@ -104,12 +115,12 @@ class HedgeEngine:
         # 1. 读两腿持仓。
         # 关键安全原则：只有两腿都能读到才动仓。任一腿读取失败就跳过本轮——
         # 因为此时无法可靠操作那条腿，贸然平另一腿会造成裸仓（比不动更危险）。
-        # primary(Variational) 若是会话失效，抛出交给 run_forever 做 Cookie 自愈。
+        # primary 若是配置的会话失效异常，抛出交给 run_forever 做自愈。
         read_error = None
         try:
             state.primary = await self.primary.get_position(self.config.primary_market)
         except Exception as exc:  # noqa: BLE001
-            if type(exc).__name__ == "VariationalAuthError":
+            if self._is_auth_error(exc):
                 raise  # 交给 run_forever：重读 .env 新 Cookie 后下轮继续
             logger.error("读取 primary 持仓失败：%s", exc)
             read_error = "primary"
@@ -129,7 +140,7 @@ class HedgeEngine:
         state.net_delta = p_size + h_size
         logger.info("primary=%s hedge=%s net_delta=%s", p_size, h_size, state.net_delta)
 
-        # 2.5 主保护：任一腿逼近清仓价 → 两腿一起平（delta 中性，一起平净损失仅磨损）
+        # 2. 主保护：任一腿逼近清仓价 → 两腿一起平（delta 中性，一起平净损失仅磨损）
         if p_size != 0 or h_size != 0:
             flat = await self._check_liquidation_and_flatten()
             if flat:
@@ -143,7 +154,29 @@ class HedgeEngine:
                 state.action_taken = derisked
                 return state
 
-        # 4. 再平衡：把 hedge 腿调整到 -primary_size
+        # 4. primary 名义上限：仅拒绝跟随变大的 primary 仓位，不阻止降险动作。
+        max_notional = self.config.max_primary_notional
+        if max_notional is not None and p_size != 0:
+            try:
+                mark_price = (
+                    await self.primary.get_market_price(self.config.primary_market)
+                ).mid
+            except Exception as exc:  # noqa: BLE001
+                state.action_taken = (
+                    f"跳过本轮（primary 标记价读取失败：{exc}，不动仓以避免裸仓）"
+                )
+                logger.error(state.action_taken)
+                return state
+            primary_notional = abs(p_size) * mark_price
+            if primary_notional > max_notional:
+                state.action_taken = (
+                    f"⚠️ primary 名义金额 {primary_notional} 超过上限 {max_notional}，"
+                    "拒绝再平衡并保持已有对冲仓不动"
+                )
+                logger.warning(state.action_taken)
+                return state
+
+        # 5. 再平衡：把 hedge 腿调整到 -primary_size
         target_hedge = -p_size
         base = max(abs(p_size), abs(h_size))
         threshold = self.config.rebalance_threshold_ratio * base if base > 0 else Decimal(0)
@@ -185,6 +218,12 @@ class HedgeEngine:
             if proximity < self.config.flatten_proximity:
                 msg = (f"⚠️ {adapter.name} 逼近清仓价（标记 {mark:.0f} / 清仓 {liq:.0f}，"
                        f"距 {proximity:.1%} < {self.config.flatten_proximity:.0%}）→ 两腿一起平仓")
+                if not self.primary.supports_trading:
+                    warning = (
+                        f"{msg}；primary 只读，需人工处理，两腿保持不动"
+                    )
+                    logger.warning(warning)
+                    return warning
                 if self.config.dry_run:
                     logger.warning("[dry_run] %s", msg)
                     return f"[dry_run] {msg}"
@@ -205,6 +244,10 @@ class HedgeEngine:
 
         frac = self.config.derisk_fraction
         msg = f"⚠️ 可用保证金率 {free_ratio:.2%} < {self.config.min_free_margin_ratio:.0%}，降险减仓 {frac:.0%}"
+        if not self.primary.supports_trading:
+            warning = f"{msg}；primary 只读，需人工处理，两腿保持不动"
+            logger.warning(warning)
+            return warning
         if self.config.dry_run:
             logger.warning("[dry_run] %s", msg)
             return f"[dry_run] {msg}"
@@ -267,8 +310,8 @@ class HedgeEngine:
                 state = await self.run_once()
                 await self._emit_snapshot(state)
             except Exception as exc:  # noqa: BLE001 循环不因单轮异常退出
-                # primary(Variational) 会话失效 → 触发 Cookie 自愈（按类名判断，避免耦合依赖）
-                if type(exc).__name__ == "VariationalAuthError":
+                # 配置的 primary 会话失效异常 → 触发既有 Cookie 自愈。
+                if self._is_auth_error(exc):
                     logger.warning("primary 会话失效：%s", exc)
                     await self._try_reload_primary()
                 else:
