@@ -94,6 +94,7 @@ def _append_snapshot(payload: dict, path: Path | None = None) -> None:
 
 
 def _build_snapshot_callback(
+    primary,
     hedge,
     *,
     interval: float,
@@ -110,6 +111,19 @@ def _build_snapshot_callback(
         except Exception as exc:  # noqa: BLE001  保证金失败不能吞掉心跳
             margin_error = str(exc)
             logger.warning("读取 Extended 可用保证金率失败：%s", exc)
+
+        # 权益仅供面板汇总用，取不到就留空——绝不能因此中断交易循环
+        primary_collateral = None
+        hedge_equity = None
+        try:
+            balance = await hedge.get_balance()
+            hedge_equity = str(balance.equity)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取 Extended 权益失败（不影响对冲）：%s", exc)
+        try:
+            primary_collateral = str(await primary.get_collateral())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取 Lighter 抵押品失败（不影响对冲）：%s", exc)
 
         primary_ok = state.primary is not None
         hedge_ok = state.hedge is not None
@@ -133,6 +147,8 @@ def _build_snapshot_callback(
             ),
             "min_hedge_free_margin_ratio": str(min_hedge_free_margin_ratio),
             "hedge_margin_error": margin_error,
+            "primary_collateral": primary_collateral,
+            "hedge_equity": hedge_equity,
         }
         _append_snapshot(payload)
 
@@ -223,6 +239,7 @@ async def _main(args: argparse.Namespace) -> None:
             hedge,
             config,
             on_snapshot=_build_snapshot_callback(
+                primary,
                 hedge,
                 interval=args.interval,
                 rebalance_threshold_ratio=args.rebalance_threshold,

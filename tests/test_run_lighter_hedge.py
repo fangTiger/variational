@@ -209,11 +209,19 @@ def test_snapshot_callback_appends_complete_round(monkeypatch, tmp_path) -> None
     assert hasattr(cli, "_build_snapshot_callback")
     monkeypatch.setattr(cli.time, "time", lambda: 1_786_000_000.0)
 
+    class FakePrimary:
+        async def get_collateral(self):
+            return Decimal("489.265906")
+
     class FakeHedge:
         async def get_free_margin_ratio(self):
             return Decimal("0.35")
 
+        async def get_balance(self):
+            return SimpleNamespace(equity=Decimal("465.23"))
+
     callback = cli._build_snapshot_callback(
+        FakePrimary(),
         FakeHedge(),
         interval=30.0,
         rebalance_threshold_ratio=Decimal("0.02"),
@@ -244,6 +252,8 @@ def test_snapshot_callback_appends_complete_round(monkeypatch, tmp_path) -> None
         "hedge_free_margin_ratio": "0.35",
         "min_hedge_free_margin_ratio": "0.20",
         "hedge_margin_error": None,
+        "primary_collateral": "489.265906",
+        "hedge_equity": "465.23",
     }
 
 
@@ -258,11 +268,19 @@ def test_snapshot_callback_keeps_heartbeat_when_margin_read_fails(
     assert hasattr(cli, "_build_snapshot_callback")
     monkeypatch.setattr(cli.time, "time", lambda: 1_786_000_030.0)
 
+    class BrokenPrimary:
+        async def get_collateral(self):
+            raise RuntimeError("Lighter account timeout")
+
     class BrokenMarginHedge:
         async def get_free_margin_ratio(self):
             raise RuntimeError("Extended balance timeout")
 
+        async def get_balance(self):
+            raise RuntimeError("Extended equity timeout")
+
     callback = cli._build_snapshot_callback(
+        BrokenPrimary(),
         BrokenMarginHedge(),
         interval=30.0,
         rebalance_threshold_ratio=Decimal("0.02"),
@@ -284,6 +302,8 @@ def test_snapshot_callback_keeps_heartbeat_when_margin_read_fails(
     assert row["net_delta"] is None
     assert row["hedge_free_margin_ratio"] is None
     assert "Extended balance timeout" in row["hedge_margin_error"]
+    assert row["primary_collateral"] is None
+    assert row["hedge_equity"] is None
 
 
 def test_cli_uses_dedicated_dated_log_file() -> None:

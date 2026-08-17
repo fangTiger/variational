@@ -138,6 +138,19 @@ class LighterClient(ExchangeAdapter):
             return Position(market=market, signed_size=sign * size, raw=raw)
         return Position(market=market, signed_size=Decimal(0))
 
+    async def get_collateral(self) -> Decimal:
+        """账户抵押品总额。仅供监控汇总，不参与任何交易决策。"""
+        account_index = self._require_account_index()
+        data = await self._get_json(
+            "/api/v1/account",
+            params={"by": "index", "value": str(account_index)},
+        )
+        self._raise_api_error(data, context="账户详情查询")
+        accounts = data.get("accounts")
+        if not isinstance(accounts, list) or not accounts:
+            raise ValueError("Lighter 账户详情响应缺少 accounts")
+        return Decimal(str(accounts[0]["collateral"]))
+
     @staticmethod
     def _extract_market_details(data: dict) -> list[dict[str, Any]]:
         """提取订单簿详情列表，响应结构异常时抛出。"""

@@ -201,6 +201,59 @@ def test_high_leverage_fires(env):
     assert "leverage" in _keys(alerts)
 
 
+def test_attribution_gap_fires(env, tmp_path, monkeypatch):
+    """归因残差超阈值时必须真的产生告警，并保留带符号金额。"""
+    monkeypatch.setattr(alert_check, "_ROOT", tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "attribution.json").write_text(
+        json.dumps({"should_stop": False, "has_gap": True, "residual": -1.04}),
+        encoding="utf-8",
+    )
+    _write_live(env["live"], env["now"])
+    _write_monitor(env["monitor"], _healthy_monitor(env["now"]))
+
+    alerts = alert_check.collect_alerts(env["now"])
+
+    assert "attribution_gap" in _keys(alerts)
+    body = next(alert.body for alert in alerts if alert.key == "attribution_gap")
+    assert "-$1.04" in body
+
+
+def test_verdict_stop_fires(env, tmp_path, monkeypatch):
+    """满 4 周判据不通过时必须真的产生停止建议告警。"""
+    monkeypatch.setattr(alert_check, "_ROOT", tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "attribution.json").write_text(
+        json.dumps({"should_stop": True, "reason": "闭环年化 9.0% < 15%"}),
+        encoding="utf-8",
+    )
+    _write_live(env["live"], env["now"])
+    _write_monitor(env["monitor"], _healthy_monitor(env["now"]))
+
+    alerts = alert_check.collect_alerts(env["now"])
+
+    assert "verdict_stop" in _keys(alerts)
+    body = next(alert.body for alert in alerts if alert.key == "verdict_stop")
+    assert "闭环年化 9.0% < 15%" in body
+
+
+def test_invalid_attribution_shape_does_not_break_existing_alerts(
+    env,
+    tmp_path,
+    monkeypatch,
+):
+    """合法 JSON 但顶层不是对象时，不能让全部告警检查崩溃。"""
+    monkeypatch.setattr(alert_check, "_ROOT", tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "attribution.json").write_text("[]", encoding="utf-8")
+    _write_live(env["live"], env["now"], halted=True)
+    _write_monitor(env["monitor"], _healthy_monitor(env["now"]))
+
+    alerts = alert_check.collect_alerts(env["now"])
+
+    assert "halted" in _keys(alerts)
+
+
 def test_leverage_just_under_threshold_is_silent(env):
     _write_live(env["live"], env["now"])
     rows = _healthy_monitor(env["now"])

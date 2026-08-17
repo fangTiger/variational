@@ -415,3 +415,19 @@ def test_liquidation_info_is_none_without_live_liquidation_price(
     info = _run_and_close(client, client.get_liquidation_info("BTC"))
 
     assert info is None
+
+
+def test_get_collateral_reads_account_field(monkeypatch):
+    """抵押品取自 accounts[0].collateral，真实响应结构。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"code": 200, "total": 1, "accounts": [
+                {"index": 5626, "collateral": "489.265906", "positions": []}
+            ]},
+        )
+
+    client = _make_client(monkeypatch, handler)
+    client.account_index = 5626
+    assert asyncio.run(client.get_collateral()) == Decimal("489.265906")
