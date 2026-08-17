@@ -4,6 +4,10 @@
 # 注意：Extended 跑在 Starknet 上，必须用 -starknet 后缀的包，而非 x10-python-trading
 x10-python-trading-starknet>=2.4.0
 
+# Lighter 官方交易 SDK —— 做市腿。锁 commit：签名器与返回模型可能随分支
+# 变化，而单测全部绕过真实包，不锁版本等于把生产行为交给上游默认分支
+lighter_sdk @ git+https://github.com/elliottech/lighter-python.git@da322db2ca4fb3fac56b463d0ade4e54960e32be
+
 # Variational 私有 API 客户端：curl_cffi 提供 Chrome TLS 指纹伪装，绕过 Cloudflare 指纹检测
 curl_cffi>=0.7.0
 
