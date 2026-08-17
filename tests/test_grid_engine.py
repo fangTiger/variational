@@ -136,7 +136,7 @@ def test_cancel_keeps_record_on_failure() -> None:
     """撤单失败时不能把订单记录丢掉（否则留孤儿单）。"""
 
     class FailExt(FakeExt):
-        async def cancel_order(self, oid):
+        async def cancel_order(self, market, order_id):
             raise RuntimeError("network")
 
     ext = FailExt()

@@ -407,9 +407,10 @@ class VariationalClient(ExchangeAdapter):
             is_reduce_only=reduce_only,
         )
 
-    async def cancel_order(self, rfq_id: str) -> Any:
-        """撤单。"""
-        return await self._post("/orders/cancel", {"rfq_id": rfq_id})
+    async def cancel_order(self, market: str, order_id) -> Any:
+        """撤单。Variational 的 RFQ 编号全局唯一，market 仅为满足统一契约。"""
+        del market
+        return await self._post("/orders/cancel", {"rfq_id": order_id})
 
     async def close(self) -> None:
         await self._http.close()

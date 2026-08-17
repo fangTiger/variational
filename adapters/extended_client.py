@@ -341,7 +341,9 @@ class ExtendedClient(ExchangeAdapter):
         )
         return await self._client.orders.place_order(order=order)
 
-    async def cancel_order(self, order_id) -> None:
+    async def cancel_order(self, market: str, order_id) -> None:
+        """撤单。Extended 的订单号全局唯一，market 仅为满足统一契约。"""
+        del market
         await self._client.orders.cancel_order(order_id=order_id)
 
     async def get_open_orders(self, market: str) -> list:
@@ -352,7 +354,7 @@ class ExtendedClient(ExchangeAdapter):
         """逐单撤掉普通网格单，保留 reduce-only、TPSL 与条件单。"""
         orders = filter_grid_orders(await self.get_open_orders(market))
         for order in orders:
-            await self.cancel_order(order.id)
+            await self.cancel_order(market, order.id)
         return len(orders)
 
     async def cancel_tpsl(self, market: str) -> None:
@@ -360,7 +362,7 @@ class ExtendedClient(ExchangeAdapter):
         orders = await self.get_open_orders(market)
         for order in orders:
             if _is_position_tpsl(order):
-                await self.cancel_order(order.id)
+                await self.cancel_order(market, order.id)
 
     async def get_position_tpsl(self, market: str):
         """查询当前市场真实挂出的整仓 TPSL。"""

@@ -78,6 +78,14 @@ class ExchangeAdapter(ABC):
     ):
         """以市价单开/平仓，返回平台原始下单结果。"""
 
+    async def cancel_order(self, market: str, order_id) -> None:
+        """撤掉指定订单。
+
+        market 参数对 Extended 是冗余的（订单号全局唯一），但 Lighter 撤单
+        必须同时提供 market_index，因此契约统一带上它。
+        """
+        raise NotImplementedError
+
     @abstractmethod
     async def close(self) -> None:
         """释放连接资源。"""

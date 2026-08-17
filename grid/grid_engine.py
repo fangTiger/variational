@@ -1805,7 +1805,7 @@ class GridEngine:
             self._counters["write_budget_exhausted_rounds"] += 1
             self._write_budget_exhausted_this_round = True
         try:
-            await self.ext.cancel_order(rec["id"])
+            await self.ext.cancel_order(self.config.market, rec["id"])
             self._orders.pop(level, None)  # 撤单成功后才删记录
         except Exception as exc:  # noqa: BLE001
             logger.warning("撤单失败 格%d：%s（保留记录下轮重试）", level, exc)
