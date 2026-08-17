@@ -7,6 +7,7 @@ pnl_attribution.run() 会打一次资金费接口，因此必须缓存——
 
 from __future__ import annotations
 
+import math
 import time
 
 from panel.types import Metric, SystemStatus
@@ -28,6 +29,15 @@ def _run() -> dict:
     from tools.pnl_attribution import run
 
     return run()
+
+
+def _number(value) -> float | None:
+    """把归因字段安全转成有限浮点数。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def collect(*, now: float | None = None) -> SystemStatus:
@@ -61,6 +71,45 @@ def collect(*, now: float | None = None) -> SystemStatus:
         ),
         Metric("观察期", f"{result.get('days', 0):.1f} / 28 天"),
     ]
+
+    equity_change = _number(result.get("equity_change"))
+    if equity_change is None:
+        equity_change_text, equity_change_tone = "—", "normal"
+    else:
+        equity_change_text = f"${equity_change:+.2f}"
+        equity_change_tone = (
+            "good"
+            if equity_change > 0
+            else ("bad" if equity_change < 0 else "normal")
+        )
+
+    funding_total = _number(result.get("funding_total"))
+    funding_text = f"${funding_total:+.2f}" if funding_total is not None else "—"
+
+    annualised = _number(result.get("grid_annualised_pct"))
+    days = _number(result.get("days"))
+    if annualised is None:
+        annualised_text = "—"
+    else:
+        sample_warning = "（样本不足）" if days is not None and days < 7 else ""
+        annualised_text = f"{annualised:.1f}%{sample_warning}"
+
+    max_drawdown = _number(result.get("max_drawdown_pct"))
+    max_drawdown_text = (
+        f"{max_drawdown:.2f}%" if max_drawdown is not None else "—"
+    )
+    max_drawdown_tone = (
+        "warn" if max_drawdown is not None and max_drawdown > 5 else "normal"
+    )
+
+    metrics.extend(
+        [
+            Metric("权益变化", equity_change_text, equity_change_tone),
+            Metric("资金费", funding_text),
+            Metric("闭环年化", annualised_text),
+            Metric("最大回撤", max_drawdown_text, max_drawdown_tone),
+        ]
+    )
     return SystemStatus(
         name=NAME,
         alive=None,

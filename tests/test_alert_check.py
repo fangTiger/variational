@@ -23,6 +23,7 @@ def env(tmp_path, monkeypatch):
     live = tmp_path / "grid_live.json"
     monitor = tmp_path / "grid_monitor.jsonl"
     hedge = tmp_path / "lighter_hedge.jsonl"
+    monkeypatch.setattr(alert_check, "_ROOT", tmp_path)
     monkeypatch.setattr(alert_check, "_LIVE", live)
     monkeypatch.setattr(alert_check, "_MONITOR", monitor)
     monkeypatch.setattr(alert_check, "_HEDGE_MONITOR", hedge, raising=False)

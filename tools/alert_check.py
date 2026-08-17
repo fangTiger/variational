@@ -468,6 +468,33 @@ def collect_alerts(now: float | None = None) -> list[Alert]:
             )
 
     alerts.extend(_collect_lighter_hedge_alerts(now))
+
+    # 4 周判据与恒等式残差（由 tools/pnl_attribution.py 每小时写入）。
+    # 放在现有网格和 Lighter 检查之后，避免改变它们的判断路径。
+    attribution = _read_json(_ROOT / "data" / "attribution.json")
+    if isinstance(attribution, dict):
+        if attribution.get("should_stop"):
+            alerts.append(
+                Alert(
+                    "verdict_stop",
+                    "⛔ 策略未达判据",
+                    f"{attribution.get('reason', '')}；建议停",
+                )
+            )
+        elif attribution.get("has_gap"):
+            residual = _finite_float(attribution.get("residual"))
+            if residual is None:
+                residual_text = "未知"
+            else:
+                sign = "+" if residual >= 0 else "-"
+                residual_text = f"{sign}${abs(residual):.2f}"
+            alerts.append(
+                Alert(
+                    "attribution_gap",
+                    "⚠️ 归因存在缺口",
+                    f"残差 {residual_text}，数据不可信",
+                )
+            )
     return alerts
 
 

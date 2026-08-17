@@ -28,3 +28,9 @@ def test_system_status_allows_none_alive_and_equity():
     s = SystemStatus(name="收益归因", alive=None, summary="—", metrics=[], equity=None)
     assert s.alive is None
     assert s.equity is None
+
+
+def test_system_status_total_pnl_defaults_to_none_for_backward_compatibility():
+    """旧调用不传总收益时仍可构造，且明确表示不可汇总。"""
+    s = SystemStatus("旧系统", True, "正常", [], 100.0, None)
+    assert s.total_pnl is None

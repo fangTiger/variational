@@ -24,7 +24,7 @@
 		<string>--hedge-market</string>
 		<string>BTC-USD</string>
 		<string>--max-primary-notional</string>
-		<string>1300</string>
+		<string>2000</string>
 		<string>--interval</string>
 		<string>30</string>
 		<string>--rebalance-threshold</string>

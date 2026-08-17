@@ -100,6 +100,7 @@ def _build_snapshot_callback(
     interval: float,
     rebalance_threshold_ratio: Decimal,
     min_hedge_free_margin_ratio: Decimal,
+    max_primary_notional: Decimal | None,
 ):
     """构造每轮快照回调；保证金查询失败也必须保留心跳。"""
 
@@ -127,6 +128,54 @@ def _build_snapshot_callback(
 
         primary_ok = state.primary is not None
         hedge_ok = state.hedge is not None
+
+        # 名义金额只复用本轮 Lighter 持仓原始响应，不额外请求接口。
+        primary_notional = None
+        try:
+            if primary_ok:
+                raw = state.primary.raw
+                raw_notional = (
+                    raw.get("position_value")
+                    if isinstance(raw, dict)
+                    else getattr(raw, "position_value", None)
+                )
+                if raw_notional is not None:
+                    primary_notional = str(raw_notional)
+        except Exception as exc:  # noqa: BLE001 快照字段失败不能中断交易循环
+            logger.warning("读取 Lighter 名义金额失败（不影响对冲）：%s", exc)
+
+        # 两所原始字段拼写不同，分别照抄并独立容错。
+        primary_unrealized = None
+        try:
+            if primary_ok:
+                raw_unrealized = state.primary.raw.get("unrealized_pnl")
+                if raw_unrealized is not None:
+                    primary_unrealized = str(raw_unrealized)
+        except Exception as exc:  # noqa: BLE001 快照字段失败不能中断交易循环
+            logger.warning("读取 Lighter 浮盈失败（不影响对冲）：%s", exc)
+
+        hedge_notional = None
+        try:
+            if hedge_ok:
+                raw_hedge_notional = getattr(state.hedge.raw, "value", None)
+                if raw_hedge_notional is not None:
+                    hedge_notional = str(raw_hedge_notional)
+        except Exception as exc:  # noqa: BLE001 快照字段失败不能中断交易循环
+            logger.warning("读取 Extended 名义金额失败（不影响对冲）：%s", exc)
+
+        hedge_unrealized = None
+        try:
+            if hedge_ok:
+                raw_unrealized = getattr(
+                    state.hedge.raw,
+                    "unrealised_pnl",
+                    None,
+                )
+                if raw_unrealized is not None:
+                    hedge_unrealized = str(raw_unrealized)
+        except Exception as exc:  # noqa: BLE001 快照字段失败不能中断交易循环
+            logger.warning("读取 Extended 浮盈失败（不影响对冲）：%s", exc)
+
         payload = {
             "ts": time.time(),
             "interval": interval,
@@ -149,6 +198,15 @@ def _build_snapshot_callback(
             "hedge_margin_error": margin_error,
             "primary_collateral": primary_collateral,
             "hedge_equity": hedge_equity,
+            "primary_notional": primary_notional,
+            "max_primary_notional": (
+                str(max_primary_notional)
+                if max_primary_notional is not None
+                else None
+            ),
+            "hedge_notional": hedge_notional,
+            "primary_unrealized": primary_unrealized,
+            "hedge_unrealized": hedge_unrealized,
         }
         _append_snapshot(payload)
 
@@ -244,6 +302,7 @@ async def _main(args: argparse.Namespace) -> None:
                 interval=args.interval,
                 rebalance_threshold_ratio=args.rebalance_threshold,
                 min_hedge_free_margin_ratio=args.min_hedge_free_margin_ratio,
+                max_primary_notional=args.max_primary_notional,
             ),
             on_auth_error=None,
         )

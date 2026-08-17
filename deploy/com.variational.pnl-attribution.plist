@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONPATH</key>
+		<string>/Users/captain/python/variational</string>
+	</dict>
+	<key>Label</key>
+	<string>com.variational.pnl-attribution</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/captain/python/variational/.venv/bin/python</string>
+		<string>-m</string>
+		<string>tools.pnl_attribution</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/captain/python/variational/logs/pnl-attribution.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/captain/python/variational/logs/pnl-attribution.log</string>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/captain/python/variational</string>
+</dict>
+</plist>

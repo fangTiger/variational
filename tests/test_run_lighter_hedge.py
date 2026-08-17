@@ -163,6 +163,18 @@ def test_main_assembles_engine_prints_identity_and_closes_clients(
     monkeypatch.setattr(cli, "ExtendedClient", FakeExtended)
     monkeypatch.setattr(cli, "HedgeEngine", FakeEngine)
 
+    def capture_snapshot_options(primary, hedge, **options):
+        captured["snapshot_primary"] = primary
+        captured["snapshot_hedge"] = hedge
+        captured["snapshot_options"] = options
+
+        async def snapshot(_state):
+            return None
+
+        return snapshot
+
+    monkeypatch.setattr(cli, "_build_snapshot_callback", capture_snapshot_options)
+
     asyncio.run(
         cli._main(
             _args(
@@ -189,6 +201,7 @@ def test_main_assembles_engine_prints_identity_and_closes_clients(
     assert config.rebalance_threshold_ratio == Decimal("0.03")
     assert config.dry_run is False
     assert config.auth_error_types == ()
+    assert captured["snapshot_options"]["max_primary_notional"] == Decimal("2500")
     assert captured["primary"].closed is True
     assert captured["hedge"].closed is True
 
@@ -226,10 +239,25 @@ def test_snapshot_callback_appends_complete_round(monkeypatch, tmp_path) -> None
         interval=30.0,
         rebalance_threshold_ratio=Decimal("0.02"),
         min_hedge_free_margin_ratio=Decimal("0.20"),
+        max_primary_notional=Decimal("2000"),
     )
     state = HedgeState(
-        primary=Position("BTC", Decimal("1")),
-        hedge=Position("BTC-USD", Decimal("-0.9")),
+        primary=Position(
+            "BTC",
+            Decimal("1"),
+            raw={
+                "position_value": "1499.25",
+                "unrealized_pnl": "-1.25",
+            },
+        ),
+        hedge=Position(
+            "BTC-USD",
+            Decimal("-0.9"),
+            raw=SimpleNamespace(
+                value="1499.052990",
+                unrealised_pnl="0.30",
+            ),
+        ),
         net_delta=Decimal("0.1"),
         action_taken="再平衡 hedge → -1",
         primary_notional_exceeded=True,
@@ -254,6 +282,11 @@ def test_snapshot_callback_appends_complete_round(monkeypatch, tmp_path) -> None
         "hedge_margin_error": None,
         "primary_collateral": "489.265906",
         "hedge_equity": "465.23",
+        "primary_notional": "1499.25",
+        "max_primary_notional": "2000",
+        "hedge_notional": "1499.052990",
+        "primary_unrealized": "-1.25",
+        "hedge_unrealized": "0.30",
     }
 
 
@@ -285,6 +318,7 @@ def test_snapshot_callback_keeps_heartbeat_when_margin_read_fails(
         interval=30.0,
         rebalance_threshold_ratio=Decimal("0.02"),
         min_hedge_free_margin_ratio=Decimal("0.20"),
+        max_primary_notional=Decimal("2000"),
     )
     state = HedgeState(
         primary=None,
@@ -304,6 +338,168 @@ def test_snapshot_callback_keeps_heartbeat_when_margin_read_fails(
     assert "Extended balance timeout" in row["hedge_margin_error"]
     assert row["primary_collateral"] is None
     assert row["hedge_equity"] is None
+    assert row["primary_notional"] is None
+    assert row["max_primary_notional"] == "2000"
+    assert row["hedge_notional"] is None
+    assert row["primary_unrealized"] is None
+    assert row["hedge_unrealized"] is None
+
+
+def test_snapshot_callback_keeps_heartbeat_when_notional_conversion_fails(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """原始名义金额异常时必须写 null，不能中断交易循环的心跳。"""
+    cli = _cli_module()
+    snapshot_file = tmp_path / "lighter_hedge.jsonl"
+    monkeypatch.setattr(cli, "_HEDGE_SNAPSHOT", snapshot_file)
+
+    class BrokenValue:
+        def __str__(self):
+            raise RuntimeError("position_value 无法转换")
+
+    class FakePrimary:
+        async def get_collateral(self):
+            return Decimal("489.27")
+
+    class FakeHedge:
+        async def get_free_margin_ratio(self):
+            return Decimal("0.35")
+
+        async def get_balance(self):
+            return SimpleNamespace(equity=Decimal("465.23"))
+
+    callback = cli._build_snapshot_callback(
+        FakePrimary(),
+        FakeHedge(),
+        interval=30.0,
+        rebalance_threshold_ratio=Decimal("0.02"),
+        min_hedge_free_margin_ratio=Decimal("0.20"),
+        max_primary_notional=Decimal("2000"),
+    )
+    state = HedgeState(
+        primary=Position(
+            "BTC",
+            Decimal("1"),
+            raw={"position_value": BrokenValue()},
+        ),
+        hedge=Position("BTC-USD", Decimal("-1")),
+        action_taken="无需再平衡",
+    )
+
+    asyncio.run(callback(state))
+
+    row = json.loads(snapshot_file.read_text(encoding="utf-8"))
+    assert row["primary_notional"] is None
+    assert row["max_primary_notional"] == "2000"
+
+
+def test_snapshot_callback_degrades_each_new_raw_field_independently(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """任一新字段读取失败时，其他已有原始字段仍要进入心跳。"""
+    cli = _cli_module()
+    snapshot_file = tmp_path / "lighter_hedge.jsonl"
+    monkeypatch.setattr(cli, "_HEDGE_SNAPSHOT", snapshot_file)
+
+    class FakePrimary:
+        async def get_collateral(self):
+            return Decimal("489.27")
+
+    class FakeHedge:
+        async def get_free_margin_ratio(self):
+            return Decimal("0.35")
+
+        async def get_balance(self):
+            return SimpleNamespace(equity=Decimal("465.23"))
+
+    class BrokenPrimaryRaw(dict):
+        def get(self, key, default=None):
+            if key == "unrealized_pnl":
+                raise RuntimeError("unrealized_pnl 读取失败")
+            return super().get(key, default)
+
+    class BrokenValue:
+        def __str__(self):
+            raise RuntimeError("value 无法转换")
+
+    class BrokenHedgeUnrealized:
+        value = "1499.052990"
+
+        @property
+        def unrealised_pnl(self):
+            raise RuntimeError("unrealised_pnl 读取失败")
+
+    callback = cli._build_snapshot_callback(
+        FakePrimary(),
+        FakeHedge(),
+        interval=30.0,
+        rebalance_threshold_ratio=Decimal("0.02"),
+        min_hedge_free_margin_ratio=Decimal("0.20"),
+        max_primary_notional=Decimal("2000"),
+    )
+    states = [
+        HedgeState(
+            primary=Position(
+                "BTC",
+                Decimal("1"),
+                raw=BrokenPrimaryRaw(position_value="1499.25"),
+            ),
+            hedge=Position(
+                "BTC-USD",
+                Decimal("-1"),
+                raw=SimpleNamespace(value="1499.052990", unrealised_pnl="0.30"),
+            ),
+        ),
+        HedgeState(
+            primary=Position(
+                "BTC",
+                Decimal("1"),
+                raw={"position_value": "1499.25", "unrealized_pnl": "-1.25"},
+            ),
+            hedge=Position(
+                "BTC-USD",
+                Decimal("-1"),
+                raw=SimpleNamespace(value=BrokenValue(), unrealised_pnl="0.30"),
+            ),
+        ),
+        HedgeState(
+            primary=Position(
+                "BTC",
+                Decimal("1"),
+                raw={"position_value": "1499.25", "unrealized_pnl": "-1.25"},
+            ),
+            hedge=Position(
+                "BTC-USD",
+                Decimal("-1"),
+                raw=BrokenHedgeUnrealized(),
+            ),
+        ),
+    ]
+
+    for state in states:
+        asyncio.run(callback(state))
+
+    rows = [
+        json.loads(line)
+        for line in snapshot_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert (
+        rows[0]["primary_unrealized"],
+        rows[0]["hedge_notional"],
+        rows[0]["hedge_unrealized"],
+    ) == (None, "1499.052990", "0.30")
+    assert (
+        rows[1]["primary_unrealized"],
+        rows[1]["hedge_notional"],
+        rows[1]["hedge_unrealized"],
+    ) == ("-1.25", None, "0.30")
+    assert (
+        rows[2]["primary_unrealized"],
+        rows[2]["hedge_notional"],
+        rows[2]["hedge_unrealized"],
+    ) == ("-1.25", "1499.052990", None)
 
 
 def test_cli_uses_dedicated_dated_log_file() -> None:

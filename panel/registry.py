@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 
 from panel.actions import to_panel_alert
@@ -39,6 +40,30 @@ def collect_all() -> list[SystemStatus]:
 def total_equity(systems: list[SystemStatus]) -> float:
     """总览条用的合计权益。equity 为 None 的系统不计入。"""
     return sum(s.equity for s in systems if isinstance(s.equity, (int, float)))
+
+
+def system_counts(systems: list[SystemStatus]) -> tuple[int, int]:
+    """返回有存活概念的系统总数与在线数。"""
+    total = sum(system.alive is not None for system in systems)
+    online = sum(system.alive is True for system in systems)
+    return total, online
+
+
+def total_pnl_summary(systems: list[SystemStatus]) -> tuple[float, list[str]]:
+    """汇总可计算的总收益，并返回未计入的系统名称。"""
+    total = 0.0
+    missing: list[str] = []
+    for system in systems:
+        value = system.total_pnl
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        ):
+            total += float(value)
+        else:
+            missing.append(system.name)
+    return total, missing
 
 
 def collect_panel_alerts() -> list[PanelAlert]:

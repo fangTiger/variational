@@ -51,3 +51,4 @@ class SystemStatus:
     metrics: list[Metric] = field(default_factory=list)
     equity: float | None = None
     error: str | None = None
+    total_pnl: float | None = None

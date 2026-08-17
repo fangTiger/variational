@@ -119,13 +119,14 @@ PYTHONPATH=. .venv/bin/python -m tools.run_grid \
 
 ### 方式二：launchd 常驻（生产用）
 
-生产环境共 6 个服务；已安装的 plist 放在 `~/Library/LaunchAgents/`，Lighter 对冲的可审查源文件保存在仓库 `deploy/`：
+生产环境共 7 个服务；已安装的 plist 放在 `~/Library/LaunchAgents/`，Lighter 对冲与收益归因的可审查源文件保存在仓库 `deploy/`：
 
 | 服务 Label | 入口 | 调度 | 作用 |
 |---|---|---|---|
 | `com.variational.grid-bot` | `python -m tools.run_grid --live ...` | KeepAlive（崩溃自动拉起） | **网格引擎主进程** |
 | `com.variational.lighter-hedge` | `python -m tools.run_lighter_hedge --live` | KeepAlive（崩溃自动拉起） | Lighter RH → Extended 自动对冲；心跳写入 `data/lighter_hedge.jsonl` |
 | `com.variational.grid-monitor` | `python -m tools.grid_monitor` | 每 3600 秒 | 权益快照 → `data/grid_monitor.jsonl` |
+| `com.variational.pnl-attribution` | `python -m tools.pnl_attribution` | 每 3600 秒 | 成交导入、离线配对与恒等式校验 → `data/attribution.json` |
 | `com.variational.alert-check` | `python -m tools.alert_check` | 每 900 秒 | 异常推 macOS 通知 |
 | `com.variational.anchor-check` | `tools/run_anchor_check.sh` | 每天 9:00 / 21:00 | 健康巡检 → `logs/anchor-check.log` |
 | `com.variational.trade-collector` | `python -m tools.trade_collector` | KeepAlive | 逐笔成交采集 → `data/trades/` |
@@ -172,13 +173,14 @@ PYTHONPATH=. .venv/bin/python -m tools.run_grid \
 </plist>
 ```
 
-> ⚠️ 网格等既有 plist 仍由机器本地维护。Lighter 对冲以仓库内 `deploy/com.variational.lighter-hedge.plist` 为准，修改参数时先改并审查仓库源文件，再由人工复制安装。
+> ⚠️ 网格等既有 plist 仍由机器本地维护。Lighter 对冲与收益归因分别以仓库内 `deploy/com.variational.lighter-hedge.plist`、`deploy/com.variational.pnl-attribution.plist` 为准，修改参数时先改并审查仓库源文件，再由人工复制安装。本仓库任务不会自动安装或执行 `launchctl`。
 
 Lighter 对冲首次安装与启动由人执行，本仓库任务不会自动运行这些命令：
 
 ```bash
 # 先检查仓库源文件；确认 --live、账户前缀、上限和告警阈值
 plutil -lint deploy/com.variational.lighter-hedge.plist
+plutil -lint deploy/com.variational.pnl-attribution.plist
 
 # 人工安装后再加载
 cp deploy/com.variational.lighter-hedge.plist \
@@ -211,6 +213,10 @@ nohup .venv/bin/python -m tools.grid_panel --port 8787 > logs/grid-panel.out.log
 
 # 权益/回撤汇总
 PYTHONPATH=. .venv/bin/python -m tools.grid_monitor --report
+
+# 手动运行一次收益归因；报告写入 data/attribution.json
+PYTHONPATH=. .venv/bin/python -m tools.pnl_attribution --report
+python3 -m json.tool data/attribution.json
 
 # 手动跑一次告警检查（--dry-run 只打印不弹通知）
 PYTHONPATH=. .venv/bin/python -m tools.alert_check --dry-run
@@ -249,6 +255,7 @@ PYTHONPATH=. .venv/bin/python -m tools.go_dark
 | `adapters/extended_client.py` | Extended 交易所适配器（下单/撤单/查仓/TPSL） |
 | `tools/run_grid.py` | 守护进程入口 |
 | `tools/grid_monitor.py` | 每小时权益快照 → `data/grid_monitor.jsonl` |
+| `tools/pnl_attribution.py` | 导入成交、配对闭环、校验残差 → `data/attribution.json` |
 | `tools/alert_check.py` | 异常主动告警（macOS 通知） |
 | `tools/grid_panel.py` | 本地网页面板 `http://localhost:8787` |
 
@@ -318,6 +325,7 @@ grep "网格引擎启动" logs/grid-bot.err.log | tail -1
 ```bash
 cat data/grid_live.json | python3 -m json.tool     # 引擎实时快照
 tail -3 data/lighter_hedge.jsonl                   # Lighter 对冲最近三轮心跳
+python3 -m json.tool data/attribution.json         # 闭环收益、归因残差与 4 周判据
 PYTHONPATH=. .venv/bin/python -m tools.grid_monitor --report    # 权益/回撤汇总
 PYTHONPATH=. .venv/bin/python -m tools.alert_check --dry-run    # 手动跑一次告警检查
 nohup .venv/bin/python -m tools.grid_panel --port 8787 &        # 网页面板

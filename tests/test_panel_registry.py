@@ -38,6 +38,25 @@ def test_total_equity_skips_none(monkeypatch):
     assert registry.total_equity(registry.collect_all()) == 100.0
 
 
+def test_system_counts_excludes_none_alive():
+    """只有存在进程概念的系统进入分母，且仅 True 算在线。"""
+    systems = [
+        SystemStatus(name="在线", alive=True, summary=""),
+        SystemStatus(name="离线", alive=False, summary=""),
+        SystemStatus(name="无存活概念", alive=None, summary=""),
+    ]
+    assert registry.system_counts(systems) == (2, 1)
+
+
+def test_total_pnl_summary_skips_none_and_reports_missing_systems():
+    systems = [
+        SystemStatus(name="网格", alive=True, summary="", total_pnl=49.5),
+        SystemStatus(name="对冲", alive=True, summary="", total_pnl=-1.75),
+        SystemStatus(name="归因", alive=None, summary=""),
+    ]
+    assert registry.total_pnl_summary(systems) == (47.75, ["归因"])
+
+
 def test_collect_panel_alerts_translates(monkeypatch):
     from tools.alert_check import Alert
 

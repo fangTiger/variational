@@ -12,6 +12,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from grid.regime import describe_regime
+from panel import registry
+from panel.render import render_page
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -48,13 +50,17 @@ class GridPanelHandler(http.server.BaseHTTPRequestHandler):
 
     live_path = PROJECT_ROOT / "data" / "grid_live.json"
     monitor_path = PROJECT_ROOT / "data" / "grid_monitor.jsonl"
+    unified = False
 
     def do_GET(self) -> None:
         if urlsplit(self.path).path != "/":
             self.send_error(404)
             return
 
-        html = render_html(_read_live(self.live_path), _latest_equity(self.monitor_path))
+        if self.unified:
+            html = build_unified_page()
+        else:
+            html = render_html(_read_live(self.live_path), _latest_equity(self.monitor_path))
         body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -64,6 +70,28 @@ class GridPanelHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args) -> None:
         pass
+
+
+def build_unified_page() -> str:
+    """组装统一面板页面。任何异常都要出页面，白屏比错误信息更危险。"""
+    try:
+        systems = registry.collect_all()
+        alerts = registry.collect_panel_alerts()
+        total = registry.total_equity(systems)
+    except Exception as exc:  # noqa: BLE001
+        from panel.types import PanelAlert
+
+        return render_page(
+            [],
+            [PanelAlert(
+                key="panel_total_failure",
+                level="critical",
+                title="⛔ 面板采集全面失败",
+                action=f"本页数据不可用，不要依赖它判断实盘状态。告诉 Claude 排查：{exc}",
+            )],
+            total=0.0,
+        )
+    return render_page(systems, alerts, total=total)
 
 
 def render_html(live: dict, equity: dict) -> str:
@@ -544,10 +572,14 @@ def main() -> None:
         type=Path,
         default=PROJECT_ROOT / "data" / "grid_monitor.jsonl",
     )
+    parser.add_argument(
+        "--legacy", action="store_true", help="回退到只看网格的旧面板"
+    )
     args = parser.parse_args()
 
     GridPanelHandler.live_path = args.live_path
     GridPanelHandler.monitor_path = args.monitor_path
+    GridPanelHandler.unified = not args.legacy
     with http.server.HTTPServer(("localhost", args.port), GridPanelHandler) as server:
         print(f"面板已启动：http://localhost:{args.port}（Ctrl+C 停）", flush=True)
         server.serve_forever()
