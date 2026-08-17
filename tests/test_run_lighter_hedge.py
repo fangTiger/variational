@@ -34,6 +34,7 @@ def _args(**overrides) -> SimpleNamespace:
         "interval": 30.0,
         "rebalance_threshold": Decimal("0.02"),
         "min_hedge_free_margin_ratio": Decimal("0.20"),
+        "maker_first_timeout": 0.0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -99,6 +100,7 @@ def test_parser_uses_safe_defaults_and_environment_address(monkeypatch) -> None:
     assert args.interval == 30.0
     assert args.rebalance_threshold == Decimal("0.02")
     assert args.min_hedge_free_margin_ratio == Decimal("0.20")
+    assert args.maker_first_timeout == 0.0
 
 
 def test_main_assembles_engine_prints_identity_and_closes_clients(
@@ -183,6 +185,7 @@ def test_main_assembles_engine_prints_identity_and_closes_clients(
                 max_primary_notional=Decimal("2500"),
                 interval=45.0,
                 rebalance_threshold=Decimal("0.03"),
+                maker_first_timeout=12.0,
             )
         )
     )
@@ -199,6 +202,7 @@ def test_main_assembles_engine_prints_identity_and_closes_clients(
     assert config.max_primary_notional == Decimal("2500")
     assert config.poll_interval == 45.0
     assert config.rebalance_threshold_ratio == Decimal("0.03")
+    assert config.maker_first_timeout_s == 12.0
     assert config.dry_run is False
     assert config.auth_error_types == ()
     assert captured["snapshot_options"]["max_primary_notional"] == Decimal("2500")
@@ -211,6 +215,7 @@ def test_main_assembles_engine_prints_identity_and_closes_clients(
     assert "Extended 账户前缀：X10_HEDGE" in output
     assert "标的：BTC → BTC-USD" in output
     assert "名义上限：2500 USD" in output
+    assert "maker 优先等待：12 秒（0=关闭）" in output
     assert "dry_run：False" in output
 
 

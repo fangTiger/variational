@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -54,6 +55,10 @@ class HedgeConfig:
     # 次级：可用保证金率降险，默认 0 = 关闭（放宽）；设 >0 才启用按比例减仓
     min_free_margin_ratio: Decimal = Decimal("0")
     derisk_fraction: Decimal = Decimal("0.35")
+
+    # 对冲下单先挂 maker 等待成交的秒数；0 表示直接吃单（保持原行为）。
+    # 放在字段末尾，避免改变既有配置项的位置参数序号。
+    maker_first_timeout_s: float = 0.0
 
     @property
     def target_notional_usd(self) -> Decimal:
@@ -283,6 +288,26 @@ class HedgeEngine:
         if self.config.dry_run:
             logger.info("[dry_run] %s（未真正下单）", msg)
             return f"[dry_run] {msg}"
+
+        if self.config.maker_first_timeout_s > 0:
+            current = (
+                await self.hedge.get_position(self.config.market)
+            ).signed_size
+            delta = target_hedge - current
+            reduce_only = (
+                abs(target_hedge) < abs(current)
+                and target_hedge * current >= 0
+            )
+            result = await maker_first_hedge(
+                self.hedge,
+                self.config.market,
+                delta,
+                timeout_s=self.config.maker_first_timeout_s,
+                reduce_only=reduce_only,
+            )
+            logger.info("%s 完成（maker 优先）：%s", msg, result.note)
+            return f"{msg}（{result.note}）"
+
         result = await self.hedge.hedge(self.config.market, target_hedge)
         logger.info("%s 完成：%s", msg, result)
         return msg
@@ -337,3 +362,118 @@ class HedgeEngine:
     def stop(self) -> None:
         """请求停止主循环。"""
         self._running = False
+
+
+@dataclass(frozen=True)
+class HedgeFillResult:
+    """一次对冲下单的结果。
+
+    filled 是最终覆盖掉的数量（maker 成交 + 吃单补足）。
+    note 记录异常路径，供排查。
+    """
+
+    filled: Decimal
+    used_taker: bool
+    note: str = ""
+
+
+async def maker_first_hedge(
+    adapter,
+    market: str,
+    target_delta: Decimal,
+    *,
+    timeout_s: float = 15.0,
+    poll_s: float = 1.0,
+    reduce_only: bool = False,
+) -> HedgeFillResult:
+    """先挂 maker，超时未成交则撤单、按剩余量吃单。
+
+    成交判定使用订单状态与已成交量，而不是持仓差值。持仓差值遇到部分成交
+    会误判成全部成交，导致欠对冲并留下无人跟踪的孤儿单。
+    """
+    if target_delta == 0:
+        return HedgeFillResult(
+            filled=Decimal(0),
+            used_taker=False,
+            note="目标为零",
+        )
+
+    side = Side.BUY if target_delta > 0 else Side.SELL
+    amount = abs(target_delta)
+
+    # 挂在本方最优价：卖挂 ask、买挂 bid。挂在对手价会立即成交，
+    # 从而被 post_only 拒绝。
+    quote = await adapter.get_market_price(market)
+    price = quote.ask if side is Side.SELL else quote.bid
+    response = await adapter.place_limit_order(
+        market,
+        side,
+        amount,
+        price,
+        post_only=True,
+        reduce_only=reduce_only,
+    )
+
+    def _field(value, name: str):
+        if isinstance(value, dict):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    response_data = _field(response, "data") or response
+    order_id = _field(response_data, "id") or _field(response, "id")
+    if order_id is None:
+        raise RuntimeError("maker 下单响应缺少订单 ID，无法安全追踪")
+
+    async def _read_order() -> tuple[Decimal, str]:
+        got = await adapter.get_order_by_id(market, order_id)
+        data = _field(got, "data") or got
+        raw_filled = _field(data, "filled_qty")
+        raw_status = _field(data, "status")
+        filled_qty = Decimal(str(raw_filled or 0))
+        status = str(raw_status or "").upper().rsplit(".", 1)[-1]
+        return filled_qty, status
+
+    deadline = time.monotonic() + timeout_s
+    filled = Decimal(0)
+    terminal_statuses = {"FILLED", "CANCELLED", "EXPIRED", "REJECTED"}
+    while time.monotonic() < deadline:
+        await asyncio.sleep(poll_s)
+        filled, status = await _read_order()
+        if filled >= amount:
+            return HedgeFillResult(
+                filled=filled,
+                used_taker=False,
+                note="maker 全部成交",
+            )
+        if status in terminal_statuses:
+            break
+
+    note = ""
+    try:
+        await adapter.cancel_order(market, order_id)
+    except Exception as exc:  # noqa: BLE001
+        note = f"撤单失败（{exc}）"
+        logger.warning("对冲撤单失败，将按重读结果决定是否吃单：%s", exc)
+
+    # 撤单成功与否都重读一次：撤单前的瞬间可能又成交了一部分，
+    # 按陈旧数据吃单会超额对冲。
+    filled, _status = await _read_order()
+    remaining = amount - filled
+    if remaining <= 0:
+        return HedgeFillResult(
+            filled=filled,
+            used_taker=False,
+            note=(note + "；重读发现已全部成交，未吃单").lstrip("；"),
+        )
+
+    await adapter.market_order(
+        market,
+        side,
+        remaining,
+        reduce_only=reduce_only,
+    )
+    return HedgeFillResult(
+        filled=amount,
+        used_taker=True,
+        note=(note + f"；maker 成交 {filled}，吃单补 {remaining}").lstrip("；"),
+    )

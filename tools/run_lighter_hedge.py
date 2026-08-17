@@ -71,6 +71,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--interval", type=float, default=30.0, help="轮询秒数（默认 30）")
     parser.add_argument(
+        "--maker-first-timeout",
+        type=float,
+        default=0.0,
+        help="对冲先挂 maker 单等待成交的秒数，超时转吃单；0=直接吃单（默认）",
+    )
+    parser.add_argument(
         "--rebalance-threshold",
         type=Decimal,
         default=Decimal("0.02"),
@@ -271,6 +277,7 @@ def _startup_summary(
             f"标的：{args.market} → {args.hedge_market}",
             f"名义上限：{args.max_primary_notional} USD",
             f"保证金率告警阈值：{args.min_hedge_free_margin_ratio:.0%}",
+            f"maker 优先等待：{args.maker_first_timeout:g} 秒（0=关闭）",
             f"dry_run：{not args.live}",
         ]
     )
@@ -289,6 +296,7 @@ async def _main(args: argparse.Namespace) -> None:
             poll_interval=args.interval,
             rebalance_threshold_ratio=args.rebalance_threshold,
             dry_run=not args.live,
+            maker_first_timeout_s=args.maker_first_timeout,
             max_primary_notional=args.max_primary_notional,
             auth_error_types=(),
         )
