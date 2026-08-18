@@ -23,16 +23,19 @@ def env(tmp_path, monkeypatch):
     live = tmp_path / "grid_live.json"
     monitor = tmp_path / "grid_monitor.jsonl"
     hedge = tmp_path / "lighter_hedge.jsonl"
+    mm = tmp_path / "lighter_mm.jsonl"
     monkeypatch.setattr(alert_check, "_ROOT", tmp_path)
     monkeypatch.setattr(alert_check, "_LIVE", live)
     monkeypatch.setattr(alert_check, "_MONITOR", monitor)
     monkeypatch.setattr(alert_check, "_HEDGE_MONITOR", hedge, raising=False)
+    monkeypatch.setattr(alert_check, "_MM_MONITOR", mm, raising=False)
     monkeypatch.setattr(alert_check, "_ALERT_STATE", tmp_path / "alert_state.json")
     monkeypatch.setattr(alert_check, "_bot_running", lambda: True)
     return {
         "live": live,
         "monitor": monitor,
         "hedge": hedge,
+        "mm": mm,
         "now": 1_786_000_000.0,
     }
 
@@ -94,6 +97,32 @@ def _hedge_row(now, **kw):
 
 
 def _write_hedge(path, rows):
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _mm_row(now, **kw):
+    """构造一条显式健康的 Lighter 做市心跳。"""
+    row = {
+        "ts": now,
+        "market": "BTC",
+        "dry_run": True,
+        "levels": 4,
+        "unit": 50.0,
+        "max_inv": 500.0,
+        "interval": 5.0,
+        "position_size": "0",
+        "inventory_usd": 0.0,
+        "open_orders": 8,
+        "success": True,
+    }
+    row.update(kw)
+    return row
+
+
+def _write_mm(path, rows):
     path.write_text(
         "\n".join(json.dumps(row) for row in rows) + "\n",
         encoding="utf-8",
@@ -267,6 +296,151 @@ def test_missing_files_fire_not_crash(env):
     """数据文件缺失时要报警，而不是抛异常把调度任务搞挂。"""
     alerts = alert_check.collect_alerts(env["now"])
     assert {"live_missing", "monitor_missing", "lighter_hedge_missing"} <= _keys(alerts)
+
+
+def test_lighter_mm_missing_file_is_silent_before_deployment(env):
+    """防止做市机器人尚未部署时因心跳文件不存在而持续制造噪音告警。"""
+    assert not env["mm"].exists()
+
+    assert alert_check._collect_lighter_mm_alerts(env["now"]) == []
+
+
+@pytest.mark.parametrize("contents", ["", "不是 JSON\n[]\n"])
+def test_lighter_mm_existing_file_without_valid_record_fires(env, contents):
+    """防止已部署后的空文件或损坏文件被误判成尚未部署并静默放过。"""
+    env["mm"].write_text(contents, encoding="utf-8")
+
+    alerts = alert_check._collect_lighter_mm_alerts(env["now"])
+
+    assert "lighter_mm_missing" in _keys(alerts)
+
+
+def test_collect_alerts_includes_lighter_mm_failures(env):
+    """防止做市收集函数虽存在却未接入总告警入口，继续形成静默盲区。"""
+    _write_live(env["live"], env["now"])
+    _write_monitor(env["monitor"], _healthy_monitor(env["now"]))
+    _write_hedge(env["hedge"], [_hedge_row(env["now"])])
+    env["mm"].write_text("损坏心跳\n", encoding="utf-8")
+
+    assert "lighter_mm_missing" in _keys(alert_check.collect_alerts(env["now"]))
+
+
+def test_lighter_mm_stale_uses_three_heartbeat_intervals(env):
+    """防止轮询参数调整后告警仍写死旧常量，导致停摆发现过晚或误报。"""
+    _write_mm(
+        env["mm"],
+        [_mm_row(env["now"] - 31, interval=10.0)],
+    )
+
+    alerts = alert_check._collect_lighter_mm_alerts(env["now"])
+
+    assert "lighter_mm_stale" in _keys(alerts)
+    alert = next(item for item in alerts if item.key == "lighter_mm_stale")
+    assert "做市心跳陈旧" in alert.title
+    assert "31 秒" in alert.body
+    assert "门槛 30 秒" in alert.body
+
+
+@pytest.mark.parametrize("bad_interval", [None, 0, -2.5])
+def test_lighter_mm_invalid_interval_falls_back_to_five_seconds(
+    env,
+    bad_interval,
+):
+    """防止缺失或非正 interval 让陈旧门槛失效，从而永久漏报做市停摆。"""
+    row = _mm_row(env["now"] - 16)
+    if bad_interval is None:
+        row.pop("interval")
+    else:
+        row["interval"] = bad_interval
+    _write_mm(env["mm"], [row])
+
+    alerts = alert_check._collect_lighter_mm_alerts(env["now"])
+
+    assert "lighter_mm_stale" in _keys(alerts)
+    body = next(item.body for item in alerts if item.key == "lighter_mm_stale")
+    assert "门槛 15 秒" in body
+
+
+def test_lighter_mm_far_future_timestamp_is_not_fresh(env):
+    """防止损坏的远未来时间戳让 age 为负，进而永久绕过做市心跳陈旧告警。"""
+    future = env["now"] + alert_check._HEDGE_FUTURE_TOLERANCE_S + 1
+    _write_mm(env["mm"], [_mm_row(future, interval=5.0)])
+
+    alerts = alert_check._collect_lighter_mm_alerts(env["now"])
+
+    assert "lighter_mm_stale" in _keys(alerts)
+
+
+@pytest.mark.parametrize("failure_count", [3, 4])
+def test_lighter_mm_three_or_more_consecutive_failures_fire(
+    env,
+    failure_count,
+):
+    """防止做市连续失败仍被活跃心跳伪装成健康，且告警轮数与事实不符。"""
+    rows = [
+        _mm_row(env["now"] - offset, success=False)
+        for offset in reversed(range(failure_count))
+    ]
+    _write_mm(env["mm"], rows)
+
+    alerts = alert_check._collect_lighter_mm_alerts(env["now"])
+
+    assert "lighter_mm_failures" in _keys(alerts)
+    body = next(item.body for item in alerts if item.key == "lighter_mm_failures")
+    assert f"连续失败 {failure_count} 轮" in body
+
+
+def test_lighter_mm_inventory_above_ninety_percent_fires(env):
+    """防止带符号库存只比较正值，导致接近上限的空头库存完全不告警。"""
+    _write_mm(
+        env["mm"],
+        [_mm_row(env["now"], inventory_usd=-451.0, max_inv=500.0)],
+    )
+
+    alerts = alert_check._collect_lighter_mm_alerts(env["now"])
+
+    assert "lighter_mm_inventory" in _keys(alerts)
+    alert = next(item for item in alerts if item.key == "lighter_mm_inventory")
+    assert "库存逼近上限" in alert.title
+    assert "$-451" in alert.body
+    assert "$500" in alert.body
+
+
+def test_lighter_mm_null_inventory_skips_only_inventory_check(env):
+    """防止 inventory_usd=null 被当成 0 或抛错，并吞掉同批连续失败告警。"""
+    rows = [
+        _mm_row(
+            env["now"] - offset,
+            success=False,
+            inventory_usd=None,
+        )
+        for offset in (2, 1, 0)
+    ]
+    _write_mm(env["mm"], rows)
+
+    alerts = alert_check._collect_lighter_mm_alerts(env["now"])
+
+    assert "lighter_mm_failures" in _keys(alerts)
+    assert "lighter_mm_inventory" not in _keys(alerts)
+
+
+def test_lighter_mm_inventory_at_exactly_ninety_percent_is_silent(env):
+    """防止把“超过 90%”错写成“大于等于”，在精确边界制造库存误报。"""
+    rows = [
+        _mm_row(
+            env["now"] - offset,
+            success=False,
+            inventory_usd=450.0,
+            max_inv=500.0,
+        )
+        for offset in (2, 1, 0)
+    ]
+    _write_mm(env["mm"], rows)
+
+    alerts = alert_check._collect_lighter_mm_alerts(env["now"])
+
+    assert "lighter_mm_failures" in _keys(alerts)
+    assert "lighter_mm_inventory" not in _keys(alerts)
 
 
 def test_lighter_hedge_stale_uses_three_intervals(env):

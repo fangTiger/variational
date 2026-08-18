@@ -28,6 +28,10 @@ ACTIONS: dict[str, str] = {
     "lighter_hedge_primary_read": "读不到 Lighter 账户，引擎已停止动仓以避免裸腿。检查网络或 API 状态",
     "lighter_hedge_margin": "Extended 对冲腿可用保证金不足。给该账户加钱，或减小两腿仓位",
     "lighter_hedge_invalid": "对冲心跳数据异常（字段缺失或时间戳错乱），机器人可能有 bug。告诉 Claude 排查",
+    "lighter_mm_missing": "做市心跳文件存在但没有有效记录，机器人可能启动异常。告诉 Claude 检查日志和进程",
+    "lighter_mm_stale": "做市机器人已经失联，现有挂单和库存可能无人管理。告诉 Claude 检查并重启",
+    "lighter_mm_failures": "做市循环连续失败，可能无法维护挂单。检查网络、API 凭据和错误日志",
+    "lighter_mm_inventory": "做市库存已接近配置上限。检查持仓与挂单，必要时减仓或暂停机器人",
     "attribution_gap": "归因账目对不上，这批收益数字不可信，不要用它做去留判断。告诉 Claude 复核",
     "verdict_stop": "4 周判据结论为停止。告诉 Claude 复核数据后再决定是否真的停",
 }
@@ -41,6 +45,9 @@ _CRITICAL = {
     "lighter_hedge_net_delta",
     "lighter_hedge_notional_cap",
     "lighter_hedge_margin",
+    "lighter_mm_missing",
+    "lighter_mm_stale",
+    "lighter_mm_failures",
 }
 
 _UNKNOWN = "未登记的告警类型，告诉 Claude 补充动作指引"

@@ -33,6 +33,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _LIVE = _ROOT / "data" / "grid_live.json"
 _MONITOR = _ROOT / "data" / "grid_monitor.jsonl"
 _HEDGE_MONITOR = _ROOT / "data" / "lighter_hedge.jsonl"
+_MM_MONITOR = _ROOT / "data" / "lighter_mm.jsonl"
 _ALERT_STATE = _ROOT / "data" / "alert_state.json"
 
 # 同一条告警的静默期：避免每轮调度都弹同样的通知把人训练成无视通知
@@ -54,6 +55,8 @@ _LEVERAGE_WARN = 3.0
 
 # Lighter 对冲默认每 30 秒一轮；实际心跳会携带 interval 并覆盖该兜底值。
 _HEDGE_DEFAULT_INTERVAL_S = 30.0
+# Lighter 做市旧心跳可能没有 interval；按需求以 5 秒作为陈旧门槛兜底。
+_MM_DEFAULT_INTERVAL_S = 5.0
 # alert-check 每 900 秒运行一次；保留两个调度周期，避免严重异常在检查前恢复后漏报。
 _HEDGE_EVENT_LOOKBACK_S = 30 * 60
 # 容忍轻微时钟漂移；更远的未来时间必须视为损坏，不能让 age<0 绕过 stale。
@@ -365,6 +368,83 @@ def _collect_lighter_hedge_alerts(now: float) -> list[Alert]:
     return alerts
 
 
+def _collect_lighter_mm_alerts(now: float) -> list[Alert]:
+    """从持久化心跳判断 Lighter 做市异常；未部署时保持沉默。"""
+    if not _MM_MONITOR.exists():
+        return []
+
+    rows = _read_recent_jsonl(_MM_MONITOR, limit=512)
+    if not rows:
+        return [
+            Alert(
+                "lighter_mm_missing",
+                "⛔ Lighter 做市心跳缺失",
+                "data/lighter_mm.jsonl 已存在但没有有效记录，机器人可能异常",
+            )
+        ]
+
+    alerts: list[Alert] = []
+    latest = rows[-1]
+    latest_ts = _finite_float(latest.get("ts"))
+    interval = _finite_float(latest.get("interval"))
+    if interval is None or interval <= 0:
+        interval = _MM_DEFAULT_INTERVAL_S
+    stale_after = 3 * interval
+    age = now - latest_ts if latest_ts is not None else now
+    timestamp_valid = (
+        latest_ts is not None
+        and latest_ts > 0
+        and latest_ts <= now + _HEDGE_FUTURE_TOLERANCE_S
+    )
+    if not timestamp_valid or age > stale_after:
+        visible_age = max(age, 0)
+        age_text = (
+            f"{visible_age:.0f} 秒"
+            if visible_age < 60
+            else _fmt_age(visible_age)
+        )
+        alerts.append(
+            Alert(
+                "lighter_mm_stale",
+                "⛔ Lighter 做市心跳陈旧",
+                f"已 {age_text} 没有更新（门槛 {stale_after:.0f} 秒），"
+                "机器人可能崩溃或卡死",
+            )
+        )
+
+    failure_count = 0
+    for row in reversed(rows):
+        if row.get("success") is not False:
+            break
+        failure_count += 1
+    if failure_count >= 3:
+        alerts.append(
+            Alert(
+                "lighter_mm_failures",
+                "⛔ Lighter 做市连续失败",
+                f"连续失败 {failure_count} 轮，机器人无法正常完成做市循环",
+            )
+        )
+
+    inventory_usd = _finite_float(latest.get("inventory_usd"))
+    max_inv = _finite_float(latest.get("max_inv"))
+    if (
+        inventory_usd is not None
+        and max_inv is not None
+        and max_inv > 0
+        and abs(inventory_usd) > max_inv * 0.9
+    ):
+        alerts.append(
+            Alert(
+                "lighter_mm_inventory",
+                "⚠️ Lighter 做市库存逼近上限",
+                f"当前库存 ${inventory_usd:.2f}，上限 ${max_inv:.2f}，"
+                "已超过上限的 90%",
+            )
+        )
+    return alerts
+
+
 def _bot_running() -> bool:
     """只认 launchd 里的 grid-bot 有真实 PID，避免匹配到同名的等待脚本。"""
     try:
@@ -468,6 +548,7 @@ def collect_alerts(now: float | None = None) -> list[Alert]:
             )
 
     alerts.extend(_collect_lighter_hedge_alerts(now))
+    alerts.extend(_collect_lighter_mm_alerts(now))
 
     # 4 周判据与恒等式残差（由 tools/pnl_attribution.py 每小时写入）。
     # 放在现有网格和 Lighter 检查之后，避免改变它们的判断路径。
