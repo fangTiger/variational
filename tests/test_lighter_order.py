@@ -10,12 +10,15 @@ False，导致 filter_grid_orders 把交易所端保护单当成普通网格单�
 
 from __future__ import annotations
 
+import inspect
+import re
 from decimal import Decimal
 
 import pytest
 
 from adapters.base import Side
 from adapters.lighter_order import LighterOrder
+from grid.grid_engine import GridEngine
 
 # 实测样例（api.rh.lighter.xyz /api/v1/accountInactiveOrders）
 REAL_ORDER = {
@@ -127,6 +130,46 @@ def test_filled_qty_comes_from_filled_base_amount_as_decimal() -> None:
 
     assert order.filled_qty == Decimal("0.02000")
     assert isinstance(order.filled_qty, Decimal)
+
+
+def test_average_price_uses_real_filled_amounts() -> None:
+    """防止真实成交已有基础量和报价量时均价仍为空，导致 ``fills.jsonl`` 永远不写。"""
+    order = LighterOrder.from_api(REAL_ORDER)
+
+    assert order.filled_quote_amount == Decimal("1893.58")
+    average_price = order.average_price
+    assert average_price is not None
+    assert average_price.quantize(Decimal("0.1")) == Decimal("64495.2")
+
+
+def test_average_price_is_none_when_filled_base_amount_is_zero() -> None:
+    """防止零成交基础量触发除零异常或返回会被引擎当成有效成交价的零。"""
+    order = LighterOrder.from_api(dict(REAL_ORDER, filled_base_amount="0"))
+
+    assert order.average_price is None
+
+
+def test_missing_filled_quote_amount_defaults_to_zero() -> None:
+    """防止旧 API 响应缺少报价成交额时构造订单失败或编造有效均价。"""
+    raw = dict(REAL_ORDER)
+    raw.pop("filled_quote_amount")
+
+    order = LighterOrder.from_api(raw)
+
+    assert order.filled_quote_amount == Decimal("0")
+    assert order.average_price is None
+
+
+def test_average_price_name_matches_engine_fill_price_contract() -> None:
+    """防止均价属性改名后引擎再次静默读不到，令成交日志永久为空。"""
+    order = LighterOrder.from_api(REAL_ORDER)
+    engine_source = inspect.getsource(GridEngine._handle_fills)
+    engine_fill_price_attributes = set(
+        re.findall(r'getattr\(o, "([^"]+)", None\)', engine_source)
+    )
+
+    assert hasattr(order, "average_price")
+    assert "average_price" in engine_fill_price_attributes
 
 
 def test_price_is_decimal_not_float() -> None:

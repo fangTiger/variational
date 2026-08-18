@@ -31,6 +31,16 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(alert_check, "_MM_MONITOR", mm, raising=False)
     monkeypatch.setattr(alert_check, "_ALERT_STATE", tmp_path / "alert_state.json")
     monkeypatch.setattr(alert_check, "_bot_running", lambda: True)
+    monkeypatch.setattr(
+        alert_check.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="-\t0\tcom.variational.lighter-hedge\n",
+            stderr="",
+        ),
+    )
     return {
         "live": live,
         "monitor": monitor,
@@ -459,6 +469,52 @@ def test_lighter_hedge_stale_uses_three_intervals(env):
     assert "90" in body
 
 
+def test_lighter_hedge_unloaded_launchd_job_is_silent(env, monkeypatch):
+    """防止有意卸载对冲任务后，缺失或陈旧心跳永久制造全部对冲误报。"""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="-\t0\tcom.variational.grid-bot\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(alert_check.subprocess, "run", fake_run)
+
+    alerts = alert_check._collect_lighter_hedge_alerts(env["now"])
+
+    assert calls == [["launchctl", "list"]]
+    assert not any(alert.key.startswith("lighter_hedge_") for alert in alerts)
+
+
+def test_lighter_hedge_loaded_with_stale_heartbeat_still_fires(env, monkeypatch):
+    """防止 launchd 任务已加载但暂无 PID 时被误判成有意停用，吞掉陈旧心跳告警。"""
+    _write_hedge(
+        env["hedge"],
+        [_hedge_row(env["now"] - 91, interval=30.0)],
+    )
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="-\t0\tcom.variational.lighter-hedge\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(alert_check.subprocess, "run", fake_run)
+
+    alerts = alert_check._collect_lighter_hedge_alerts(env["now"])
+
+    assert calls == [["launchctl", "list"]]
+    assert "lighter_hedge_stale" in _keys(alerts)
+
+
 def test_lighter_hedge_two_consecutive_net_delta_breaches_fire(env):
     """连续两轮 10% 净敞口超过 2% 阈值，必须告警。"""
     _write_live(env["live"], env["now"])
@@ -788,6 +844,23 @@ def test_notify_nonzero_exit_is_failure(monkeypatch):
     monkeypatch.setattr(alert_check.subprocess, "run", lambda *a, **kw: failed)
 
     assert alert_check.notify("标题", "内容") is False
+
+
+def test_notify_preserves_non_ascii_text_in_applescript(monkeypatch):
+    """防止中文标题和正文被转成 AppleScript 不识别的 ``\\uXXXX`` 而永远无法送达。"""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args=args, returncode=0)
+
+    monkeypatch.setattr(alert_check.subprocess, "run", fake_run)
+
+    assert alert_check.notify("风险告警", "库存异常") is True
+    script = calls[0][0][2]
+    assert "风险告警" in script
+    assert "库存异常" in script
+    assert "\\u" not in script
 
 
 def test_notification_failure_does_not_start_six_hour_cooldown(monkeypatch):

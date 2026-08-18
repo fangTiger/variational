@@ -61,11 +61,19 @@ class LighterOrder:
     price: Decimal
     qty: Decimal
     filled_qty: Decimal
+    filled_quote_amount: Decimal
     reduce_only: bool
     type: str
     trigger_price: Decimal
     created_at: int
     raw: dict[str, Any]
+
+    @property
+    def average_price(self) -> Decimal | None:
+        """按真实成交基础量与报价量计算均价；没有成交时不返回伪造零价。"""
+        if self.filled_qty == 0 or self.filled_quote_amount == 0:
+            return None
+        return self.filled_quote_amount / self.filled_qty
 
     @property
     def is_position_stop_loss(self) -> bool:
@@ -104,6 +112,7 @@ class LighterOrder:
             price=Decimal(str(_require(raw, "price"))),
             qty=Decimal(str(raw.get("initial_base_amount") or 0)),
             filled_qty=Decimal(str(raw.get("filled_base_amount") or 0)),
+            filled_quote_amount=Decimal(str(raw.get("filled_quote_amount") or 0)),
             reduce_only=bool(raw.get("reduce_only", False)),
             type=str(raw.get("type") or "").upper(),
             trigger_price=Decimal(str(raw.get("trigger_price") or 0)),

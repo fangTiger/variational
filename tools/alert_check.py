@@ -219,6 +219,9 @@ def _net_delta_status(row: dict) -> tuple[Decimal, Decimal, bool] | None:
 
 def _collect_lighter_hedge_alerts(now: float) -> list[Alert]:
     """从持久化快照判断 Lighter 对冲的五类严重异常。"""
+    if not _lighter_hedge_loaded():
+        return []
+
     rows = _read_recent_jsonl(_HEDGE_MONITOR, limit=512)
     if not rows:
         return [
@@ -460,6 +463,23 @@ def _bot_running() -> bool:
     return False
 
 
+def _lighter_hedge_loaded() -> bool:
+    """判断 Lighter 对冲 launchd 任务是否已加载；查询失败时保留原告警。"""
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=10
+        )
+    except Exception:  # noqa: BLE001
+        return True
+    if result.returncode != 0:
+        return True
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if fields and fields[-1] == "com.variational.lighter-hedge":
+            return True
+    return False
+
+
 def _fmt_age(seconds: float) -> str:
     if seconds < 3600:
         return f"{seconds / 60:.0f} 分钟"
@@ -621,8 +641,8 @@ def _save_cooldown(state: dict) -> None:
 def notify(title: str, body: str) -> bool:
     """弹 macOS 通知；返回是否真正发送成功，失败不抛错。"""
     script = (
-        f'display notification {json.dumps(body)} '
-        f'with title {json.dumps(title)} sound name "Basso"'
+        f'display notification {json.dumps(body, ensure_ascii=False)} '
+        f'with title {json.dumps(title, ensure_ascii=False)} sound name "Basso"'
     )
     try:
         result = subprocess.run(

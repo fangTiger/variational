@@ -32,6 +32,16 @@ def test_lighter_hedge_plist_is_safe_keepalive_service() -> None:
     ]
 
 
+def test_lighter_hedge_plist_enables_15_second_maker_first_execution() -> None:
+    """实盘对冲必须先被动挂单 15 秒，再按剩余量吃单补齐。"""
+    with PLIST.open("rb") as stream:
+        config = plistlib.load(stream)
+
+    arguments = config["ProgramArguments"]
+    option_index = arguments.index("--maker-first-timeout")
+    assert arguments[option_index + 1] == "15"
+
+
 def test_readme_documents_lighter_hedge_service_and_install_source() -> None:
     """README 必须说明服务入口及从仓库 plist 人工安装。"""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
