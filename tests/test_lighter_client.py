@@ -620,6 +620,72 @@ class _FakeSigner:
             return None, None, self._err
         return object(), _FakeSendTx(self._response_code, "交易所拒单"), None
 
+    async def create_sl_order(
+        self,
+        market_index,
+        client_order_index,
+        base_amount,
+        trigger_price,
+        price,
+        is_ask,
+        reduce_only=False,
+        *,
+        integrator_account_index: int = 0,
+        integrator_taker_fee: int = 0,
+        integrator_maker_fee: int = 0,
+        skip_nonce: int = 0,
+        nonce: int = -1,
+        api_key_index: int = 255,
+    ):
+        del (
+            integrator_account_index,
+            integrator_taker_fee,
+            integrator_maker_fee,
+            skip_nonce,
+            nonce,
+        )
+        self.calls.append(
+            (
+                "create_sl_order",
+                {
+                    "market_index": market_index,
+                    "client_order_index": client_order_index,
+                    "base_amount": base_amount,
+                    "trigger_price": trigger_price,
+                    "price": price,
+                    "is_ask": is_ask,
+                    "reduce_only": reduce_only,
+                    "api_key_index": api_key_index,
+                },
+            )
+        )
+        if self._err is not None:
+            return None, None, self._err
+        return object(), _FakeSendTx(self._response_code, "交易所拒单"), None
+
+    async def cancel_order(
+        self,
+        market_index,
+        order_index,
+        skip_nonce: int = 0,
+        nonce: int = -1,
+        api_key_index: int = 255,
+    ):
+        del skip_nonce, nonce
+        self.calls.append(
+            (
+                "cancel_order",
+                {
+                    "market_index": market_index,
+                    "order_index": order_index,
+                    "api_key_index": api_key_index,
+                },
+            )
+        )
+        if self._err is not None:
+            return None, None, self._err
+        return object(), _FakeSendTx(self._response_code, "交易所拒单"), None
+
     async def cancel_all_orders(
         self,
         time_in_force,
@@ -672,6 +738,8 @@ class _FakeSigner:
     [
         "create_order",
         "create_market_order",
+        "create_sl_order",
+        "cancel_order",
         "cancel_all_orders",
         "create_auth_token_with_expiry",
     ],
@@ -696,6 +764,7 @@ def _trading_client(
     signer=None,
     orders=None,
     positions=None,
+    history=None,
     *,
     api_key_index: int = 255,
 ) -> LighterClient:
@@ -714,6 +783,7 @@ def _trading_client(
                             "supported_size_decimals": 5,
                             "supported_price_decimals": 1,
                             "min_base_amount": "0.00020",
+                            "min_quote_amount": "10.000000",
                         }
                     ],
                 },
@@ -734,6 +804,12 @@ def _trading_client(
                 "market_id": "1",
             }
             return httpx.Response(200, json={"code": 200, "orders": orders or []})
+        if request.url.path == "/api/v1/accountInactiveOrders":
+            assert request.headers["Authorization"] == "auth-token"
+            return httpx.Response(
+                200,
+                json={"code": 200, "orders": history or [], "next_cursor": ""},
+            )
         raise AssertionError(f"测试未声明的 HTTP 请求：{request.url}")
 
     client = LighterClient(
@@ -834,8 +910,12 @@ def test_limit_order_non_success_response_code_raises(tmp_path) -> None:
         )
 
 
-def test_limit_order_returns_unresolved_order_ref(tmp_path) -> None:
-    """第一期不解析 order_index，返回值明确携带 id=None。"""
+def test_limit_order_returns_client_order_index_as_id(tmp_path) -> None:
+    """id 必须是自己分配的 client_order_index，且不得为 None。
+
+    引擎在返回值缺 id 时判定挂单失败并原格重挂（grid_engine.py:1770），
+    而订单其实已挂在交易所上。
+    """
     signer = _FakeSigner()
     client = _trading_client(tmp_path, signer)
 
@@ -847,7 +927,7 @@ def test_limit_order_returns_unresolved_order_ref(tmp_path) -> None:
     )
 
     assert isinstance(ref, OrderRef)
-    assert ref.id is None
+    assert ref.id == 1
     assert ref.client_order_index == 1
     assert not hasattr(_FakeSendTx(), "order_index")
 
@@ -897,7 +977,13 @@ def test_transaction_calls_leave_nonce_management_to_sdk(tmp_path) -> None:
         assert "nonce" not in method.await_args.kwargs
 
 
-def test_cancel_all_orders_passes_market_and_timestamp(tmp_path) -> None:
+def test_cancel_all_orders_uses_nil_timestamp_for_ioc(tmp_path) -> None:
+    """IOC 模式下 CancelAllTime 必须为 nil，否则交易所整体撤单必失败。
+
+    实盘验证：传非零 timestamp_ms 时交易所返回
+    「CancelAllTime should be nil」，传 0 才返回 code=200。
+    timestamp_ms 只在 SCHEDULED 模式下有意义。
+    """
     signer = _FakeSigner()
     client = _trading_client(tmp_path, signer)
 
@@ -906,17 +992,53 @@ def test_cancel_all_orders_passes_market_and_timestamp(tmp_path) -> None:
     name, kwargs = signer.calls[0]
     assert name == "cancel_all_orders"
     assert kwargs["cancel_all_market_index"] == 1
-    assert kwargs["time_in_force"] == 0
-    assert isinstance(kwargs["timestamp_ms"], int)
-    assert kwargs["timestamp_ms"] > 0
+    assert kwargs["time_in_force"] == signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+    assert kwargs["timestamp_ms"] == 0
 
 
-def test_enabled_single_cancel_remains_second_phase_feature(tmp_path) -> None:
-    """第一期只支持整体撤单，不得悄悄接回单笔订单号依赖链。"""
-    client = _trading_client(tmp_path)
+def test_require_signer_prepares_ssl_cert(tmp_path, monkeypatch) -> None:
+    """构造签名器前必须先兜底 CA 证书，否则所有写操作会 SSL 失败。
 
-    with pytest.raises(NotImplementedError, match="第二期"):
-        _run_and_close(client, client.cancel_order("BTC", 12345))
+    Lighter SDK 内部用 aiohttp 提交交易，读路径的 httpx 自带 certifi
+    不受影响，因此缺证书只会打挂写操作——症状与地域封锁难以区分。
+    入口文件各自调用 ensure_ssl_cert() 不可靠，新入口一旦遗漏就复发，
+    故由适配器自身保证。
+    """
+    called: list[bool] = []
+    monkeypatch.setattr(
+        "adapters.lighter_client.ensure_ssl_cert",
+        lambda: called.append(True),
+    )
+    client = _trading_client(tmp_path, _FakeSigner())
+    client._signer = None  # 强制走真实的懒加载分支
+
+    import lighter
+
+    monkeypatch.setattr(lighter, "SignerClient", lambda **kwargs: _FakeSigner())
+    client._require_signer()
+
+    assert called == [True]
+
+
+def test_single_cancel_accepts_string_client_index(tmp_path) -> None:
+    """引擎可能把 id 存成字符串（如经 JSON 状态文件回环）。
+
+    匹配前必须归一成整数，否则字符串与整数比不相等，
+    每次撤单都会静默走"已不在挂单簿上"分支，订单永远撤不掉。
+    """
+    signer = _FakeSigner()
+    client = _trading_client(
+        tmp_path,
+        signer,
+        orders=[_raw_order(order_index=844424907205585, client_order_index=42)],
+    )
+
+    _run_and_close(client, client.cancel_order("BTC", "42"))
+
+    calls = [c for c in signer.calls if c[0] == "cancel_order"]
+    assert len(calls) == 1
+    assert calls[0][1]["order_index"] == 844424907205585
+    assert isinstance(calls[0][1]["order_index"], int)
 
 
 def test_enabled_close_position_uses_reduce_only_market_order(tmp_path) -> None:
@@ -969,12 +1091,343 @@ def test_market_order_applies_directional_ioc_price_limit(
     assert kwargs["reduce_only"] is True
 
 
-def test_get_open_orders_uses_auth_and_returns_list(tmp_path) -> None:
-    orders = [{"client_order_index": 1, "order_index": 900, "status": "open"}]
+def _raw_order(**overrides) -> dict:
+    """实测形状的 Lighter 订单，可局部覆盖。"""
+    base = {
+        "order_index": 900,
+        "client_order_index": 1,
+        "status": "open",
+        "price": "64000.0",
+        "is_ask": False,
+        "initial_base_amount": "0.00300",
+        "filled_base_amount": "0.00000",
+        "reduce_only": False,
+        "type": "limit",
+        "side": "",
+        "created_at": 1787052005,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_get_open_orders_returns_engine_readable_views(tmp_path) -> None:
+    """必须返回属性视图而非裸 dict。
+
+    引擎与 filter_grid_orders 全部走 getattr；裸 dict 会让 reduce_only
+    恒取默认值 False，把交易所端保护单当成普通网格单撤掉。
+    """
     signer = _FakeSigner()
-    client = _trading_client(tmp_path, signer, orders=orders)
+    client = _trading_client(
+        tmp_path, signer, orders=[_raw_order(reduce_only=True, is_ask=True)]
+    )
 
     got = _run_and_close(client, client.get_open_orders("BTC"))
 
-    assert got == orders
+    assert len(got) == 1
+    assert got[0].id == 1  # client_order_index，引擎侧身份
+    assert got[0].order_index == 900  # 交易所侧，仅撤单签名用
+    assert got[0].reduce_only is True
+    assert got[0].side == Side.SELL.value
     assert signer.calls[0][0] == "create_auth_token_with_expiry"
+
+
+def test_get_orders_history_reads_inactive_orders(tmp_path) -> None:
+    """历史订单走 accountInactiveOrders，供引擎判终态。"""
+    client = _trading_client(
+        tmp_path,
+        _FakeSigner(),
+        history=[_raw_order(status="filled", filled_base_amount="0.00300")],
+    )
+
+    got = _run_and_close(client, client.get_orders_history("BTC", limit=10))
+
+    assert len(got) == 1
+    assert got[0].status == "FILLED"
+    assert got[0].filled_qty == Decimal("0.00300")
+
+
+def test_cancel_order_resolves_client_index_to_exchange_index(tmp_path) -> None:
+    """引擎传的是 client_order_index，签名要的是 order_index。
+
+    两者不是一回事，直接把 client_order_index 交给 SDK 会撤到别人的单
+    或签名失败。
+    """
+    signer = _FakeSigner()
+    client = _trading_client(
+        tmp_path,
+        signer,
+        orders=[
+            _raw_order(order_index=844424907205585, client_order_index=42),
+            _raw_order(order_index=999999999999999, client_order_index=43),
+        ],
+    )
+
+    _run_and_close(client, client.cancel_order("BTC", 42))
+
+    calls = [c for c in signer.calls if c[0] == "cancel_order"]
+    assert len(calls) == 1
+    assert calls[0][1]["market_index"] == 1
+    assert calls[0][1]["order_index"] == 844424907205585
+    assert isinstance(calls[0][1]["order_index"], int)
+
+
+def test_cancel_order_of_vanished_order_is_a_noop(tmp_path) -> None:
+    """撤一个已不在挂单簿上的单必须当成功。
+
+    引擎撤单失败时保留记录下轮重试（grid_engine.py:1809）；
+    若这里抛错，已成交的订单会被无限重试撤单，形成活锁。
+    """
+    signer = _FakeSigner()
+    client = _trading_client(tmp_path, signer, orders=[])
+
+    _run_and_close(client, client.cancel_order("BTC", 42))
+
+    assert [c for c in signer.calls if c[0] == "cancel_order"] == []
+
+
+def test_cancel_grid_orders_spares_protective_orders(tmp_path) -> None:
+    """只撤普通网格单，reduce_only 与条件单必须留下。
+
+    撤错会让整仓止损消失，网格在急跌里失去最后一道保护。
+    """
+    signer = _FakeSigner()
+    client = _trading_client(
+        tmp_path,
+        signer,
+        orders=[
+            _raw_order(order_index=901, reduce_only=False, type="limit"),
+            _raw_order(order_index=902, reduce_only=True, type="limit"),
+            _raw_order(order_index=903, reduce_only=False, type="tpsl"),
+        ],
+    )
+
+    count = _run_and_close(client, client.cancel_grid_orders("BTC"))
+
+    cancelled = [c[1]["order_index"] for c in signer.calls if c[0] == "cancel_order"]
+    assert cancelled == [901]
+    assert count == 1
+
+
+def test_limit_order_below_min_quote_amount_rejected_locally(tmp_path) -> None:
+    """名义额低于 min_quote_amount 必须本地拦下，不能发给交易所。
+
+    实盘验证：Lighter 除最小数量 0.00020 BTC 外还有最小名义额 $10，
+    低于门槛返回 code=21706 'invalid order base or quote amount'。
+    若不本地拦截，配置里每格金额切得过小时网格会"看起来在跑"却每笔
+    都被拒，且错误码不说明是哪个门槛，极难定位。
+    """
+    signer = _FakeSigner()
+    client = _trading_client(tmp_path, signer)
+
+    # 0.00020 BTC × 44000 = $8.8 < $10
+    with pytest.raises(ValueError, match="最小名义额"):
+        _run_and_close(
+            client,
+            client.place_limit_order(
+                "BTC", Side.BUY, Decimal("0.00020"), Decimal("44000")
+            ),
+        )
+
+    assert [c for c in signer.calls if c[0] == "create_order"] == []
+
+
+def test_limit_order_at_min_quote_amount_is_accepted(tmp_path) -> None:
+    """刚好达到门槛必须放行，不能把边界值一并拒掉。"""
+    signer = _FakeSigner()
+    client = _trading_client(tmp_path, signer)
+
+    # 0.00020 BTC × 50000 = $10.00
+    _run_and_close(
+        client,
+        client.place_limit_order(
+            "BTC", Side.BUY, Decimal("0.00020"), Decimal("50000")
+        ),
+    )
+
+    assert [c for c in signer.calls if c[0] == "create_order"]
+
+
+def test_place_limit_order_returns_usable_id_synchronously(tmp_path) -> None:
+    """挂单必须同步返回可用订单号。
+
+    Lighter 下单响应只有 tx_hash，若返回 id=None，引擎会判定挂单失败
+    并原格重挂（grid_engine.py:1770），而订单其实已挂在交易所上——
+    形成孤儿单加重复挂单。故返回自己分配的 client_order_index。
+    """
+    signer = _FakeSigner()
+    client = _trading_client(tmp_path, signer)
+
+    ref = _run_and_close(
+        client,
+        client.place_limit_order("BTC", Side.BUY, Decimal("0.001"), Decimal("60000")),
+    )
+
+    assert ref.id is not None
+    assert ref.id == ref.client_order_index
+    name, kwargs = signer.calls[0]
+    assert name == "create_order"
+    assert kwargs["client_order_index"] == ref.id
+
+
+def _sl_order(**overrides) -> dict:
+    """reduce-only 且带触发价的整仓止损单。"""
+    fields = {
+        "order_index": 7001,
+        "client_order_index": 70,
+        "reduce_only": True,
+        "trigger_price": "61000.0",
+        "is_ask": True,
+        "type": "stop-loss",
+    }
+    fields.update(overrides)
+    return _raw_order(**fields)
+
+
+def test_position_stop_loss_rejects_flat_and_bad_trigger(tmp_path) -> None:
+    """空仓或非法触发价必须本地拒绝，与 Extended 侧语义一致。"""
+    client = _trading_client(tmp_path, _FakeSigner())
+
+    with pytest.raises(ValueError, match="空仓"):
+        _run_and_close(
+            client,
+            client.place_position_stop_loss("BTC", Decimal("0"), Decimal("61000")),
+        )
+
+    client = _trading_client(tmp_path, _FakeSigner())
+    with pytest.raises(ValueError, match="触发价"):
+        _run_and_close(
+            client,
+            client.place_position_stop_loss("BTC", Decimal("0.01"), Decimal("0")),
+        )
+
+
+@pytest.mark.parametrize(
+    ("signed_size", "expect_is_ask"),
+    [(Decimal("0.01"), True), (Decimal("-0.01"), False)],
+)
+def test_position_stop_loss_closes_in_correct_direction(
+    tmp_path, signed_size: Decimal, expect_is_ask: bool
+) -> None:
+    """多仓止损必须是卖出、空仓止损必须是买入。
+
+    方向反了，止损单会在触发时加倍放大敞口而不是平仓。
+    """
+    signer = _FakeSigner()
+    client = _trading_client(tmp_path, signer)
+
+    _run_and_close(
+        client,
+        client.place_position_stop_loss("BTC", signed_size, Decimal("61000")),
+    )
+
+    call = [c for c in signer.calls if c[0] == "create_sl_order"][0][1]
+    assert call["is_ask"] is expect_is_ask
+    assert call["reduce_only"] is True
+    assert call["base_amount"] == 1000  # abs(0.01) → 5 位精度
+
+
+def test_position_stop_loss_prices_allow_ioc_execution(tmp_path) -> None:
+    """止损是 IOC 单，限价必须留出滑点空间朝平仓方向偏。
+
+    平多（卖出）时限价高于触发价就永远吃不到，止损形同虚设。
+    """
+    signer = _FakeSigner()
+    client = _trading_client(tmp_path, signer)
+
+    _run_and_close(
+        client,
+        client.place_position_stop_loss("BTC", Decimal("0.01"), Decimal("61000")),
+    )
+
+    call = [c for c in signer.calls if c[0] == "create_sl_order"][0][1]
+    assert call["trigger_price"] == 610000  # 1 位精度
+    assert call["price"] < call["trigger_price"]
+
+
+def test_position_stop_loss_replaces_instead_of_accumulating(tmp_path) -> None:
+    """重挂前必须撤掉旧止损单。
+
+    Extended 的整仓 TPSL 是单例，重挂即替换；Lighter 的 create_sl_order
+    每次新建一张。而引擎在持仓变化时就会重挂（grid_engine.py:519），
+    网格每笔成交都改变持仓——不撤旧单会累积出成百上千张陈旧止损单，
+    触发时一起打出去，把平仓变成反向开仓。
+    """
+    signer = _FakeSigner()
+    client = _trading_client(tmp_path, signer, orders=[_sl_order()])
+
+    _run_and_close(
+        client,
+        client.place_position_stop_loss("BTC", Decimal("0.01"), Decimal("61000")),
+    )
+
+    names = [c[0] for c in signer.calls]
+    assert names.index("cancel_order") < names.index("create_sl_order")
+    cancelled = [c[1]["order_index"] for c in signer.calls if c[0] == "cancel_order"]
+    assert cancelled == [7001]
+
+
+def test_cancel_tpsl_spares_ordinary_grid_orders(tmp_path) -> None:
+    """只撤整仓止损，普通网格单必须留下。"""
+    signer = _FakeSigner()
+    client = _trading_client(
+        tmp_path,
+        signer,
+        orders=[_raw_order(order_index=801), _sl_order(order_index=802)],
+    )
+
+    _run_and_close(client, client.cancel_tpsl("BTC"))
+
+    cancelled = [c[1]["order_index"] for c in signer.calls if c[0] == "cancel_order"]
+    assert cancelled == [802]
+
+
+def test_get_position_tpsl_exposes_trigger_price(tmp_path) -> None:
+    """引擎读 .trigger_price 来校验交易所侧止损是否还在（grid_engine.py:537）。"""
+    client = _trading_client(
+        tmp_path, _FakeSigner(), orders=[_raw_order(order_index=801), _sl_order()]
+    )
+
+    got = _run_and_close(client, client.get_position_tpsl("BTC"))
+
+    assert got is not None
+    assert got.trigger_price == Decimal("61000.0")
+
+
+def test_get_position_tpsl_returns_none_when_absent(tmp_path) -> None:
+    """没有止损单时返回 None，不能把普通网格单误判成止损。"""
+    client = _trading_client(tmp_path, _FakeSigner(), orders=[_raw_order()])
+
+    assert _run_and_close(client, client.get_position_tpsl("BTC")) is None
+
+
+def test_round_price_aligns_to_market_tick(tmp_path) -> None:
+    """必须按市场精度对齐价格。
+
+    引擎在翻单重试对账时用 round_price 把目标价与交易所返回价对齐比较
+    （grid_engine.py:1131）。基类默认原样返回，比较必然失配，引擎会
+    误判自己的单不存在而重复挂单。
+    """
+    client = _trading_client(tmp_path, _FakeSigner())
+
+    got = _run_and_close(client, client.round_price("BTC", Decimal("64123.456")))
+
+    assert got == Decimal("64123.5")  # supported_price_decimals=1
+
+
+def test_round_amount_aligns_to_market_step(tmp_path) -> None:
+    """数量同理，按 supported_size_decimals 对齐。"""
+    client = _trading_client(tmp_path, _FakeSigner())
+
+    got = _run_and_close(client, client.round_amount("BTC", Decimal("0.0012345678")))
+
+    assert got == Decimal("0.00123")  # supported_size_decimals=5
+
+
+def test_price_tick_size_from_market_meta(tmp_path) -> None:
+    """引擎用 tick/2 作为整仓 TPSL 触发价的比对容差（grid_engine.py:549）。
+
+    返回 None 会让容差退化，止损单被反复判定为"和交易所不一致"而重挂。
+    """
+    client = _trading_client(tmp_path, _FakeSigner())
+
+    assert _run_and_close(client, client.get_price_tick_size("BTC")) == Decimal("0.1")

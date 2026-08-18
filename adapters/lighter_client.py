@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -15,8 +14,13 @@ from typing import Any
 import httpx
 
 from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
+from adapters.lighter_order import LighterOrder, filter_grid_orders
 from adapters.lighter_scale import to_base_amount, to_price
 from adapters.order_ref import ClientOrderIndexAllocator, OrderRef
+from infra.logger import get_logger
+from infra.runtime import ensure_ssl_cert
+
+logger = get_logger("lighter_client")
 
 BASE_URL = "https://api.rh.lighter.xyz"
 DEFAULT_TIMEOUT = 10.0
@@ -251,16 +255,47 @@ class LighterClient(ExchangeAdapter):
                     min_base_amount,
                     size_decimals,
                 ),
+                # 最小名义额，与最小数量是两道独立门槛
+                "min_quote_amount": Decimal(str(book["min_quote_amount"])),
             }
             self._market_meta[symbol] = meta
             return meta
         raise KeyError(f"Lighter 没有标的 {market}")
 
+    @staticmethod
+    def _require_min_quote(
+        meta: dict[str, Any],
+        price: Decimal,
+        amount: Decimal,
+    ) -> None:
+        """校验名义额门槛。
+
+        Lighter 有两道独立门槛：最小数量 `min_base_amount` 与最小名义额
+        `min_quote_amount`。只满足前者仍会被交易所以
+        `code=21706 invalid order base or quote amount` 拒绝，而该错误码
+        不指明是哪一道，配置切得过小时网格会"看起来在跑"却每笔都被拒。
+        """
+        minimum = meta.get("min_quote_amount")
+        if minimum is None:
+            return
+        notional = Decimal(str(price)) * Decimal(str(amount))
+        if notional < Decimal(str(minimum)):
+            raise ValueError(
+                f"Lighter 订单名义额 {notional} 低于最小名义额 {minimum}"
+                f"（价格 {price} × 数量 {amount}）"
+            )
+
     def _require_signer(self):
-        """懒加载锁定版本的 SDK 签名器。"""
+        """懒加载锁定版本的 SDK 签名器。
+
+        SDK 内部用 aiohttp 提交交易，会读系统 CA 库；macOS 上该库常为空，
+        导致写操作 SSL 校验失败而读操作（httpx 自带 certifi）照常。
+        入口文件各自调用 ensure_ssl_cert() 不可靠，故在此兜底。
+        """
         if self._signer is None:
             if not self._api_private_key:
                 raise RuntimeError("Lighter 鉴权操作需要 api_private_key")
+            ensure_ssl_cert()
             import lighter
 
             self._signer = lighter.SignerClient(
@@ -300,8 +335,13 @@ class LighterClient(ExchangeAdapter):
             raise RuntimeError("Lighter 生成鉴权 token 失败：返回空 token")
         return {"Authorization": str(token)}
 
-    async def get_open_orders(self, market: str) -> list[dict[str, Any]]:
-        """查询指定市场的活动订单；该接口即使只读也要求 SDK 鉴权。"""
+    async def get_open_orders(self, market: str) -> list[LighterOrder]:
+        """查询指定市场的活动订单；该接口即使只读也要求 SDK 鉴权。
+
+        返回属性视图而非裸 dict：引擎与 `filter_grid_orders` 全部走 getattr，
+        裸 dict 会让 `reduce_only` 恒取默认值 False，把交易所端保护单
+        当成普通网格单撤掉。
+        """
         meta = await self._load_market_meta(market)
         data = await self._get_json(
             "/api/v1/accountActiveOrders",
@@ -315,7 +355,44 @@ class LighterClient(ExchangeAdapter):
         orders = data.get("orders")
         if not isinstance(orders, list):
             raise ValueError("Lighter 活动订单响应缺少 orders 数组")
-        return self._validate_dict_items(orders, context="orders")
+        return LighterOrder.from_api_list(
+            self._validate_dict_items(orders, context="orders"),
+            context="活动订单",
+        )
+
+    async def get_orders_history(
+        self,
+        market: str,
+        limit: int = 100,
+        *,
+        order_type: str | None = None,
+        sort: str | None = None,
+    ) -> list[LighterOrder]:
+        """查询历史（非活动）订单，供引擎判定成交 vs 过期/被撤。
+
+        Lighter 的 `accountInactiveOrders` 不支持按类型过滤或指定排序，
+        接口保留 `order_type` / `sort` 仅为与统一适配器契约兼容；
+        过滤由调用方自行完成。
+        """
+        del order_type, sort
+        meta = await self._load_market_meta(market)
+        data = await self._get_json(
+            "/api/v1/accountInactiveOrders",
+            params={
+                "account_index": str(self._require_account_index()),
+                "market_id": str(meta["market_id"]),
+                "limit": str(limit),
+            },
+            headers=self._auth_headers(),
+        )
+        self._raise_api_error(data, context="历史订单查询")
+        orders = data.get("orders")
+        if not isinstance(orders, list):
+            raise ValueError("Lighter 历史订单响应缺少 orders 数组")
+        return LighterOrder.from_api_list(
+            self._validate_dict_items(orders, context="orders"),
+            context="历史订单",
+        )
 
     async def market_order(
         self,
@@ -331,6 +408,7 @@ class LighterClient(ExchangeAdapter):
         signer = self._require_signer()
         client_order_index = self._coi.next()
         mark_price = (await self.get_market_price(market)).mid
+        self._require_min_quote(meta, mark_price, amount)
         price_multiplier = (
             Decimal(1) - DEFAULT_MARKET_ORDER_SLIPPAGE
             if side is Side.SELL
@@ -364,13 +442,18 @@ class LighterClient(ExchangeAdapter):
         post_only: bool = True,
         reduce_only: bool = False,
     ):
-        """挂限价单并返回客户端订单引用。
+        """挂限价单并返回订单引用。
 
-        单笔撤单能力在第二期补齐；当前不解析交易所 order_index，
-        只支持按市场整体撤单，因此返回的 OrderRef.id 固定为 None。
+        `OrderRef.id` 是 `client_order_index`，不是交易所的 `order_index`。
+        Lighter 的下单响应只含 tx_hash，`order_index` 要事后查询才有；
+        而引擎在返回值缺 id 时会判定挂单失败并原格重挂
+        （`grid_engine.py:1770`），留下挂在交易所却不被跟踪的孤儿单。
+        `client_order_index` 由本地分配、下单当场即有，故用作统一身份，
+        由 `cancel_order` 在撤单时转换回 `order_index`。
         """
         self._require_trading()
         meta = await self._load_market_meta(market)
+        self._require_min_quote(meta, price, amount)
         signer = self._require_signer()
         client_order_index = self._coi.next()
         _tx, _response, err = await signer.create_order(
@@ -392,26 +475,179 @@ class LighterClient(ExchangeAdapter):
             reduce_only=reduce_only,
         )
         self._validate_tx_response(_response, err, context="挂限价单")
-        return OrderRef(id=None, client_order_index=client_order_index)
+        return OrderRef(
+            id=client_order_index,
+            client_order_index=client_order_index,
+        )
 
     async def cancel_order(self, market: str, order_id) -> None:
-        """单笔撤单第二期实现；当前一期只支持按市场整体撤单。"""
+        """撤单。`order_id` 是 `client_order_index`（引擎侧身份）。
+
+        签名需要交易所侧的 `order_index`，两者不是一回事，因此先查活动
+        订单做一次转换。若该单已不在挂单簿上（成交或已撤），视为成功：
+        引擎撤单失败时会保留记录下轮重试（`grid_engine.py:1809`），
+        在这里抛错会让已成交的订单被无限重试撤单，形成活锁。
+        """
         self._require_trading()
-        del market, order_id
-        raise NotImplementedError("单笔撤单能力将在第二期补齐，当前只支持整体撤单")
+        meta = await self._load_market_meta(market)
+        target = int(order_id)
+        for order in await self.get_open_orders(market):
+            if order.id == target:
+                await self._cancel_by_order_index(meta["market_id"], order.order_index)
+                return
+        logger.warning(
+            "Lighter 撤单跳过：client_order_index=%s 已不在挂单簿上", target
+        )
+
+    async def _cancel_by_order_index(self, market_id: int, order_index: int) -> None:
+        """按交易所 order_index 撤单。"""
+        signer = self._require_signer()
+        _tx, response, err = await signer.cancel_order(
+            market_index=market_id,
+            order_index=int(order_index),
+        )
+        self._validate_tx_response(response, err, context="撤单")
+
+    async def cancel_grid_orders(self, market: str) -> int:
+        """逐单撤掉普通网格单，保留 reduce-only 与条件单。
+
+        直接用已查到的 `order_index`，不再走 `cancel_order` 的二次查询。
+        """
+        self._require_trading()
+        meta = await self._load_market_meta(market)
+        orders = filter_grid_orders(await self.get_open_orders(market))
+        for order in orders:
+            await self._cancel_by_order_index(meta["market_id"], order.order_index)
+        return len(orders)
 
     async def cancel_all_orders(self, market: str):
-        """撤销指定市场的全部活动订单，不依赖单笔订单号。"""
+        """撤销指定市场的全部活动订单，不依赖单笔订单号。
+
+        IOC 模式下 CancelAllTime 必须为 nil，传非零时间戳会被交易所以
+        「CancelAllTime should be nil」拒绝；timestamp_ms 只服务于
+        SCHEDULED 模式的定时撤单。
+        """
         self._require_trading()
         meta = await self._load_market_meta(market)
         signer = self._require_signer()
         _tx, response, err = await signer.cancel_all_orders(
             time_in_force=signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-            timestamp_ms=int(time.time() * 1000),
+            timestamp_ms=0,
             cancel_all_market_index=meta["market_id"],
         )
         self._validate_tx_response(response, err, context="整体撤单")
         return response
+
+    async def get_mark_price(self, market: str) -> Decimal:
+        """标记价。
+
+        Lighter 的 `get_market_price` 本就用订单簿详情里的 `mark_price`
+        填充买卖两边，因此中值即标记价。显式覆盖是为了让这一等价关系
+        可见——Extended 那边中值与标记价并不相等。
+        """
+        return (await self.get_market_price(market)).mid
+
+    async def round_price(self, market: str, price: Decimal) -> Decimal:
+        """按市场价格精度对齐。
+
+        引擎在翻单重试对账时用它把目标价与交易所返回价对齐比较
+        （`grid_engine.py:1131`）。若沿用基类的原样返回，比较必然失配，
+        引擎会误判自己的单不存在而重复挂单。
+        """
+        meta = await self._load_market_meta(market)
+        return self._quantize(price, meta["price_decimals"])
+
+    async def round_amount(self, market: str, amount: Decimal) -> Decimal:
+        """按市场数量步长对齐，理由同 `round_price`。"""
+        meta = await self._load_market_meta(market)
+        return self._quantize(amount, meta["size_decimals"])
+
+    async def get_price_tick_size(self, market: str) -> Decimal:
+        """返回价格最小变动单位。
+
+        引擎用 tick/2 作为整仓止损触发价的比对容差
+        （`grid_engine.py:549`）；返回 None 会让容差退化，
+        止损单被反复判定为"与交易所不一致"而重挂。
+        """
+        meta = await self._load_market_meta(market)
+        return Decimal(1).scaleb(-int(meta["price_decimals"]))
+
+    @staticmethod
+    def _quantize(value: Decimal, decimals: int) -> Decimal:
+        """按小数位数量化，采用四舍五入。"""
+        return Decimal(str(value)).quantize(Decimal(1).scaleb(-int(decimals)))
+
+    async def place_position_stop_loss(
+        self,
+        market: str,
+        signed_size: Decimal,
+        trigger_price: Decimal,
+    ):
+        """为当前整仓挂 reduce-only 止损，多仓平多、空仓平空。
+
+        **与 Extended 的关键差异：先撤旧单再挂新单。**
+        Extended 的整仓 TPSL 是单例，重挂即替换；Lighter 的 `create_sl_order`
+        每次新建一张。而引擎在持仓变化时就会重挂（`grid_engine.py:519`），
+        网格每笔成交都改变持仓——不撤旧单会累积出成百上千张陈旧止损单，
+        触发时一起打出去，把平仓变成反向开仓。
+
+        止损单是 IOC，限价须朝平仓方向留出滑点空间，否则永远吃不到，
+        止损形同虚设。
+        """
+        signed_size = Decimal(str(signed_size))
+        trigger_price = Decimal(str(trigger_price))
+        if signed_size == 0:
+            raise ValueError("空仓不能挂整仓止损")
+        if trigger_price <= 0:
+            raise ValueError("止损触发价必须大于 0")
+
+        self._require_trading()
+        meta = await self._load_market_meta(market)
+
+        # 必须先撤旧单，理由见 docstring
+        await self.cancel_tpsl(market)
+
+        is_ask = signed_size > 0  # 多仓靠卖出平掉
+        slippage = (
+            Decimal(1) - DEFAULT_MARKET_ORDER_SLIPPAGE
+            if is_ask
+            else Decimal(1) + DEFAULT_MARKET_ORDER_SLIPPAGE
+        )
+        signer = self._require_signer()
+        _tx, response, err = await signer.create_sl_order(
+            market_index=meta["market_id"],
+            client_order_index=self._coi.next(),
+            base_amount=to_base_amount(
+                abs(signed_size),
+                meta["size_decimals"],
+                min_base_units=meta["min_base_units"],
+            ),
+            trigger_price=to_price(trigger_price, meta["price_decimals"]),
+            price=to_price(trigger_price * slippage, meta["price_decimals"]),
+            is_ask=is_ask,
+            reduce_only=True,
+        )
+        self._validate_tx_response(response, err, context="挂整仓止损")
+        return response
+
+    async def cancel_tpsl(self, market: str) -> None:
+        """撤掉该市场的整仓止损，不影响普通网格单。"""
+        self._require_trading()
+        meta = await self._load_market_meta(market)
+        for order in await self.get_open_orders(market):
+            if order.is_position_stop_loss:
+                await self._cancel_by_order_index(meta["market_id"], order.order_index)
+
+    async def get_position_tpsl(self, market: str) -> LighterOrder | None:
+        """查询当前市场挂出的整仓止损；不存在返回 None。
+
+        引擎读返回值的 `.trigger_price` 校验交易所侧止损是否仍然有效
+        （`grid_engine.py:537`）。
+        """
+        for order in await self.get_open_orders(market):
+            if order.is_position_stop_loss:
+                return order
+        return None
 
     async def close_position(self, market: str):
         """通过基类通用逻辑以 reduce-only 市价单平掉当前仓位。"""
