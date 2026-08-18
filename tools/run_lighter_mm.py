@@ -25,8 +25,9 @@ logger = get_logger("lighter_mm")
 _ROOT = Path(__file__).resolve().parent.parent
 _MM_HEARTBEAT = _ROOT / "data" / "lighter_mm.jsonl"
 
-# 实盘库存硬顶必须独立于命令行参数，防止手滑放大风险。
-MAX_INVENTORY_USD = 500.0
+# 与实盘 Extended 网格的 --max-inv 3750 对齐，且匹配 Lighter 账户抵押规模。
+# 硬顶只用于防止手滑多打一个零，不限制有意且显式的规模调整。
+MAX_INVENTORY_USD = 3750.0
 MIN_UNIT_USD = 15.0
 
 
@@ -51,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-inv",
         type=float,
         default=500.0,
-        help="库存上限 USD（默认 500，硬顶 500）",
+        help=f"库存上限 USD（默认 500，硬顶 {MAX_INVENTORY_USD:g}）",
     )
     parser.add_argument(
         "--spacing",
@@ -112,8 +113,8 @@ def validate_args(args: argparse.Namespace) -> None:
         _reject_startup(f"库存上限不得超过硬顶 {MAX_INVENTORY_USD:g} USD")
     if args.unit < MIN_UNIT_USD:
         _reject_startup(f"每格名义不得低于 {MIN_UNIT_USD:g} USD")
-    if args.unit * args.levels > args.max_inv:
-        _reject_startup("每格名义乘档位数超过单边库存上限")
+    if args.unit > args.max_inv:
+        _reject_startup("每格名义不得超过单边库存上限")
     if args.live and not (os.environ.get("LIGHTER_API_PRIVATE_KEY") or "").strip():
         _reject_startup("实盘模式缺少环境变量 LIGHTER_API_PRIVATE_KEY")
 

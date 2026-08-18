@@ -56,6 +56,7 @@ def test_parser_uses_safe_defaults(monkeypatch) -> None:
     assert args.candle_account == "X10_HEDGE"
     assert args.state_path == "data/lighter_mm/state.json"
     assert args.trend_aware is False
+    assert "硬顶 3750" in cli.build_parser().format_help()
     assert Path(args.state_path).parent.resolve() != Path("data").resolve()
     assert cli._grid_config(args).state_path == args.state_path
     assert cli._grid_config(args).trend_aware is False
@@ -136,15 +137,22 @@ def test_validate_args_rejects_non_positive_levels(capsys) -> None:
 
 
 def test_validate_args_rejects_inventory_above_hard_cap(capsys) -> None:
-    """防止手滑多输入一个零，把真实库存风险放大到 500 美元硬顶以上。"""
+    """防止手滑多输入一个零，把真实库存风险放大到 3750 美元硬顶以上。"""
     cli = _cli_module()
 
     with pytest.raises(SystemExit):
-        cli.validate_args(_args(max_inv=500.01))
+        cli.validate_args(_args(max_inv=3751.0))
 
     output = capsys.readouterr().err
     assert "库存" in output
-    assert "500" in output
+    assert "3750" in output
+
+
+def test_validate_args_allows_inventory_hard_cap() -> None:
+    """防止与 Extended 实盘网格对齐的 3750 美元库存上限被硬顶误拒。"""
+    cli = _cli_module()
+
+    cli.validate_args(_args(max_inv=3750.0))
 
 
 def test_validate_args_rejects_unit_below_lighter_minimum(capsys) -> None:
@@ -159,14 +167,16 @@ def test_validate_args_rejects_unit_below_lighter_minimum(capsys) -> None:
     assert "15" in output
 
 
-def test_validate_args_rejects_full_side_above_inventory(capsys) -> None:
-    """防止单边挂满后已承诺名义额超过配置的库存上限。"""
+def test_validate_args_rejects_unit_above_inventory(capsys) -> None:
+    """防止单笔名义已超过库存上限，使引擎无法挂出任何一档。"""
     cli = _cli_module()
 
     with pytest.raises(SystemExit):
-        cli.validate_args(_args(unit=51.0, levels=4, max_inv=200.0))
+        cli.validate_args(_args(unit=201.0, levels=1, max_inv=200.0))
 
-    assert "单边" in capsys.readouterr().err
+    output = capsys.readouterr().err
+    assert "每格" in output
+    assert "库存上限" in output
 
 
 def test_validate_args_rejects_live_without_private_key(monkeypatch, capsys) -> None:
@@ -195,6 +205,13 @@ def test_validate_args_allows_inventory_boundary() -> None:
     cli = _cli_module()
 
     cli.validate_args(_args(unit=50.0, levels=4, max_inv=200.0))
+
+
+def test_validate_args_allows_extended_production_grid_config() -> None:
+    """防止自检拒掉生产环境已验证的配置；引擎把同侧已有挂单计入额度，阶梯会被库存上限自动截断。"""
+    cli = _cli_module()
+
+    cli.validate_args(_args(unit=300.0, levels=30, max_inv=3750.0))
 
 
 def test_validate_args_allows_legal_live_parameters(monkeypatch) -> None:

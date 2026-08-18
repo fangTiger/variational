@@ -23,8 +23,10 @@ MUST 分别默认为 `BTC`、`50`、`4`、`500`、`0.000986`、`2.5`、`30` 和
 - **THEN** CLI 递归创建该父目录后再装配客户端与网格引擎
 
 ### Requirement: 启动前执行资金安全自检
-系统 MUST 拒绝非正档位、超过 500 USD 硬顶的库存、低于 15 USD 的每格名义，
-以及每格名义乘档位超过库存上限的参数。乘积刚好等于库存上限时 MUST 放行。
+系统 MUST 拒绝非正档位、超过 3750 USD 硬顶的库存、低于 15 USD 的每格名义，
+以及单笔名义超过库存上限的参数。每格名义乘档位数可以超过库存上限；网格引擎
+会把同侧已有挂单计入额度，并在库存上限处自动截断阶梯。`--max-inv` 的默认值
+MUST 保持为 500 USD，放大规模必须显式指定。
 实盘模式下缺少 `LIGHTER_API_PRIVATE_KEY` 时 MUST 拒绝启动。所有拒绝原因 MUST
 使用中文并通过 `sys.exit` 结束。Lighter 地址为空时 MUST 在构造客户端前拒绝。
 状态路径的父目录经真实路径解析后若与 `data/grid_state.json` 的父目录相同，也
@@ -35,9 +37,13 @@ MUST 在构造客户端前拒绝，并说明 `equity_peak.json`、`fills.jsonl` 
 - **WHEN** 任一安全条件不满足
 - **THEN** CLI 在构造客户端前以中文原因退出
 
-#### Scenario: 单边库存等于上限
-- **WHEN** `unit * levels == max_inv` 且其他条件合法
-- **THEN** 自检正常返回
+#### Scenario: Extended 生产网格参数
+- **WHEN** `unit=300`、`levels=30`、`max_inv=3750` 且其他条件合法
+- **THEN** 自检正常返回，由网格引擎在库存上限处截断阶梯
+
+#### Scenario: 单笔超过库存上限
+- **WHEN** `unit > max_inv`
+- **THEN** 自检拒绝启动并说明每格名义不得超过库存上限
 
 #### Scenario: 同目录的不同主状态文件
 - **WHEN** 状态路径为 `data/lighter_mm_state.json` 或 `data/grid_state.json`
