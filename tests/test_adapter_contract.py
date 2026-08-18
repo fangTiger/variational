@@ -41,3 +41,25 @@ def test_base_declares_cancel_order():
     assert hasattr(ExchangeAdapter, "cancel_order")
     params = list(inspect.signature(ExchangeAdapter.cancel_order).parameters)
     assert params[:3] == ["self", "market", "order_id"]
+
+
+@pytest.mark.parametrize("cls", [ExtendedClient, LighterClient])
+def test_get_mark_price_takes_single_market_argument(cls):
+    """引擎按位置传参调用 get_mark_price，参数个数分叉会在跨所时炸。
+
+    只校验个数不校验名称：Extended 沿用 `market_name`、基类与 Lighter 用
+    `market`，这是既有约定，按位置调用不受影响。
+    """
+    got = list(inspect.signature(cls.get_mark_price).parameters)
+    assert len(got) == 2, f"{cls.__name__}.get_mark_price 参数个数不符：{got}"
+    assert got[0] == "self"
+
+
+def test_extended_mark_price_is_not_the_bid_ask_mid():
+    """Extended 必须覆盖 get_mark_price，不能沿用基类的盘口中值。
+
+    基类默认返回 get_market_price().mid，而 Extended 的 get_market_price
+    取的是买一/卖一——盘口中值与标记价是两个口径。引擎的清算距离、硬止损
+    和整仓 TPSL 都按标记价计算，用中值会让这些保护线整体偏移。
+    """
+    assert ExtendedClient.get_mark_price is not ExchangeAdapter.get_mark_price

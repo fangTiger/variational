@@ -153,6 +153,16 @@ class ExtendedClient(ExchangeAdapter):
             ask=Decimal(str(stats.data.ask_price)),
         )
 
+    async def get_mark_price(self, market_name: str) -> Decimal:
+        """标记价。
+
+        必须覆盖基类默认（买卖中值）：中值与标记价是两个口径，而引擎的
+        清算距离、硬止损和整仓 TPSL 都按标记价计算，用中值会让这些
+        保护线整体偏移。
+        """
+        stats = await self._client.info.get_market_statistics(market_name=market_name)
+        return Decimal(str(stats.data.mark_price))
+
     async def get_position(self, market_name: str) -> Position:
         """获取某标的当前持仓（无仓位返回 signed_size=0）。
 

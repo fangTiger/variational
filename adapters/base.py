@@ -126,6 +126,10 @@ class ExchangeAdapter(ABC):
         del market
         return None
 
+    async def get_mark_price(self, market: str) -> Decimal:
+        """标记价。默认取买卖中值；有独立标记价的交易所应覆盖。"""
+        return (await self.get_market_price(market)).mid
+
     async def place_position_stop_loss(
         self,
         market: str,

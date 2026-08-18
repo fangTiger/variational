@@ -90,6 +90,11 @@ class RunExt(StopExt):
 
         self._client = SimpleNamespace(info=Info())
 
+    async def get_mark_price(self, market):
+        """引擎已改为走适配器的 get_mark_price，不再直接摸 SDK。"""
+        self.calls.append("mark")
+        return Decimal(str(self._mark))
+
     async def get_position(self, market):
         self.calls.append("position")
         return await super().get_position(market)

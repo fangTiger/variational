@@ -132,8 +132,9 @@ def test_tpsl_blocks_new_risk_when_unconfirmed(tmp_path, monkeypatch) -> None:
             ]
             return SimpleNamespace(data=candles)
 
-        async def get_market_statistics(self, **kwargs):
-            return SimpleNamespace(data=SimpleNamespace(mark_price=100.0))
+        async def get_mark_price(self, market):
+            """引擎已改为走适配器接口取标记价，不再直接摸 SDK。"""
+            return Decimal("100")
 
         async def place_position_stop_loss(
             self,

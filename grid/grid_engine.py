@@ -34,6 +34,7 @@ from grid.regime import (
     trend_gate,
     close_slope,
 )
+from adapters.market_data import ExtendedCandleSource
 from grid.risk import dist_to_liq_pct, hard_stop_triggered
 from infra.logger import get_logger
 
@@ -101,10 +102,19 @@ class GridConfig:
 
 
 class GridEngine:
-    def __init__(self, ext, config: GridConfig | None = None, fng_provider=None) -> None:
+    def __init__(
+        self,
+        ext,
+        config: GridConfig | None = None,
+        fng_provider=None,
+        candle_source=None,
+    ) -> None:
         self.ext = ext
         self.config = config or GridConfig()
         self._fng_provider = fng_provider
+        # 默认用交易所自身的 K 线；Lighter 的 K 线接口返回 403，
+        # 做市场景由调用方传入指向 Extended 的行情源。
+        self._candles = candle_source or ExtendedCandleSource(ext)
         self._orders: dict[int, dict] = {}   # level -> {"id":..., "side": Side}
         self._retry: dict[int, dict] = {}
         self._reject_cooldown: dict[int, dict] = {}
@@ -174,8 +184,8 @@ class GridEngine:
         await self.ext.connect()
         pos = await self.ext.get_position(self.config.market)
         if not self.config.dry_run and pos.signed_size != 0:
-            stats = await self.ext._client.info.get_market_statistics(market_name=self.config.market)
-            notional = abs(float(pos.signed_size)) * float(stats.data.mark_price)
+            mark = await self.ext.get_mark_price(self.config.market)
+            notional = abs(float(pos.signed_size)) * float(mark)
             if notional > 2 * self.config.max_inventory_usd:
                 raise RuntimeError(
                     f"账户已有持仓 {pos.signed_size}(≈${notional:.0f})远超库存上限，疑似外部仓，请先平掉。")
@@ -228,10 +238,7 @@ class GridEngine:
             float(raw_liq) if raw_liq is not None and float(raw_liq) > 0 else None
         )
         try:
-            stats = await self.ext._client.info.get_market_statistics(
-                market_name=self.config.market
-            )
-            price = float(stats.data.mark_price)
+            price = float(await self.ext.get_mark_price(self.config.market))
             if price <= 0:
                 raise ValueError(f"实时 mark 非正数：{price}")
         except Exception as exc:  # noqa: BLE001
@@ -847,11 +854,8 @@ class GridEngine:
             return "快速执行完成"
 
         try:
-            r = await self.ext._client.info.get_candles_history(
-                market_name=self.config.market,
-                candle_type="trades",
-                interval="PT1H",
-                limit=self.config.candle_lookback,
+            candles = await self._candles.get_hourly_candles(
+                self.config.market, self.config.candle_lookback
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("K线获取失败，已处理成交并跳过补格：%s", exc)
@@ -863,7 +867,6 @@ class GridEngine:
             )
             return "K线获取失败：已处理成交，跳过补格"
 
-        candles = sorted(r.data, key=lambda k: int(k.timestamp))
         highs = drop_forming_candle([float(k.high) for k in candles])
         lows = drop_forming_candle([float(k.low) for k in candles])
         closes = drop_forming_candle([float(k.close) for k in candles])
@@ -871,7 +874,7 @@ class GridEngine:
         self._last_lows = lows
         self._last_closes = closes
         self._current_closed_bar_key = (
-            int(candles[-2].timestamp) if len(candles) >= 2 else None
+            int(candles[-2].ts) if len(candles) >= 2 else None
         )
 
         mode = trend_gate(
@@ -961,10 +964,9 @@ class GridEngine:
             return await self._run_once_trend_aware(include_slow=include_slow)
 
         # 指标 + regime
-        r = await self.ext._client.info.get_candles_history(
-            market_name=self.config.market, candle_type="trades",
-            interval="PT1H", limit=self.config.candle_lookback)
-        candles = sorted(r.data, key=lambda k: int(k.timestamp))
+        candles = await self._candles.get_hourly_candles(
+            self.config.market, self.config.candle_lookback
+        )
         highs = [float(k.high) for k in candles]; lows = [float(k.low) for k in candles]
         closes = [float(k.close) for k in candles]
         a = adx(highs, lows, closes, self.config.adx_period)
@@ -2030,10 +2032,7 @@ class GridEngine:
             return False
         if mark is None:
             try:
-                stats = await self.ext._client.info.get_market_statistics(
-                    market_name=self.config.market
-                )
-                mark = float(stats.data.mark_price)
+                mark = float(await self.ext.get_mark_price(self.config.market))
                 if mark <= 0:
                     raise ValueError(f"实时 mark 非正数：{mark}")
             except Exception as exc:  # noqa: BLE001

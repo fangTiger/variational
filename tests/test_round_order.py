@@ -99,12 +99,10 @@ def test_inv_prefers_realtime_mark_and_keeps_position_size(tmp_path) -> None:
             self.liquidation_calls = 0
             self.market_statistics_calls = 0
 
-            class Info:
-                async def get_market_statistics(inner_self, **kwargs):
-                    self.market_statistics_calls += 1
-                    return SimpleNamespace(data=SimpleNamespace(mark_price="101"))
-
-            self._client = SimpleNamespace(info=Info())
+        async def get_mark_price(self, market):
+            """引擎已改为走适配器接口取标记价，不再直接摸 SDK。"""
+            self.market_statistics_calls += 1
+            return Decimal("101")
 
         async def get_position(self, market):
             self.position_calls += 1
@@ -147,18 +145,17 @@ def test_inv_falls_back_to_position_mark_and_warns(
 ) -> None:
     """实时行情异常或返回零时，回退 position mark 并明确告警。"""
 
-    class Info:
-        async def get_market_statistics(self, **kwargs):
-            if isinstance(realtime_result, Exception):
-                raise realtime_result
-            return SimpleNamespace(data=SimpleNamespace(mark_price=realtime_result))
+    async def get_mark_price(market):
+        if isinstance(realtime_result, Exception):
+            raise realtime_result
+        return Decimal(str(realtime_result))
 
     position = Position(
         market="BTC-USD",
         signed_size=Decimal("0.0123"),
         raw=SimpleNamespace(mark_price="95", liquidation_price="80"),
     )
-    ext = SimpleNamespace(_client=SimpleNamespace(info=Info()))
+    ext = SimpleNamespace(get_mark_price=get_mark_price)
     eng = GridEngine(ext, GridConfig(state_path=str(tmp_path / "grid_state.json")))
 
     with caplog.at_level(logging.WARNING, logger="grid_engine"):
@@ -177,16 +174,15 @@ def test_inv_falls_back_to_position_mark_and_warns(
 def test_hard_stop_prefers_realtime_mark_over_position_mark(tmp_path) -> None:
     """硬止损直接接收 position 时，也不得使用其中的陈旧 mark。"""
 
-    class Info:
-        async def get_market_statistics(self, **kwargs):
-            return SimpleNamespace(data=SimpleNamespace(mark_price="100"))
+    async def get_mark_price(market):
+        return Decimal("100")
 
     position = Position(
         market="BTC-USD",
         signed_size=Decimal("0.01"),
         raw=SimpleNamespace(mark_price="90", liquidation_price="80"),
     )
-    ext = SimpleNamespace(_client=SimpleNamespace(info=Info()))
+    ext = SimpleNamespace(get_mark_price=get_mark_price)
     eng = GridEngine(
         ext,
         GridConfig(
