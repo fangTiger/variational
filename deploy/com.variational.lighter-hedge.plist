@@ -31,6 +31,8 @@
 		<string>0.02</string>
 		<string>--min-hedge-free-margin-ratio</string>
 		<string>0.20</string>
+		<string>--maker-first-timeout</string>
+		<string>15</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
