@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONPATH</key>
+		<string>/Users/captain/python/variational</string>
+		<key>SSL_CERT_FILE</key>
+		<string>/Users/captain/python/variational/.venv/lib/python3.11/site-packages/certifi/cacert.pem</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.variational.lighter-mm</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/captain/python/variational/.venv/bin/python</string>
+		<string>-m</string>
+		<string>tools.run_lighter_mm</string>
+		<string>--live</string>
+		<string>--unit</string>
+		<string>300</string>
+		<string>--levels</string>
+		<string>30</string>
+		<string>--max-inv</string>
+		<string>3750</string>
+		<string>--spacing</string>
+		<string>0.000986</string>
+		<string>--interval</string>
+		<string>2.5</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/captain/python/variational/logs/lighter-mm.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/captain/python/variational/logs/lighter-mm.out.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/captain/python/variational</string>
+</dict>
+</plist>
