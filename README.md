@@ -47,15 +47,16 @@ X10_GRID_VAULT_ID=...
 
 ## 启动方式
 
-### 先分清楚：这个仓库有三套系统
+### 先分清楚：这个仓库有四套系统
 
 | 系统 | 入口 | 交易所 | 状态 |
 |---|---|---|---|
 | **BTC 中性网格** | `tools/run_grid.py` | **Extended** | ✅ 实盘运行中，是本项目主体 |
 | 跨所对冲刷积分 | `tools/run_hedge_bot.py` | Variational + Extended | ⛔ 已停用，保留作参考 |
-| Lighter RH 积分对冲 | `tools/run_lighter_hedge.py` | Lighter RH + Extended | 🆕 默认 dry-run，使用独立 `X10_HEDGE_` 账户 |
+| Lighter RH 积分对冲 | `tools/run_lighter_hedge.py` | Lighter RH + Extended | ⛔ 已停用（做市改为不对冲），代码保留 |
+| **Lighter 做市** | `tools/run_lighter_mm.py` | **Lighter** | ✅ 实盘运行中，launchd 常驻（`com.variational.lighter-mm`） |
 
-三套系统使用不同账户前缀：网格用 `X10_GRID_`，旧对冲用 `X10_`，Lighter RH 对冲用 `X10_HEDGE_`；三者不得复用 vault。
+涉及 Extended 的系统按用途使用账户前缀：网格用 `X10_GRID_`，旧对冲用 `X10_`，Lighter RH 对冲用 `X10_HEDGE_`；三者不得复用 vault。Lighter 做市在 Lighter 下单，仅使用 `X10_HEDGE_` 读取 Extended K 线。
 
 ### Lighter RH 对冲启动
 
@@ -73,6 +74,8 @@ PYTHONPATH=. .venv/bin/python -m tools.run_lighter_hedge --live
 ```
 
 默认每 30 秒向 `data/lighter_hedge.jsonl` 追加一条心跳，包含两腿仓位、净敞口、本轮动作和 Extended 可用保证金率。`tools.alert_check` 会检查心跳、连续净敞口偏离、primary 名义超限、连续读取失败和保证金不足；保证金告警阈值可用 `--min-hedge-free-margin-ratio` 调整，默认 20%。
+
+生产 launchd 配置保持 Lighter 只读，由人工在 Lighter 调仓；检测到仓位变化后，EXTENDED 对冲腿先以 post-only Maker 单等待 15 秒，超时撤单并只对未成交部分使用 IOC 补齐。该行为由 `--maker-first-timeout 15` 显式启用。
 
 下面的前台参数与模板说明以 Extended 网格为主；Lighter 对冲的常驻 plist 另见后文。
 
