@@ -18,7 +18,8 @@
 		<string>tools.run_lighter_hedge</string>
 		<string>--live</string>
 		<string>--account</string>
-		<string>X10_HEDGE</string>
+		<string>X10_GRID</string>
+		<string>--allow-shared-account</string>
 		<string>--market</string>
 		<string>BTC</string>
 		<string>--hedge-market</string>

@@ -19,7 +19,7 @@ from decimal import Decimal  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from adapters.base import ExchangeAdapter  # noqa: E402
-from adapters.extended_client import ExtendedClient  # noqa: E402
+from adapters.extended_client import ExtendedClient, filter_grid_orders  # noqa: E402
 from adapters.lighter_client import LighterClient  # noqa: E402
 from engine.hedge_engine import HedgeConfig, HedgeEngine, HedgeState  # noqa: E402
 from infra.logger import get_logger  # noqa: E402
@@ -78,6 +78,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--account",
         default="X10_HEDGE",
         help="Extended 账户环境变量前缀（默认 X10_HEDGE）",
+    )
+    parser.add_argument(
+        "--allow-shared-account",
+        action="store_true",
+        help=(
+            "知情允许与网格共用 Extended 账户；启动时仍校验零持仓且无网格挂单；"
+            "不能与 --risk-selfcheck-only 同用"
+        ),
     )
     parser.add_argument(
         "--lighter-address",
@@ -271,7 +279,8 @@ def _env_value(name: str) -> str | None:
 def _validate_startup(args: argparse.Namespace) -> tuple[str, str]:
     """校验地址与账户隔离，返回规范化账户前缀和 Lighter 地址。"""
     account_prefix = str(args.account).strip().upper()
-    if account_prefix == "X10_GRID":
+    allow_shared_account = bool(getattr(args, "allow_shared_account", False))
+    if account_prefix == "X10_GRID" and not allow_shared_account:
         raise StartupError("拒绝启动：X10_GRID 是实盘网格账户，本进程绝不能使用")
     if not account_prefix:
         raise StartupError("拒绝启动：Extended 账户前缀不能为空")
@@ -282,23 +291,51 @@ def _validate_startup(args: argparse.Namespace) -> tuple[str, str]:
             "拒绝启动：请传 --lighter-address 或设置 LIGHTER_RH_L1_ADDRESS"
         )
 
-    hedge_vault = _env_value("X10_HEDGE_VAULT_ID")
-    grid_vault = _env_value("X10_GRID_VAULT_ID")
-    if hedge_vault is not None and grid_vault is not None and hedge_vault == grid_vault:
+    if not allow_shared_account:
+        hedge_vault = _env_value("X10_HEDGE_VAULT_ID")
+        grid_vault = _env_value("X10_GRID_VAULT_ID")
+        if (
+            hedge_vault is not None
+            and grid_vault is not None
+            and hedge_vault == grid_vault
+        ):
+            raise StartupError(
+                "拒绝启动：X10_HEDGE_VAULT_ID 与 X10_GRID_VAULT_ID 相同"
+            )
+
+        selected_vault = _env_value(f"{account_prefix}_VAULT_ID")
+        if (
+            selected_vault is not None
+            and grid_vault is not None
+            and selected_vault == grid_vault
+        ):
+            raise StartupError(
+                f"拒绝启动：{account_prefix}_VAULT_ID 与 X10_GRID_VAULT_ID 相同"
+            )
+    return account_prefix, lighter_address
+
+
+async def _validate_shared_account_state(hedge) -> None:
+    """校验共用账户没有遗留仓位或普通网格挂单。"""
+    try:
+        positions = await hedge.get_all_positions()
+    except Exception as exc:  # noqa: BLE001  无法确认空仓时必须失败关闭
+        raise StartupError(f"拒绝启动：无法确认共用账户持仓状态：{exc}") from exc
+    active_positions = [position for position in positions if position.signed_size != 0]
+    if active_positions:
+        position = active_positions[0]
         raise StartupError(
-            "拒绝启动：X10_HEDGE_VAULT_ID 与 X10_GRID_VAULT_ID 相同"
+            f"拒绝启动：共用账户仍有仓位（{position.market} {position.signed_size}）"
         )
 
-    selected_vault = _env_value(f"{account_prefix}_VAULT_ID")
-    if (
-        selected_vault is not None
-        and grid_vault is not None
-        and selected_vault == grid_vault
-    ):
+    try:
+        grid_orders = filter_grid_orders(await hedge.get_all_open_orders())
+    except Exception as exc:  # noqa: BLE001  无法确认挂单为空时必须失败关闭
+        raise StartupError(f"拒绝启动：无法确认共用账户网格活动：{exc}") from exc
+    if grid_orders:
         raise StartupError(
-            f"拒绝启动：{account_prefix}_VAULT_ID 与 X10_GRID_VAULT_ID 相同"
+            f"拒绝启动：共用账户仍有网格活动（{len(grid_orders)} 张普通网格挂单）"
         )
-    return account_prefix, lighter_address
 
 
 def _has_real_capability(target, capability: str) -> bool:
@@ -378,11 +415,15 @@ def _startup_summary(
         f"{HEDGE_RISK_LAYER_REQUIREMENTS[layer][0]}={status}"
         for layer, status in risk_statuses.items()
     )
-    return "\n".join(
+    lines = [
+        f"Lighter 地址：{lighter_address}",
+        f"Lighter account_index：{account_index}",
+        f"Extended 账户前缀：{account_prefix}",
+    ]
+    if getattr(args, "allow_shared_account", False):
+        lines.append("Extended 账户模式：与网格共用（网格进程不得同时运行）")
+    lines.extend(
         [
-            f"Lighter 地址：{lighter_address}",
-            f"Lighter account_index：{account_index}",
-            f"Extended 账户前缀：{account_prefix}",
             f"标的：{args.market} → {args.hedge_market}",
             f"名义上限：{args.max_primary_notional} USD",
             f"保证金率告警阈值：{args.min_hedge_free_margin_ratio:.0%}",
@@ -391,15 +432,26 @@ def _startup_summary(
             f"dry_run：{not args.live}",
         ]
     )
+    return "\n".join(lines)
 
 
 async def _main(args: argparse.Namespace) -> None:
     """完成启动自检、装配并运行对冲引擎。"""
     account_prefix, lighter_address = _validate_startup(args)
+    if getattr(args, "allow_shared_account", False) and getattr(
+        args,
+        "risk_selfcheck_only",
+        False,
+    ):
+        raise StartupError(
+            "拒绝启动：--allow-shared-account 与 --risk-selfcheck-only 不能同时使用"
+        )
     primary = LighterClient(l1_address=lighter_address)
     hedge = None
     try:
         hedge = ExtendedClient.from_env(prefix=account_prefix)
+        if getattr(args, "allow_shared_account", False):
+            await _validate_shared_account_state(hedge)
         risk_statuses = _validate_risk_controls(primary, hedge, args)
         config = HedgeConfig(
             market=args.hedge_market,

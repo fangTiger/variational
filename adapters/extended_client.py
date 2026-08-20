@@ -173,12 +173,24 @@ class ExtendedClient(ExchangeAdapter):
         items = resp.data or []
         if not items:
             return Position(market=market_name, signed_size=Decimal(0))
-        pos = items[0]
+        return self._normalize_position(items[0], fallback_market=market_name)
+
+    @staticmethod
+    def _normalize_position(pos, *, fallback_market: str | None = None) -> Position:
+        """把 Extended 原始持仓归一化为统一持仓快照。"""
         size = Decimal(str(pos.size))
         # side 为 SHORT 时取负；不同 SDK 版本可能用枚举或字符串，做兼容
         side = str(getattr(pos, "side", "")).upper()
         signed = -size if "SHORT" in side or "SELL" in side else size
-        return Position(market=market_name, signed_size=signed, raw=pos)
+        market = str(getattr(pos, "market", fallback_market) or fallback_market or "")
+        if not market:
+            raise RuntimeError("Extended 持仓缺少 market 字段")
+        return Position(market=market, signed_size=signed, raw=pos)
+
+    async def get_all_positions(self) -> list[Position]:
+        """获取账户全部持仓，不按标的过滤。"""
+        resp = await self._client.account.get_positions()
+        return [self._normalize_position(pos) for pos in (resp.data or [])]
 
     async def get_balance(self):
         """账户余额（原始模型）。
@@ -358,6 +370,11 @@ class ExtendedClient(ExchangeAdapter):
 
     async def get_open_orders(self, market: str) -> list:
         r = await self._client.account.get_open_orders(market_names=[market])
+        return r.data or []
+
+    async def get_all_open_orders(self) -> list:
+        """获取账户全部开放订单，不按标的过滤。"""
+        r = await self._client.account.get_open_orders()
         return r.data or []
 
     async def cancel_grid_orders(self, market: str) -> int:

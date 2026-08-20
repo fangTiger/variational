@@ -26,6 +26,7 @@ def _args(**overrides) -> SimpleNamespace:
     """构造 _main 所需的最小参数集合。"""
     values = {
         "live": False,
+        "allow_shared_account": False,
         "account": "X10_HEDGE",
         "lighter_address": "0x4A3D...3d82",
         "market": "BTC",
@@ -40,6 +41,99 @@ def _args(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+class _SharedAccountHedge:
+    """复刻真实适配器只读契约，并覆盖共用账户的成功与失败状态。"""
+
+    def __init__(
+        self,
+        *,
+        signed_size: Decimal = Decimal("0"),
+        positions: list[Position] | None = None,
+        open_orders: list[object] | None = None,
+    ) -> None:
+        self.signed_size = signed_size
+        self.positions = (
+            list(positions)
+            if positions is not None
+            else (
+                []
+                if signed_size == 0
+                else [Position("BTC-USD", signed_size)]
+            )
+        )
+        self.open_orders = list(open_orders or [])
+        self.calls: list[tuple[str, str]] = []
+        self.closed = False
+
+    async def get_position(self, market: str) -> Position:
+        return next(
+            (position for position in self.positions if position.market == market),
+            Position(market, Decimal("0")),
+        )
+
+    async def get_all_positions(self) -> list[Position]:
+        self.calls.append(("positions", "全部"))
+        return self.positions
+
+    async def get_open_orders(self, market: str) -> list[object]:
+        return [
+            order
+            for order in self.open_orders
+            if getattr(order, "market", market) == market
+        ]
+
+    async def get_all_open_orders(self) -> list[object]:
+        self.calls.append(("open_orders", "全部"))
+        return self.open_orders
+
+    async def market_order(self, *_args, **_kwargs):
+        return None
+
+    async def get_liquidation_info(self, _market):
+        return None
+
+    async def get_free_margin_ratio(self):
+        return Decimal("1")
+
+    async def get_balance(self):
+        return SimpleNamespace(equity=Decimal("1000"))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _patch_shared_account_clients(monkeypatch, cli, hedge: _SharedAccountHedge) -> None:
+    """隔离外部网络，同时保留入口真实的构造与关闭流程。"""
+
+    class FakeLighter:
+        def __init__(self, l1_address: str) -> None:
+            self.l1_address = l1_address
+            self.account_index = None
+            self.closed = False
+
+        async def connect(self) -> None:
+            self.account_index = 5626
+
+        async def get_position(self, market: str) -> Position:
+            return Position(market, Decimal("0"))
+
+        async def get_market_price(self, market: str):
+            return SimpleNamespace(market=market, mid=Decimal("60000"))
+
+        async def get_liquidation_info(self, _market):
+            return None
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(cli, "LighterClient", FakeLighter)
+    monkeypatch.setattr(
+        cli,
+        "ExtendedClient",
+        SimpleNamespace(from_env=lambda prefix: hedge),
+    )
+
+
 def test_rejects_grid_account_before_constructing_clients(monkeypatch) -> None:
     """即使大小写或空白不同，也绝不能让该进程使用网格账户。"""
     cli = _cli_module()
@@ -51,7 +145,9 @@ def test_rejects_grid_account_before_constructing_clients(monkeypatch) -> None:
     monkeypatch.setattr(cli.ExtendedClient, "from_env", fail_constructor)
 
     with pytest.raises(RuntimeError, match="X10_GRID"):
-        asyncio.run(cli._main(_args(account=" x10_grid ")))
+        asyncio.run(
+            cli._main(_args(account=" x10_grid ", allow_shared_account=False))
+        )
 
 
 def test_rejects_equal_hedge_and_grid_vault_ids(monkeypatch) -> None:
@@ -67,7 +163,190 @@ def test_rejects_equal_hedge_and_grid_vault_ids(monkeypatch) -> None:
     monkeypatch.setattr(cli.ExtendedClient, "from_env", fail_constructor)
 
     with pytest.raises(RuntimeError, match="VAULT_ID.*相同"):
-        asyncio.run(cli._main(_args()))
+        asyncio.run(cli._main(_args(allow_shared_account=False)))
+
+
+def test_rejects_selected_account_equal_to_grid_vault_without_declaration(
+    monkeypatch,
+) -> None:
+    """未声明时，所选账户 vault 与网格相同仍必须在构造客户端前拒绝。"""
+    cli = _cli_module()
+    monkeypatch.setenv("X10_HEDGE_VAULT_ID", "9002")
+    monkeypatch.setenv("X10_GRID_VAULT_ID", "9001")
+    monkeypatch.setenv("X10_VAULT_ID", "9001")
+
+    def fail_constructor(*_args, **_kwargs):
+        pytest.fail("所选账户 vault 隔离校验必须发生在客户端构造前")
+
+    monkeypatch.setattr(cli, "LighterClient", fail_constructor)
+    monkeypatch.setattr(cli.ExtendedClient, "from_env", fail_constructor)
+
+    with pytest.raises(RuntimeError, match="X10_VAULT_ID.*X10_GRID_VAULT_ID.*相同"):
+        asyncio.run(
+            cli._main(_args(account="X10", allow_shared_account=False))
+        )
+
+
+def test_declaration_skips_all_static_account_rejections(monkeypatch) -> None:
+    """声明共用后，账户前缀和两类 vault 相同都只进入运行时校验。"""
+    cli = _cli_module()
+    monkeypatch.setenv("X10_HEDGE_VAULT_ID", "9001")
+    monkeypatch.setenv("X10_GRID_VAULT_ID", "9001")
+
+    result = cli._validate_startup(
+        _args(account=" x10_grid ", allow_shared_account=True)
+    )
+
+    assert result == ("X10_GRID", "0x4A3D...3d82")
+
+
+def test_shared_account_with_position_is_rejected(monkeypatch) -> None:
+    """即使其他标的仍有仓位，共用账户也必须拒绝启动。"""
+    cli = _cli_module()
+    hedge = _SharedAccountHedge(
+        positions=[Position("ETH-USD", Decimal("0.01"))]
+    )
+    _patch_shared_account_clients(monkeypatch, cli, hedge)
+
+    class FailEngine:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pytest.fail("账户级仓位门禁必须发生在引擎构造前")
+
+    monkeypatch.setattr(cli, "HedgeEngine", FailEngine)
+
+    with pytest.raises(cli.StartupError, match="仍有仓位"):
+        asyncio.run(
+            cli._main(
+                _args(account="X10_GRID", allow_shared_account=True)
+            )
+        )
+
+    assert hedge.calls == [("positions", "全部")]
+    assert hedge.closed is True
+
+
+def test_shared_account_with_grid_orders_is_rejected(monkeypatch) -> None:
+    """已声明但目标账户仍有普通网格单时，入口必须拒绝启动。"""
+    cli = _cli_module()
+    hedge = _SharedAccountHedge(
+        open_orders=[
+            SimpleNamespace(
+                id="grid-order-1",
+                market="ETH-USD",
+                reduce_only=False,
+                type="LIMIT",
+                tp_sl_type=None,
+            )
+        ]
+    )
+    _patch_shared_account_clients(monkeypatch, cli, hedge)
+
+    class FailEngine:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pytest.fail("账户级挂单门禁必须发生在引擎构造前")
+
+    monkeypatch.setattr(cli, "HedgeEngine", FailEngine)
+
+    with pytest.raises(cli.StartupError, match="仍有网格活动"):
+        asyncio.run(
+            cli._main(
+                _args(account="X10_GRID", allow_shared_account=True)
+            )
+        )
+
+    assert hedge.calls == [
+        ("positions", "全部"),
+        ("open_orders", "全部"),
+    ]
+    assert hedge.closed is True
+
+
+def test_clean_shared_account_passes_runtime_validation() -> None:
+    """零持仓且仅有保护单时应视为干净，不得误判成网格活动。"""
+    cli = _cli_module()
+    hedge = _SharedAccountHedge(
+        open_orders=[
+            SimpleNamespace(
+                id="reduce-only-1",
+                reduce_only=True,
+                type="LIMIT",
+                tp_sl_type=None,
+            ),
+            SimpleNamespace(
+                id="conditional-1",
+                reduce_only=False,
+                type="CONDITIONAL",
+                tp_sl_type="POSITION",
+            ),
+        ]
+    )
+
+    asyncio.run(cli._validate_shared_account_state(hedge))
+
+    assert hedge.calls == [
+        ("positions", "全部"),
+        ("open_orders", "全部"),
+    ]
+
+
+def test_clean_shared_account_main_reaches_engine(monkeypatch) -> None:
+    """账户级校验通过后，入口必须继续完成风控自检并启动引擎。"""
+    cli = _cli_module()
+    hedge = _SharedAccountHedge()
+    _patch_shared_account_clients(monkeypatch, cli, hedge)
+    captured: dict[str, object] = {}
+
+    class FakeEngine:
+        def __init__(self, *_args, **_kwargs) -> None:
+            captured["engine_created"] = True
+
+        async def run_forever(self) -> None:
+            captured["ran_forever"] = True
+
+    monkeypatch.setattr(cli, "HedgeEngine", FakeEngine)
+
+    asyncio.run(
+        cli._main(_args(account="X10_GRID", allow_shared_account=True))
+    )
+
+    assert hedge.calls == [
+        ("positions", "全部"),
+        ("open_orders", "全部"),
+    ]
+    assert captured == {"engine_created": True, "ran_forever": True}
+    assert hedge.closed is True
+
+
+def test_shared_account_rejects_offline_selfcheck_before_constructing_clients(
+    monkeypatch,
+) -> None:
+    """共用模式依赖账户查询，不能伪装成纯离线风控自检。"""
+    cli = _cli_module()
+    monkeypatch.setenv("X10_HEDGE_VAULT_ID", "9002")
+    monkeypatch.setenv("X10_GRID_VAULT_ID", "9001")
+
+    def fail_constructor(*_args, **_kwargs):
+        pytest.fail("互斥参数必须在客户端构造前拒绝")
+
+    monkeypatch.setattr(cli, "LighterClient", fail_constructor)
+    monkeypatch.setattr(
+        cli,
+        "ExtendedClient",
+        SimpleNamespace(from_env=fail_constructor),
+    )
+
+    with pytest.raises(
+        cli.StartupError,
+        match="--allow-shared-account.*--risk-selfcheck-only.*不能同时使用",
+    ):
+        asyncio.run(
+            cli._main(
+                _args(
+                    allow_shared_account=True,
+                    risk_selfcheck_only=True,
+                )
+            )
+        )
 
 
 def test_rejects_missing_lighter_address_before_constructing_clients(monkeypatch) -> None:
@@ -92,6 +371,7 @@ def test_parser_uses_safe_defaults_and_environment_address(monkeypatch) -> None:
     args = cli._build_parser().parse_args([])
 
     assert args.live is False
+    assert args.allow_shared_account is False
     assert args.account == "X10_HEDGE"
     assert args.lighter_address == "0xwallet"
     assert args.market == "BTC"
@@ -103,6 +383,9 @@ def test_parser_uses_safe_defaults_and_environment_address(monkeypatch) -> None:
     assert args.maker_first_timeout == 0.0
     assert args.waive_risk == []
     assert args.risk_selfcheck_only is False
+
+    declared = cli._build_parser().parse_args(["--allow-shared-account"])
+    assert declared.allow_shared_account is True
 
 
 def test_risk_selfcheck_rejects_missing_real_adapter_capability() -> None:
@@ -168,6 +451,28 @@ def test_startup_summary_contains_account_and_each_risk_layer() -> None:
     assert "清算约束=启用" in summary
     assert "primary 名义上限=启用" in summary
     assert "对冲保证金监控=启用" in summary
+
+
+def test_startup_summary_marks_shared_account_and_warns_against_grid_process() -> None:
+    """共用模式必须在摘要中醒目标注，并提示不得同时运行网格进程。"""
+    cli = _cli_module()
+
+    summary = cli._startup_summary(
+        account_prefix="X10_GRID",
+        lighter_address="0xwallet",
+        account_index=5626,
+        args=_args(account="X10_GRID", allow_shared_account=True),
+        risk_statuses={
+            "position_visibility": "启用",
+            "hedge_execution": "启用",
+            "liquidation_constraints": "启用",
+            "primary_notional_cap": "启用",
+            "margin_monitor": "启用",
+        },
+    )
+
+    assert "Extended 账户模式：与网格共用" in summary
+    assert "网格进程不得同时运行" in summary
 
 
 def test_main_assembles_engine_prints_identity_and_closes_clients(

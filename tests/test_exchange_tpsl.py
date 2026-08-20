@@ -33,6 +33,65 @@ def test_filter_keeps_tpsl_and_reduce_only() -> None:
     assert ids == {"g1", "g2"}  # 只撤普通网格单，保留 TPSL 与 reduce_only
 
 
+def test_extended_account_wide_reads_omit_market_filter() -> None:
+    """共用账户门禁必须通过真实适配器查询全部持仓与全部开放订单。"""
+    calls = []
+    raw_position = SimpleNamespace(
+        id=1,
+        account_id=2,
+        market="ETH-USD",
+        status="OPENED",
+        side="SHORT",
+        leverage=Decimal("2"),
+        size=Decimal("0.01"),
+        value=Decimal("30"),
+        open_price=Decimal("3000"),
+        mark_price=Decimal("3001"),
+        liquidation_price=Decimal("4000"),
+        unrealised_pnl=Decimal("-0.01"),
+        realised_pnl=Decimal("0"),
+        tp_price=None,
+        sl_price=None,
+        adl=None,
+        created_at=1,
+        updated_at=2,
+    )
+    raw_order = _o("eth-grid")
+
+    async def get_positions(*, market_names=None, position_side=None):
+        calls.append(("positions", market_names, position_side))
+        return SimpleNamespace(data=[raw_position])
+
+    async def get_open_orders(
+        market_names=None,
+        order_type=None,
+        order_side=None,
+    ):
+        calls.append(("open_orders", market_names, order_type, order_side))
+        return SimpleNamespace(data=[raw_order])
+
+    client = ExtendedClient(
+        SimpleNamespace(
+            account=SimpleNamespace(
+                get_positions=get_positions,
+                get_open_orders=get_open_orders,
+            )
+        )
+    )
+
+    positions = asyncio.run(client.get_all_positions())
+    orders = asyncio.run(client.get_all_open_orders())
+
+    assert positions == [
+        Position("ETH-USD", Decimal("-0.01"), raw=raw_position)
+    ]
+    assert orders == [raw_order]
+    assert calls == [
+        ("positions", None, None),
+        ("open_orders", None, None, None),
+    ]
+
+
 def test_position_stop_loss_rounds_trigger_and_execution_prices(monkeypatch) -> None:
     """整仓 TPSL 的触发价与滑点执行价都必须按市场 tick 取整。"""
     rounded_inputs = []
