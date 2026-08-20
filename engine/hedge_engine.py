@@ -405,6 +405,31 @@ async def maker_first_hedge(
     # 从而被 post_only 拒绝。
     quote = await adapter.get_market_price(market)
     price = quote.ask if side is Side.SELL else quote.bid
+
+    # 订单查询能力缺失或运行时失败时，只能用挂单前后仓位差还原实际成交量。
+    # 这次前置读取不能省：maker 一旦挂出，再读到的仓位已经无法区分初始值与
+    # 成交增量，按原下单量补市价单会造成双倍对冲。
+    try:
+        position_before = Decimal(
+            str((await adapter.get_position(market)).signed_size)
+        )
+    except Exception as exc:  # noqa: BLE001 无基线就不能安全尝试 maker
+        logger.warning(
+            "maker 前仓位读取失败，跳过 maker 并直接吃单：%s",
+            exc,
+        )
+        await adapter.market_order(
+            market,
+            side,
+            amount,
+            reduce_only=reduce_only,
+        )
+        return HedgeFillResult(
+            filled=amount,
+            used_taker=True,
+            note="maker 前仓位不可读，已直接吃单",
+        )
+
     response = await adapter.place_limit_order(
         market,
         side,
@@ -424,8 +449,19 @@ async def maker_first_hedge(
     if order_id is None:
         raise RuntimeError("maker 下单响应缺少订单 ID，无法安全追踪")
 
+    order_getter = getattr(adapter, "get_order_by_id", None)
+    if isinstance(adapter, ExchangeAdapter):
+        implementation = getattr(type(adapter), "get_order_by_id", None)
+        if implementation is ExchangeAdapter.get_order_by_id:
+            order_getter = None
+    order_lookup_available = callable(order_getter)
+
     async def _read_order() -> tuple[Decimal, str]:
-        got = await adapter.get_order_by_id(market, order_id)
+        if not order_lookup_available:
+            raise NotImplementedError("适配器未实现按 ID 查询订单")
+        got = await order_getter(market, order_id)
+        if got is None:
+            raise LookupError(f"订单 {order_id} 暂未出现在查询结果中")
         data = _field(got, "data") or got
         raw_filled = _field(data, "filled_qty")
         raw_status = _field(data, "status")
@@ -436,17 +472,29 @@ async def maker_first_hedge(
     deadline = time.monotonic() + timeout_s
     filled = Decimal(0)
     terminal_statuses = {"FILLED", "CANCELLED", "EXPIRED", "REJECTED"}
-    while time.monotonic() < deadline:
-        await asyncio.sleep(poll_s)
-        filled, status = await _read_order()
-        if filled >= amount:
-            return HedgeFillResult(
-                filled=filled,
-                used_taker=False,
-                note="maker 全部成交",
-            )
-        if status in terminal_statuses:
-            break
+    fallback_reason = ""
+    if order_lookup_available:
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_s)
+            try:
+                filled, status = await _read_order()
+            except Exception as exc:  # noqa: BLE001 单查失效必须转仓位差降级
+                fallback_reason = f"订单状态读取失败（{exc}）"
+                logger.warning("%s，将撤单后按实际仓位差补单", fallback_reason)
+                break
+            if filled >= amount:
+                return HedgeFillResult(
+                    filled=filled,
+                    used_taker=False,
+                    note="maker 全部成交",
+                )
+            if status in terminal_statuses:
+                break
+    else:
+        fallback_reason = "适配器缺少订单状态查询能力"
+        if timeout_s > 0:
+            await asyncio.sleep(timeout_s)
+        logger.warning("%s，将撤单后按实际仓位差补单", fallback_reason)
 
     note = ""
     try:
@@ -455,15 +503,32 @@ async def maker_first_hedge(
         note = f"撤单失败（{exc}）"
         logger.warning("对冲撤单失败，将按重读结果决定是否吃单：%s", exc)
 
-    # 撤单成功与否都重读一次：撤单前的瞬间可能又成交了一部分，
-    # 按陈旧数据吃单会超额对冲。
-    filled, _status = await _read_order()
-    remaining = amount - filled
+    # 有单查能力时仍优先重读精确成交量；能力缺失、返回空或请求异常时，
+    # 统一退回实际仓位差。撤单失败也不能跳过这一步。
+    if not fallback_reason:
+        try:
+            filled, _status = await _read_order()
+        except Exception as exc:  # noqa: BLE001 单查瞬时失效同样安全降级
+            fallback_reason = f"撤单后订单状态读取失败（{exc}）"
+            logger.warning("%s，将按实际仓位差补单", fallback_reason)
+
+    if fallback_reason:
+        position_after = Decimal(
+            str((await adapter.get_position(market)).signed_size)
+        )
+        actual_delta = position_after - position_before
+        remaining_delta = target_delta - actual_delta
+        same_direction = remaining_delta * target_delta > 0
+        remaining = abs(remaining_delta) if same_direction else Decimal(0)
+        filled = min(amount, abs(actual_delta))
+        note = (note + f"；{fallback_reason}").lstrip("；")
+    else:
+        remaining = amount - filled
     if remaining <= 0:
         return HedgeFillResult(
             filled=filled,
             used_taker=False,
-            note=(note + "；重读发现已全部成交，未吃单").lstrip("；"),
+            note=(note + "；实际仓位差显示无需补单").lstrip("；"),
         )
 
     await adapter.market_order(

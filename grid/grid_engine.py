@@ -71,6 +71,8 @@ _RETRY_MAX_ATTEMPTS = 10
 _UTC_PLUS_8 = timezone(timedelta(hours=8))
 # 计划离场失败会每轮重试，但同类高等级告警最多每分钟一条。
 _SCHEDULED_CLOSE_ALERT_INTERVAL_S = 60.0
+# 对冲持续失效时每累计这么多轮再聚合告警一次，状态变化仍立即告警。
+_HEDGE_INTERLOCK_SUMMARY_EVERY = 100
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,16 @@ RISK_LAYER_REQUIREMENTS = {
         capabilities=("get_hourly_candles",),
         capability_target="candle_source",
         activation_flag="--trend-aware",
+    ),
+    "hedge_interlock": RiskLayerRequirement(
+        label="对冲存活互锁",
+        capabilities=(
+            "hedge_heartbeat_path",
+            "hedge_heartbeat_timeout_s",
+        ),
+        capability_target="config",
+        activation_flag="--hedge-heartbeat-path",
+        optional_when_disabled=True,
     ),
 }
 
@@ -160,8 +172,11 @@ class GridConfig:
     cancel_backoff_rounds: int = 3
     # 空元组表示默认不放弃任何层；仅允许填写 RISK_LAYER_REQUIREMENTS 的键。
     risk_waivers: tuple[str, ...] = ()
-    # None 表示程序化调用没有 CLI 来源；CLI 入口必须传入实际出现过的三个 flag。
+    # None 表示程序化调用没有 CLI 来源；CLI 入口必须传入实际出现过的关键 flag。
     explicit_risk_flags: tuple[str, ...] | None = None
+    # 两项都为 None 时禁用互锁，保持变更前逐单行为；只配置一项会被风控自检拒绝。
+    hedge_heartbeat_path: str | None = None
+    hedge_heartbeat_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
         """拒绝半配置与歧义边界，避免误把计划停机变成全天交易。"""
@@ -273,6 +288,9 @@ class GridEngine:
         self._scheduled_orders_cancelled = False
         self._scheduled_stop_flat = False
         self._last_scheduled_close_alert_ts = 0.0
+        self._hedge_interlock_active = False
+        self._hedge_interlock_reason = "未配置"
+        self._hedge_interlock_failure_count = 0
 
     def _trading_window_enabled(self) -> bool:
         """仅当两个边界都已配置时启用；半配置属于启动错误。"""
@@ -325,6 +343,141 @@ class GridEngine:
         )
 
     @property
+    def hedge_interlock_active(self) -> bool:
+        """返回当前对冲互锁是否生效，供入口心跳与状态面板读取。"""
+        return self._hedge_interlock_active
+
+    @property
+    def hedge_interlock_reason(self) -> str:
+        """返回最近一次对冲存活判定原因。"""
+        return self._hedge_interlock_reason
+
+    def _hedge_interlock_requested(self) -> bool:
+        """任一互锁参数出现即视为声明启用，半配置必须失败关闭。"""
+        return (
+            self.config.hedge_heartbeat_path is not None
+            or self.config.hedge_heartbeat_timeout_s is not None
+        )
+
+    def _set_hedge_interlock(self, active: bool, reason: str) -> None:
+        """更新互锁状态；变化立即告警，持续失效按轮次聚合。"""
+        was_active = self._hedge_interlock_active
+        self._hedge_interlock_active = active
+        self._hedge_interlock_reason = reason
+        if active:
+            self._hedge_interlock_failure_count += 1
+            count = self._hedge_interlock_failure_count
+            if not was_active:
+                logger.warning(
+                    "对冲互锁已触发：%s；已停止扩大敞口的新挂单，"
+                    "仅允许撤单与缩小敞口挂单",
+                    reason,
+                )
+            elif count % _HEDGE_INTERLOCK_SUMMARY_EVERY == 0:
+                logger.warning(
+                    "对冲互锁持续生效：%s；同类累计=%d轮",
+                    reason,
+                    count,
+                )
+            else:
+                logger.debug("对冲互锁持续生效：%s；累计=%d轮", reason, count)
+            return
+
+        self._hedge_interlock_failure_count = 0
+        if was_active:
+            logger.warning("对冲心跳已恢复：%s；对冲互锁已解除", reason)
+
+    def _refresh_hedge_interlock(self) -> bool:
+        """读取对冲 JSONL 末行并失败关闭地刷新互锁状态。"""
+        if not self._hedge_interlock_requested():
+            self._hedge_interlock_active = False
+            self._hedge_interlock_reason = "未配置"
+            self._hedge_interlock_failure_count = 0
+            return False
+
+        heartbeat_path = str(self.config.hedge_heartbeat_path or "").strip()
+        timeout = self.config.hedge_heartbeat_timeout_s
+        try:
+            timeout_s = float(timeout)
+        except (TypeError, ValueError):
+            timeout_s = 0.0
+        if not heartbeat_path or not math.isfinite(timeout_s) or timeout_s <= 0:
+            self._set_hedge_interlock(True, "互锁配置不完整：缺少心跳路径或有效超时")
+            return True
+
+        path = Path(heartbeat_path)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            self._set_hedge_interlock(True, f"对冲心跳文件不存在：{path}")
+            return True
+        except (OSError, UnicodeError) as exc:
+            self._set_hedge_interlock(True, f"对冲心跳文件读取失败：{exc}")
+            return True
+
+        if not lines:
+            self._set_hedge_interlock(True, "对冲心跳内容损坏：文件为空")
+            return True
+        try:
+            heartbeat = json.loads(lines[-1])
+        except (json.JSONDecodeError, TypeError) as exc:
+            self._set_hedge_interlock(True, f"对冲心跳末行损坏：{exc}")
+            return True
+        if not isinstance(heartbeat, dict):
+            self._set_hedge_interlock(True, "对冲心跳末行损坏：不是 JSON 对象")
+            return True
+
+        raw_ts = heartbeat.get("ts")
+        try:
+            heartbeat_ts = float(raw_ts)
+        except (TypeError, ValueError):
+            self._set_hedge_interlock(True, "对冲心跳缺少有效时间戳")
+            return True
+        if not math.isfinite(heartbeat_ts) or heartbeat_ts <= 0:
+            self._set_hedge_interlock(True, "对冲心跳缺少有效时间戳")
+            return True
+
+        age = time.time() - heartbeat_ts
+        if age > timeout_s:
+            self._set_hedge_interlock(
+                True,
+                f"对冲心跳陈旧：已 {age:.1f} 秒未更新，超时阈值 {timeout_s:g} 秒",
+            )
+            return True
+        if (
+            heartbeat.get("primary_read_ok") is not True
+            or heartbeat.get("hedge_read_ok") is not True
+        ):
+            self._set_hedge_interlock(
+                True,
+                "对冲心跳自报两腿读取失败："
+                f"primary_read_ok={heartbeat.get('primary_read_ok')!r}，"
+                f"hedge_read_ok={heartbeat.get('hedge_read_ok')!r}",
+            )
+            return True
+
+        self._set_hedge_interlock(
+            False,
+            f"心跳新鲜（年龄 {max(0.0, age):.1f} 秒）且两腿读取正常",
+        )
+        return False
+
+    def _hedge_interlock_allows(
+        self,
+        side: Side,
+        inv_usd: float,
+        order_notional_usd: float,
+    ) -> bool:
+        """互锁生效时仅允许让绝对敞口严格减小的方向与数量。"""
+        if not self._hedge_interlock_active:
+            return True
+        signed_order = (
+            order_notional_usd if side is Side.BUY else -order_notional_usd
+        )
+        projected = inv_usd + signed_order
+        return abs(projected) < abs(inv_usd)
+
+    @property
     def _log_step(self) -> float:
         return math.log(1 + self.config.spacing_pct)
 
@@ -349,6 +502,11 @@ class GridEngine:
             return self.config.hard_stop_dist > 0 or self.config.exchange_tpsl
         if layer == "trend_band":
             return self.config.trend_aware
+        if layer == "hedge_interlock":
+            return (
+                self.config.hedge_heartbeat_path is not None
+                or self.config.hedge_heartbeat_timeout_s is not None
+            )
         raise KeyError(f"未知风控层：{layer}")
 
     def _risk_capability_target(self, layer: str):
@@ -357,6 +515,8 @@ class GridEngine:
             return self.ext
         if requirement.capability_target == "candle_source":
             return self._candles
+        if requirement.capability_target == "config":
+            return self.config
         raise ValueError(
             f"风控层 {layer} 使用未知能力目标：{requirement.capability_target}"
         )
@@ -364,6 +524,16 @@ class GridEngine:
     def _has_risk_capability(self, layer: str, capability: str) -> bool:
         """判断能力是否真实实现，基类的空默认实现不算可用能力。"""
         target = self._risk_capability_target(layer)
+        if RISK_LAYER_REQUIREMENTS[layer].capability_target == "config":
+            value = getattr(target, capability, None)
+            if capability == "hedge_heartbeat_path":
+                return bool(str(value or "").strip())
+            if capability == "hedge_heartbeat_timeout_s":
+                try:
+                    return math.isfinite(float(value)) and float(value) > 0
+                except (TypeError, ValueError):
+                    return False
+            return value is not None
         method = getattr(target, capability, None)
         if not callable(method):
             return False
@@ -377,7 +547,7 @@ class GridEngine:
     def validate_risk_controls(self) -> dict[str, str]:
         """启动前校验全部风控层，记录摘要并拒绝未声明的缺失。
 
-        CLI 入口还会提供实际出现过的三个关键 flag。这样即使配置对象有
+        CLI 入口还会提供实际出现过的关键 flag。这样即使配置对象有
         12% 等历史默认值，也不能把「运维未显式配置」伪装成已确认启用。
         程序化调用没有 CLI 来源时仍按配置的真实开关和能力判断。
         """
@@ -415,6 +585,7 @@ class GridEngine:
                 explicit_flags is not None
                 and requirement.activation_flag is not None
                 and requirement.activation_flag not in explicit_flags
+                and (enabled or not requirement.optional_when_disabled)
             )
 
             if not enabled:
@@ -434,9 +605,16 @@ class GridEngine:
             if hard_stop_closed:
                 reasons.append("硬止损配置已关闭（hard_stop_dist <= 0）")
             if missing_capabilities:
-                reasons.append(
-                    "缺少能力 " + "、".join(missing_capabilities)
-                )
+                if layer == "hedge_interlock":
+                    reasons.append(
+                        "缺少心跳路径或有效超时配置（"
+                        + "、".join(missing_capabilities)
+                        + "）"
+                    )
+                else:
+                    reasons.append(
+                        "缺少能力 " + "、".join(missing_capabilities)
+                    )
             if missing_explicit_flag:
                 reasons.append(
                     f"未显式配置 {requirement.activation_flag}"
@@ -1051,6 +1229,8 @@ class GridEngine:
             "halted": state.halted if state is not None else False,
             "trading_window_state": self.trading_window_state,
             "planned_stop": self.trading_window_state == "planned_stop",
+            "hedge_interlock_active": self.hedge_interlock_active,
+            "hedge_interlock_reason": self.hedge_interlock_reason,
             "dist_to_liq_pct": self._last_dist_to_liq,
             "cfg": {
                 "unit": self.config.unit_usd,
@@ -1089,6 +1269,8 @@ class GridEngine:
             last_success_ts=self._last_success_ts,
             trading_window_state=self.trading_window_state,
             planned_stop=self.trading_window_state == "planned_stop",
+            hedge_interlock_active=self.hedge_interlock_active,
+            hedge_interlock_reason=self.hedge_interlock_reason,
         )
         tmp = live_path.with_suffix(live_path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1185,6 +1367,8 @@ class GridEngine:
         else:
             # K 线尚未读取，保护性动作沿用上一轮迟滞门控结果。
             blocked_side = state.blocked_side if state is not None else "BOTH"
+        # 互锁撤单优先占用写预算，避免成交翻单先耗尽预算后危险陈单仍留在盘口。
+        await self._cancel_interlock_expanding_orders(inv_usd)
         # _handle_fills 内部会先 drain retry；外层不得重复调用。
         await self._handle_fills(inv_usd, blocked_side=blocked_side)
 
@@ -1537,6 +1721,8 @@ class GridEngine:
         return "计划停机：窗口外，库存已归零，进程保持运行"
 
     async def run_once(self, include_slow: bool = True) -> str:
+        # 未配置时只复位内存状态且不触碰文件；配置后每轮都以末行判活。
+        self._refresh_hedge_interlock()
         if self._trading_window_enabled():
             if not self._is_trading_window_open():
                 return await self._run_scheduled_stop_cycle()
@@ -1578,9 +1764,11 @@ class GridEngine:
         if mode is GridMode.OFF:
             return await self._go_off(inv)
 
-        # 1) 处理成交：已挂但盘口消失的单=成交，翻到反向一格
+        # 1) 互锁撤单优先；未配置时是纯内存空操作，不改变既有调用实参。
+        await self._cancel_interlock_expanding_orders(inv_usd)
+        # 2) 处理成交：已挂但盘口消失的单=成交，翻到反向一格
         await self._handle_fills(inv_usd)
-        # 2) 维护阶梯：当前价上下各挂 N 格
+        # 3) 维护阶梯：当前价上下各挂 N 格
         return await self._maintain_ladder(price, inv_usd)
 
     async def _open_ids(self) -> set:
@@ -2148,6 +2336,23 @@ class GridEngine:
                 self._counters["rejected_terminal"] += 1
                 logger.warning("格%d 订单 %s 终态=REJECTED，仅移除不翻单", lv, rec["id"])
 
+    async def _cancel_interlock_expanding_orders(self, inv_usd: float) -> None:
+        """互锁生效后立即撤掉仍可能扩大敞口的已跟踪挂单。"""
+        if not self._hedge_interlock_active:
+            return
+        for level, record in list(self._orders.items()):
+            if record.get("status_pending"):
+                continue
+            raw_qty = record.get("qty")
+            notional = (
+                float(Decimal(str(raw_qty)) * self._level_price(level))
+                if raw_qty is not None
+                else float(self.config.unit_usd)
+            )
+            if self._hedge_interlock_allows(record["side"], inv_usd, notional):
+                continue
+            await self._cancel(level, why="对冲互锁撤扩大敞口挂单")
+
     async def _maintain_ladder(
         self,
         price: float,
@@ -2409,13 +2614,32 @@ class GridEngine:
                 cooldown["until"] - now,
             )
             return None
+        lp = self._level_price(level)
+        qty = qty if qty is not None else Decimal(str(self.config.unit_usd)) / lp
+        order_notional = float(qty * lp)
+        if not self._hedge_interlock_allows(side, inv_usd, order_notional):
+            projected = (
+                inv_usd + order_notional
+                if side is Side.BUY
+                else inv_usd - order_notional
+            )
+            logger.info(
+                "对冲互锁拒绝扩大敞口挂单：格%d 方向=%s 原因=%s；"
+                "当前敞口=$%.2f，订单名义=$%.2f，预计敞口=$%.2f；互锁原因=%s",
+                level,
+                side.value,
+                why or "未说明",
+                inv_usd,
+                order_notional,
+                projected,
+                self._hedge_interlock_reason,
+            )
+            return None
         if not reduce_only and not self._within_cap(side, inv_usd):
             self._log_cap_rejection(level, side, inv_usd, why)
             return None
-        lp = self._level_price(level)
         if not self._market_side_allows(level, side, lp):
             return None
-        qty = qty if qty is not None else Decimal(str(self.config.unit_usd)) / lp
         msg = f"{why}：{side.value} {qty:.6f}@{lp:.0f}(格{level}){' reduce-only' if reduce_only else ''}"
 
         def remember_failed() -> str:

@@ -443,6 +443,26 @@ class LighterClient(ExchangeAdapter):
             context="历史订单",
         )
 
+    async def get_order_by_id(
+        self,
+        market: str,
+        order_id,
+    ) -> LighterOrder | None:
+        """按引擎侧 ``client_order_index`` 查询活动单或近期历史单。
+
+        Lighter 没有在本适配器中暴露稳定的单笔查询端点，因此依次复用活动单
+        与历史单接口。maker 超时后的撤单竞态通常只涉及刚创建的订单，近期
+        历史窗口足以覆盖；两个来源都未命中属于正常结果，返回 ``None``。
+        """
+        target = int(order_id)
+        for order in await self.get_open_orders(market):
+            if order.id == target:
+                return order
+        for order in await self.get_orders_history(market, limit=100):
+            if order.id == target:
+                return order
+        return None
+
     async def market_order(
         self,
         market: str,

@@ -128,6 +128,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="距强平价硬止损比例（默认值仍为 0.12，但必须显式传入或声明放弃）",
     )
     parser.add_argument(
+        "--hedge-heartbeat-path",
+        default=None,
+        help="对冲 JSONL 心跳路径；默认不配置，即不启用互锁",
+    )
+    parser.add_argument(
+        "--hedge-interval",
+        type=float,
+        default=30.0,
+        help="对冲轮询间隔秒数，互锁超时固定取其 3 倍（默认 30）",
+    )
+    parser.add_argument(
         "--waive-risk",
         action="append",
         default=[],
@@ -169,6 +180,11 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.unit > args.max_inv:
         _reject_startup("每格名义不得超过单边库存上限")
     if (
+        getattr(args, "hedge_heartbeat_path", None) is not None
+        and getattr(args, "hedge_interval", 0) <= 0
+    ):
+        _reject_startup("启用对冲互锁时，对冲轮询间隔必须大于 0")
+    if (
         args.live
         and not getattr(args, "risk_selfcheck_only", False)
         and not (os.environ.get("LIGHTER_API_PRIVATE_KEY") or "").strip()
@@ -188,9 +204,15 @@ def _grid_config(args: argparse.Namespace) -> GridConfig:
             ("--trend-aware", args.trend_aware),
             ("--max-drawdown", max_drawdown_arg is not None),
             ("--hard-stop-dist", hard_stop_arg is not None),
+            (
+                "--hedge-heartbeat-path",
+                bool(str(getattr(args, "hedge_heartbeat_path", "") or "").strip()),
+            ),
         )
         if present
     )
+    hedge_heartbeat_path = getattr(args, "hedge_heartbeat_path", None)
+    hedge_interval = float(getattr(args, "hedge_interval", 30.0))
     return GridConfig(
         market=args.market,
         spacing_pct=args.spacing,
@@ -210,6 +232,10 @@ def _grid_config(args: argparse.Namespace) -> GridConfig:
         hard_stop_dist=hard_stop_dist,
         risk_waivers=tuple(getattr(args, "waive_risk", ())),
         explicit_risk_flags=explicit_risk_flags,
+        hedge_heartbeat_path=hedge_heartbeat_path,
+        hedge_heartbeat_timeout_s=(
+            3 * hedge_interval if hedge_heartbeat_path is not None else None
+        ),
     )
 
 
@@ -261,6 +287,16 @@ def _heartbeat_payload(
         "open_orders": len(orders) if orders is not None else None,
         "trading_window_state": trading_window_state,
         "planned_stop": trading_window_state == "planned_stop",
+        "hedge_interlock_active": getattr(
+            engine,
+            "hedge_interlock_active",
+            False,
+        ),
+        "hedge_interlock_reason": getattr(
+            engine,
+            "hedge_interlock_reason",
+            "未配置",
+        ),
         "success": success,
     }
 
@@ -362,7 +398,7 @@ async def _main(args: argparse.Namespace) -> None:
         logger.info(
             "Lighter 做市启动：标的=%s，档位=每边%d，每格金额=$%g，"
             "库存硬顶=$%g，上限策略=%s，格距=%g，轮询间隔=%g秒，"
-            "慢路径=%g秒，交易窗口=%s，dry_run=%s",
+            "慢路径=%g秒，交易窗口=%s，对冲互锁=%s，dry_run=%s",
             args.market,
             args.levels,
             args.unit,
@@ -372,6 +408,12 @@ async def _main(args: argparse.Namespace) -> None:
             args.interval,
             args.slow_interval,
             window_summary,
+            (
+                f"启用（心跳={config.hedge_heartbeat_path}，"
+                f"超时={config.hedge_heartbeat_timeout_s:g}秒）"
+                if config.hedge_heartbeat_path is not None
+                else "未配置"
+            ),
             not args.live,
         )
         await engine.run_forever()

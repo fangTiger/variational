@@ -18,6 +18,7 @@ import time  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from pathlib import Path  # noqa: E402
 
+from adapters.base import ExchangeAdapter  # noqa: E402
 from adapters.extended_client import ExtendedClient  # noqa: E402
 from adapters.lighter_client import LighterClient  # noqa: E402
 from engine.hedge_engine import HedgeConfig, HedgeEngine, HedgeState  # noqa: E402
@@ -27,6 +28,32 @@ logger = get_logger("lighter_hedge")
 
 _ROOT = Path(__file__).resolve().parent.parent
 _HEDGE_SNAPSHOT = _ROOT / "data" / "lighter_hedge.jsonl"
+
+HEDGE_RISK_LAYER_REQUIREMENTS = {
+    "position_visibility": (
+        "两腿持仓读取",
+        (("primary", "get_position"), ("hedge", "get_position")),
+    ),
+    "hedge_execution": (
+        "对冲执行",
+        (("hedge", "market_order"),),
+    ),
+    "liquidation_constraints": (
+        "清算约束",
+        (
+            ("primary", "get_liquidation_info"),
+            ("hedge", "get_liquidation_info"),
+        ),
+    ),
+    "primary_notional_cap": (
+        "primary 名义上限",
+        (("primary", "get_market_price"),),
+    ),
+    "margin_monitor": (
+        "对冲保证金监控",
+        (("hedge", "get_free_margin_ratio"), ("hedge", "get_balance")),
+    ),
+}
 
 
 class StartupError(RuntimeError):
@@ -87,6 +114,19 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Decimal,
         default=Decimal("0.20"),
         help="Extended 可用保证金率告警阈值（默认 0.20）",
+    )
+    parser.add_argument(
+        "--waive-risk",
+        action="append",
+        default=[],
+        choices=tuple(HEDGE_RISK_LAYER_REQUIREMENTS),
+        metavar="LAYER",
+        help="知情放弃指定风控能力层；可重复传入",
+    )
+    parser.add_argument(
+        "--risk-selfcheck-only",
+        action="store_true",
+        help="只执行离线风控能力自检，不连接交易所或进入循环",
     )
     return parser
 
@@ -261,14 +301,83 @@ def _validate_startup(args: argparse.Namespace) -> tuple[str, str]:
     return account_prefix, lighter_address
 
 
+def _has_real_capability(target, capability: str) -> bool:
+    """基类占位方法不算真实能力，避免测试桩与生产适配器契约漂移。"""
+    method = getattr(target, capability, None)
+    if not callable(method):
+        return False
+    if isinstance(target, ExchangeAdapter):
+        implementation = getattr(type(target), capability, None)
+        base_implementation = getattr(ExchangeAdapter, capability, None)
+        if implementation is base_implementation:
+            return False
+    return True
+
+
+def _validate_risk_controls(primary, hedge, args: argparse.Namespace) -> dict[str, str]:
+    """离线校验对冲所需能力，缺失且未知情放弃时拒绝启动。"""
+    waivers = set(getattr(args, "waive_risk", ()))
+    unknown = waivers - HEDGE_RISK_LAYER_REQUIREMENTS.keys()
+    if unknown:
+        raise StartupError("拒绝启动：未知的风控知情放弃层：" + "、".join(sorted(unknown)))
+
+    targets = {"primary": primary, "hedge": hedge}
+    statuses: dict[str, str] = {}
+    issues: list[str] = []
+    for layer, (label, requirements) in HEDGE_RISK_LAYER_REQUIREMENTS.items():
+        active_requirements = list(requirements)
+        if layer == "hedge_execution" and args.maker_first_timeout > 0:
+            active_requirements.extend(
+                [
+                    ("hedge", "get_market_price"),
+                    ("hedge", "place_limit_order"),
+                    ("hedge", "cancel_order"),
+                    ("hedge", "get_position"),
+                ]
+            )
+        missing = [
+            f"{target_name}.{capability}"
+            for target_name, capability in active_requirements
+            if not _has_real_capability(targets[target_name], capability)
+        ]
+        if not missing:
+            statuses[layer] = "启用"
+            continue
+        reason = f"{label}缺少能力 " + "、".join(missing)
+        if layer in waivers:
+            statuses[layer] = "不可用（知情放弃）"
+            logger.warning("对冲风控层已知情放弃：%s", reason)
+        else:
+            statuses[layer] = "不可用"
+            issues.append(reason)
+
+    summary = "；".join(
+        f"{HEDGE_RISK_LAYER_REQUIREMENTS[layer][0]}={status}"
+        for layer, status in statuses.items()
+    )
+    logger.info("对冲风控状态摘要：%s", summary)
+    if issues:
+        raise StartupError(
+            "拒绝启动：对冲风控完整性自检失败："
+            + "；".join(issues)
+            + "。如确需无此保护运行，必须显式声明对应知情放弃层"
+        )
+    return statuses
+
+
 def _startup_summary(
     *,
     account_prefix: str,
     lighter_address: str,
-    account_index: int,
+    account_index: int | str,
     args: argparse.Namespace,
+    risk_statuses: dict[str, str],
 ) -> str:
     """生成同时用于控制台与文件日志的启动摘要。"""
+    risk_summary = "；".join(
+        f"{HEDGE_RISK_LAYER_REQUIREMENTS[layer][0]}={status}"
+        for layer, status in risk_statuses.items()
+    )
     return "\n".join(
         [
             f"Lighter 地址：{lighter_address}",
@@ -278,6 +387,7 @@ def _startup_summary(
             f"名义上限：{args.max_primary_notional} USD",
             f"保证金率告警阈值：{args.min_hedge_free_margin_ratio:.0%}",
             f"maker 优先等待：{args.maker_first_timeout:g} 秒（0=关闭）",
+            f"风控状态：{risk_summary}",
             f"dry_run：{not args.live}",
         ]
     )
@@ -290,6 +400,7 @@ async def _main(args: argparse.Namespace) -> None:
     hedge = None
     try:
         hedge = ExtendedClient.from_env(prefix=account_prefix)
+        risk_statuses = _validate_risk_controls(primary, hedge, args)
         config = HedgeConfig(
             market=args.hedge_market,
             primary_market=args.market,
@@ -315,6 +426,18 @@ async def _main(args: argparse.Namespace) -> None:
             on_auth_error=None,
         )
 
+        if getattr(args, "risk_selfcheck_only", False):
+            summary = _startup_summary(
+                account_prefix=account_prefix,
+                lighter_address=lighter_address,
+                account_index="未连接",
+                args=args,
+                risk_statuses=risk_statuses,
+            )
+            print(summary)
+            logger.info("对冲风控完整性自检通过；未连接交易所\n%s", summary)
+            return
+
         # 先解析账户索引才能满足启动自检输出；run_forever 随后会统一连接两腿。
         await primary.connect()
         if primary.account_index is None:
@@ -324,6 +447,7 @@ async def _main(args: argparse.Namespace) -> None:
             lighter_address=lighter_address,
             account_index=primary.account_index,
             args=args,
+            risk_statuses=risk_statuses,
         )
         print(summary)
         logger.info("Lighter RH 积分对冲启动\n%s", summary)

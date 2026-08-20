@@ -56,10 +56,35 @@ def test_parser_uses_safe_defaults(monkeypatch) -> None:
     assert args.candle_account == "X10_HEDGE"
     assert args.state_path == "data/lighter_mm/state.json"
     assert args.trend_aware is False
+    assert args.hedge_heartbeat_path is None
+    assert args.hedge_interval == 30.0
     assert "硬顶 3750" in cli.build_parser().format_help()
     assert Path(args.state_path).parent.resolve() != Path("data").resolve()
     assert cli._grid_config(args).state_path == args.state_path
     assert cli._grid_config(args).trend_aware is False
+    assert cli._grid_config(args).hedge_heartbeat_path is None
+    assert cli._grid_config(args).hedge_heartbeat_timeout_s is None
+
+
+def test_grid_config_uses_three_hedge_intervals_as_interlock_timeout(
+    monkeypatch,
+) -> None:
+    """对冲 interval=30 秒时互锁阈值必须是 90 秒。"""
+    monkeypatch.setenv("LIGHTER_RH_L1_ADDRESS", "0xwallet")
+    cli = _cli_module()
+
+    args = cli.build_parser().parse_args(
+        [
+            "--hedge-heartbeat-path",
+            "data/lighter_hedge.jsonl",
+            "--hedge-interval",
+            "30",
+        ]
+    )
+    config = cli._grid_config(args)
+
+    assert config.hedge_heartbeat_path == "data/lighter_hedge.jsonl"
+    assert config.hedge_heartbeat_timeout_s == 90.0
 
 
 def test_default_state_path_isolates_all_grid_derived_files(monkeypatch) -> None:
@@ -382,6 +407,8 @@ def test_heartbeat_appends_complete_successful_round(monkeypatch, tmp_path) -> N
             "open_orders": 2,
             "trading_window_state": "disabled",
             "planned_stop": False,
+            "hedge_interlock_active": False,
+            "hedge_interlock_reason": "未配置",
             "success": True,
         }
 

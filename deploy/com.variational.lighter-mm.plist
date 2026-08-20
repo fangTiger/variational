@@ -40,6 +40,10 @@
 		<string>05:00</string>
 		<string>--trading-window-end</string>
 		<string>20:00</string>
+		<string>--hedge-heartbeat-path</string>
+		<string>data/lighter_hedge.jsonl</string>
+		<string>--hedge-interval</string>
+		<string>30</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

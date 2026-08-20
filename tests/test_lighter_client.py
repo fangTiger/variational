@@ -1225,6 +1225,43 @@ def test_get_orders_history_reads_inactive_orders(tmp_path) -> None:
     assert got[0].filled_qty == Decimal("0.00300")
 
 
+def test_get_order_by_id_returns_status_and_filled_quantity(tmp_path) -> None:
+    """按引擎保存的 client_order_index 返回统一订单视图。"""
+    client = _trading_client(
+        tmp_path,
+        _FakeSigner(),
+        orders=[],
+        history=[
+            _raw_order(
+                client_order_index=42,
+                status="filled",
+                filled_base_amount="0.00300",
+            )
+        ],
+    )
+
+    got = _run_and_close(client, client.get_order_by_id("BTC", 42))
+
+    assert got is not None
+    assert got.id == 42
+    assert got.status == "FILLED"
+    assert got.filled_qty == Decimal("0.00300")
+
+
+def test_get_order_by_id_returns_none_when_order_does_not_exist(tmp_path) -> None:
+    """活动单与历史单都没有目标时返回 None，不把正常未命中升级成异常。"""
+    client = _trading_client(
+        tmp_path,
+        _FakeSigner(),
+        orders=[_raw_order(client_order_index=41)],
+        history=[_raw_order(client_order_index=43, status="filled")],
+    )
+
+    got = _run_and_close(client, client.get_order_by_id("BTC", 42))
+
+    assert got is None
+
+
 def test_cancel_order_resolves_client_index_to_exchange_index(tmp_path) -> None:
     """引擎传的是 client_order_index，签名要的是 order_index。
 

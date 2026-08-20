@@ -122,6 +122,50 @@ class _Adapter:
         return _Response(_Order("M1", status="FILLED"))
 
 
+class _AdapterWithoutOrderLookup:
+    """刻意不实现单查能力，模拟尚未补齐能力的新交易适配器。"""
+
+    def __init__(self, position_sequence) -> None:
+        self._positions = list(position_sequence)
+        self.cancelled: list[str] = []
+        self.market_orders: list[dict] = []
+
+    async def get_market_price(self, market):
+        return MarketPrice(market, bid=Decimal("60000"), ask=Decimal("60001"))
+
+    async def get_position(self, market):
+        size = self._positions[0] if len(self._positions) == 1 else self._positions.pop(0)
+        return Position(market, Decimal(str(size)))
+
+    async def place_limit_order(
+        self,
+        market,
+        side,
+        amount,
+        price,
+        *,
+        post_only=True,
+        reduce_only=False,
+    ):
+        del market, side, amount, price, post_only, reduce_only
+        return _Response(_Order("L1"))
+
+    async def cancel_order(self, market, order_id):
+        del market
+        self.cancelled.append(order_id)
+
+    async def market_order(self, market, side, amount, *, reduce_only=False):
+        self.market_orders.append(
+            {
+                "market": market,
+                "side": side,
+                "amount": amount,
+                "reduce_only": reduce_only,
+            }
+        )
+        return _Response(_Order("M1", filled=amount, status="FILLED"))
+
+
 def _signature_shape(method):
     """只比较调用契约，不要求测试桩复制生产类型注解。"""
     return [
@@ -257,6 +301,39 @@ def test_fully_filled_after_cancel_failure_places_no_taker():
     assert adapter.order_reads == 2
     assert adapter.market_orders == []
     assert result.used_taker is False
+
+
+def test_missing_order_lookup_capability_uses_safe_fallback() -> None:
+    """真实缺少单查方法时不得泄漏 AttributeError / NotImplementedError。"""
+    adapter = _AdapterWithoutOrderLookup([Decimal("0"), Decimal("0")])
+    assert not hasattr(adapter, "get_order_by_id")
+
+    result = _run(adapter, timeout_s=0.0)
+
+    assert adapter.cancelled == ["L1"]
+    assert adapter.market_orders[0]["amount"] == Decimal("1")
+    assert result.used_taker is True
+
+
+def test_missing_order_lookup_fallback_uses_actual_position_delta() -> None:
+    """maker 已成交 0.4 时只补 0.6，绝不能按原下单量再吃 1.0。"""
+    adapter = _AdapterWithoutOrderLookup(
+        [Decimal("0"), Decimal("-0.4")]
+    )
+    assert not hasattr(adapter, "get_order_by_id")
+
+    result = _run(adapter, timeout_s=0.0)
+
+    assert adapter.cancelled == ["L1"]
+    assert adapter.market_orders == [
+        {
+            "market": "BTC-USD",
+            "side": Side.SELL,
+            "amount": Decimal("0.6"),
+            "reduce_only": False,
+        }
+    ]
+    assert result.filled == Decimal("1")
 
 
 def test_zero_delta_places_nothing():

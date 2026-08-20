@@ -101,6 +101,73 @@ def test_parser_uses_safe_defaults_and_environment_address(monkeypatch) -> None:
     assert args.rebalance_threshold == Decimal("0.02")
     assert args.min_hedge_free_margin_ratio == Decimal("0.20")
     assert args.maker_first_timeout == 0.0
+    assert args.waive_risk == []
+    assert args.risk_selfcheck_only is False
+
+
+def test_risk_selfcheck_rejects_missing_real_adapter_capability() -> None:
+    """桩刻意缺 get_position，验证失败路径而不是只伪造成功能力。"""
+    cli = _cli_module()
+
+    class ReadablePrimary:
+        async def get_position(self, _market):
+            return Position("BTC", Decimal("0"))
+
+        async def get_market_price(self, _market):
+            return SimpleNamespace(mid=Decimal("60000"))
+
+        async def get_liquidation_info(self, _market):
+            return None
+
+    class HedgeWithoutPositionRead:
+        async def get_liquidation_info(self, _market):
+            return None
+
+        async def market_order(self, *_args, **_kwargs):
+            return None
+
+        async def get_free_margin_ratio(self):
+            return Decimal("1")
+
+        async def get_balance(self):
+            return SimpleNamespace(equity=Decimal("100"))
+
+    hedge = HedgeWithoutPositionRead()
+    assert not hasattr(hedge, "get_position")
+
+    with pytest.raises(cli.StartupError, match="两腿持仓读取.*get_position"):
+        cli._validate_risk_controls(
+            ReadablePrimary(),
+            hedge,
+            _args(waive_risk=[]),
+        )
+
+
+def test_startup_summary_contains_account_and_each_risk_layer() -> None:
+    """启动摘要必须同时暴露所选账户与每层风控自检结果。"""
+    cli = _cli_module()
+
+    summary = cli._startup_summary(
+        account_prefix="X10_FUNDED_HEDGE",
+        lighter_address="0xwallet",
+        account_index=5626,
+        args=_args(account="X10_FUNDED_HEDGE"),
+        risk_statuses={
+            "position_visibility": "启用",
+            "hedge_execution": "启用",
+            "liquidation_constraints": "启用",
+            "primary_notional_cap": "启用",
+            "margin_monitor": "启用",
+        },
+    )
+
+    assert "Extended 账户前缀：X10_FUNDED_HEDGE" in summary
+    assert "风控状态：" in summary
+    assert "两腿持仓读取=启用" in summary
+    assert "对冲执行=启用" in summary
+    assert "清算约束=启用" in summary
+    assert "primary 名义上限=启用" in summary
+    assert "对冲保证金监控=启用" in summary
 
 
 def test_main_assembles_engine_prints_identity_and_closes_clients(
@@ -125,6 +192,15 @@ def test_main_assembles_engine_prints_identity_and_closes_clients(
             captured["lighter_connects"] = captured.get("lighter_connects", 0) + 1
             self.account_index = 5626
 
+        async def get_position(self, market):
+            return Position(market, Decimal("0"))
+
+        async def get_market_price(self, market):
+            return SimpleNamespace(market=market, mid=Decimal("60000"))
+
+        async def get_liquidation_info(self, _market):
+            return None
+
         async def close(self) -> None:
             self.closed = True
 
@@ -138,6 +214,34 @@ def test_main_assembles_engine_prints_identity_and_closes_clients(
         def from_env(cls, prefix: str):
             captured["account_prefix"] = prefix
             return cls()
+
+        async def get_position(self, market):
+            return Position(market, Decimal("0"))
+
+        async def get_market_price(self, market):
+            return SimpleNamespace(
+                market=market,
+                bid=Decimal("59999"),
+                ask=Decimal("60001"),
+            )
+
+        async def market_order(self, *_args, **_kwargs):
+            return None
+
+        async def place_limit_order(self, *_args, **_kwargs):
+            return SimpleNamespace(id="order-1")
+
+        async def cancel_order(self, *_args, **_kwargs):
+            return None
+
+        async def get_liquidation_info(self, _market):
+            return None
+
+        async def get_free_margin_ratio(self):
+            return Decimal("1")
+
+        async def get_balance(self):
+            return SimpleNamespace(equity=Decimal("1000"))
 
         async def close(self) -> None:
             self.closed = True
@@ -216,6 +320,7 @@ def test_main_assembles_engine_prints_identity_and_closes_clients(
     assert "标的：BTC → BTC-USD" in output
     assert "名义上限：2500 USD" in output
     assert "maker 优先等待：12 秒（0=关闭）" in output
+    assert "风控状态：两腿持仓读取=启用" in output
     assert "dry_run：False" in output
 
 
