@@ -6,33 +6,41 @@
 	<dict>
 		<key>PYTHONPATH</key>
 		<string>/Users/captain/python/variational</string>
-		<key>SSL_CERT_FILE</key>
-		<string>/Users/captain/python/variational/.venv/lib/python3.11/site-packages/certifi/cacert.pem</string>
 	</dict>
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>
-	<string>com.variational.lighter-mm</string>
+	<string>com.variational.grid-bot</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/captain/python/variational/.venv/bin/python</string>
 		<string>-m</string>
-		<string>tools.run_lighter_mm</string>
+		<string>tools.run_grid</string>
 		<string>--live</string>
+		<string>--trend-aware</string>
+		<string>--spacing</string>
+		<string>0.000986</string>
 		<string>--unit</string>
 		<string>300</string>
 		<string>--levels</string>
-		<string>10</string>
+		<string>30</string>
 		<string>--max-inv</string>
 		<string>3750</string>
-		<string>--spacing</string>
-		<string>0.000986</string>
+		<string>--min-half-frac</string>
+		<string>0.03</string>
 		<string>--interval</string>
 		<string>2.5</string>
-		<string>--trend-aware</string>
-		<string>--max-drawdown</string>
-		<string>0.12</string>
+		<string>--slow-interval</string>
+		<string>30</string>
+		<string>--adx-off</string>
+		<string>999</string>
+		<string>--adx-resume</string>
+		<string>999</string>
 		<string>--hard-stop-dist</string>
+		<string>0.12</string>
+		<string>--donchian</string>
+		<string>96</string>
+		<string>--max-drawdown</string>
 		<string>0.12</string>
 		<string>--wallet-exposure-ratio</string>
 		<string>3.0</string>
@@ -44,9 +52,9 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Users/captain/python/variational/logs/lighter-mm.err.log</string>
+	<string>/Users/captain/python/variational/logs/grid-bot.err.log</string>
 	<key>StandardOutPath</key>
-	<string>/Users/captain/python/variational/logs/lighter-mm.out.log</string>
+	<string>/Users/captain/python/variational/logs/grid-bot.out.log</string>
 	<key>ThrottleInterval</key>
 	<integer>30</integer>
 	<key>WorkingDirectory</key>

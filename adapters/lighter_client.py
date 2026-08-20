@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,13 @@ logger = get_logger("lighter_client")
 BASE_URL = "https://api.rh.lighter.xyz"
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_MARKET_ORDER_SLIPPAGE = Decimal("0.01")
+
+
+@dataclass(frozen=True)
+class LighterBalance:
+    """供通用引擎读取的 Lighter 权益视图。"""
+
+    equity: Decimal
 
 
 class LighterClient(ExchangeAdapter):
@@ -196,6 +204,36 @@ class LighterClient(ExchangeAdapter):
             raise ValueError("Lighter 账户详情响应缺少 accounts")
         return Decimal(str(accounts[0]["collateral"]))
 
+    async def get_balance(self) -> LighterBalance:
+        """返回包含未实现盈亏的账户权益视图。
+
+        权益读取 ``/api/v1/account`` 的 ``total_asset_value``。按 Lighter
+        官方口径，Total Account Value = Collateral + Unrealized PnL，
+        因而该值包含全部未平仓仓位的未实现盈亏，与 ``get_collateral()``
+        返回的抵押品不是同一口径。查询、响应结构或非正权益异常会原样抛出，
+        绝不把读取失败伪造成零权益。
+        """
+        account_index = self._require_account_index()
+        data = await self._get_json(
+            "/api/v1/account",
+            params={"by": "index", "value": str(account_index)},
+        )
+        self._raise_api_error(data, context="账户详情查询")
+        accounts = data.get("accounts")
+        if (
+            not isinstance(accounts, list)
+            or not accounts
+            or not isinstance(accounts[0], dict)
+        ):
+            raise ValueError("Lighter 账户详情响应缺少 accounts")
+        raw_equity = accounts[0].get("total_asset_value")
+        if raw_equity is None:
+            raise ValueError("Lighter 账户详情响应缺少 total_asset_value")
+        equity = Decimal(str(raw_equity))
+        if not equity.is_finite() or equity <= 0:
+            raise ValueError(f"Lighter 账户权益必须为正数：{raw_equity!r}")
+        return LighterBalance(equity=equity)
+
     @staticmethod
     def _extract_market_details(data: dict) -> list[dict[str, Any]]:
         """提取订单簿详情列表，响应结构异常时抛出。"""
@@ -205,19 +243,30 @@ class LighterClient(ExchangeAdapter):
                 return LighterClient._validate_dict_items(items, context=key)
         raise ValueError("Lighter 市场详情响应缺少 order_book_details 数组")
 
-    async def get_market_price(self, market: str) -> MarketPrice:
-        """用订单簿详情中的标记价构造统一行情。"""
-        data = await self._get_json("/api/v1/orderBookDetails")
-        self._raise_api_error(data, context="市场详情查询")
-        target = market.upper()
-        for detail in self._extract_market_details(data):
-            if str(detail.get("symbol", "")).upper() != target:
-                continue
-            mark_price = Decimal(str(detail["mark_price"]))
-            if mark_price <= 0:
-                raise ValueError(f"Lighter {market} mark_price 必须为正")
-            return MarketPrice(market=market, bid=mark_price, ask=mark_price)
-        raise KeyError(f"Lighter 市场详情中没有标的 {market}")
+    async def get_market_price(self, market: str) -> MarketPrice | None:
+        """读取真实买一卖一；盘口不可用时返回 None 供引擎降级放行。"""
+        try:
+            meta = await self._load_market_meta(market)
+            data = await self._get_json(
+                "/api/v1/orderBookOrders",
+                params={"market_id": str(meta["market_id"]), "limit": "1"},
+            )
+            self._raise_api_error(data, context="盘口查询")
+            asks = data.get("asks")
+            bids = data.get("bids")
+            if not isinstance(asks, list) or not asks:
+                return None
+            if not isinstance(bids, list) or not bids:
+                return None
+            if not isinstance(asks[0], dict) or not isinstance(bids[0], dict):
+                return None
+            ask = Decimal(str(asks[0]["price"]))
+            bid = Decimal(str(bids[0]["price"]))
+            if bid <= 0 or ask <= 0 or bid >= ask:
+                return None
+            return MarketPrice(market=market, bid=bid, ask=ask)
+        except Exception:  # noqa: BLE001 盘口保护必须失败开放，由引擎统一告警
+            return None
 
     async def get_liquidation_info(self, market: str) -> tuple[Decimal, Decimal] | None:
         """返回标记价与清算价；无仓或清算价为零时返回 None。"""
@@ -227,8 +276,8 @@ class LighterClient(ExchangeAdapter):
         liquidation_price = Decimal(str(position.raw.get("liquidation_price", "0") or "0"))
         if liquidation_price <= 0:
             return None
-        market_price = await self.get_market_price(market)
-        return market_price.mid, liquidation_price
+        mark_price = await self.get_mark_price(market)
+        return mark_price, liquidation_price
 
     async def _load_market_meta(self, market: str) -> dict[str, Any]:
         """读取并缓存市场精度；交易参数绝不依靠猜测。"""
@@ -407,7 +456,7 @@ class LighterClient(ExchangeAdapter):
         meta = await self._load_market_meta(market)
         signer = self._require_signer()
         client_order_index = self._coi.next()
-        mark_price = (await self.get_market_price(market)).mid
+        mark_price = await self.get_mark_price(market)
         self._require_min_quote(meta, mark_price, amount)
         price_multiplier = (
             Decimal(1) - DEFAULT_MARKET_ORDER_SLIPPAGE
@@ -541,11 +590,20 @@ class LighterClient(ExchangeAdapter):
     async def get_mark_price(self, market: str) -> Decimal:
         """标记价。
 
-        Lighter 的 `get_market_price` 本就用订单簿详情里的 `mark_price`
-        填充买卖两边，因此中值即标记价。显式覆盖是为了让这一等价关系
-        可见——Extended 那边中值与标记价并不相等。
+        标记价继续读取订单簿详情，不能用真实盘口中值替代，否则清算距离、
+        硬止损和市价单滑点基准都会发生无关变化。
         """
-        return (await self.get_market_price(market)).mid
+        data = await self._get_json("/api/v1/orderBookDetails")
+        self._raise_api_error(data, context="市场详情查询")
+        target = market.upper()
+        for detail in self._extract_market_details(data):
+            if str(detail.get("symbol", "")).upper() != target:
+                continue
+            mark_price = Decimal(str(detail["mark_price"]))
+            if mark_price <= 0:
+                raise ValueError(f"Lighter {market} mark_price 必须为正")
+            return mark_price
+        raise KeyError(f"Lighter 市场详情中没有标的 {market}")
 
     async def round_price(self, market: str, price: Decimal) -> Decimal:
         """按市场价格精度对齐。

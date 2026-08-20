@@ -103,6 +103,8 @@ def test_order_index_kept_separately_for_cancellation() -> None:
         ("filled", "FILLED"),
         ("canceled", "CANCELLED"),
         ("cancelled", "CANCELLED"),
+        ("canceled-post-only", "CANCELLED-POST-ONLY"),
+        ("canceled-self-trade", "CANCELLED-SELF-TRADE"),
         ("expired", "EXPIRED"),
         ("open", "OPEN"),
     ],

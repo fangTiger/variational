@@ -11,10 +11,12 @@ import pytest
 
 from adapters import extended_client
 from adapters.base import Position
-from grid.grid_engine import GridConfig, GridEngine
+from grid.grid_engine import RISK_LAYER_REQUIREMENTS, GridConfig, GridEngine
 from grid.grid_state import GridState
 from grid.regime import GridMode
 from tools.run_grid import _build_parser
+
+_ALL_RISK_WAIVERS = tuple(RISK_LAYER_REQUIREMENTS)
 
 
 def test_request_timeout_is_bounded() -> None:
@@ -207,7 +209,12 @@ def test_failed_rounds_increment_counter_and_write_live_snapshot(
     """短时连续失败写入快照，但未满 60 秒不得升级 CRITICAL。"""
     eng = GridEngine(
         object(),
-        GridConfig(state_path=str(tmp_path / "grid_state.json"), poll_interval=0),
+        GridConfig(
+            state_path=str(tmp_path / "grid_state.json"),
+            poll_interval=0,
+            # 本场景只测失败计数，object() 不代表可交易适配器。
+            risk_waivers=_ALL_RISK_WAIVERS,
+        ),
     )
     attempts = 0
 
@@ -245,7 +252,12 @@ def test_successful_round_resets_failure_counter_and_updates_last_success(
     """恢复成功后的第一轮立即清零失联状态并刷新成功时间。"""
     eng = GridEngine(
         object(),
-        GridConfig(state_path=str(tmp_path / "grid_state.json"), poll_interval=0),
+        GridConfig(
+            state_path=str(tmp_path / "grid_state.json"),
+            poll_interval=0,
+            # 本场景只测恢复计数，object() 不代表可交易适配器。
+            risk_waivers=_ALL_RISK_WAIVERS,
+        ),
     )
     eng._last_success_ts = 0.0
     attempts = 0

@@ -16,11 +16,12 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from adapters.base import Side
+from adapters.base import ExchangeAdapter, MarketPrice, Side
+from engine.hedge_engine import maker_first_hedge
 from grid.band import blocked_side_for_breach, compute_band, is_out_of_band
 from grid.fill_log import append_fill, build_fill_record
 from grid.grid_state import GridState, load_state, save_state
@@ -66,6 +67,55 @@ _EQUITY_JUMP_PCT = 0.08
 # 交易所时间与本机可能有轻微偏差；对账时允许一分钟时钟偏移。
 _RETRY_RECONCILE_CLOCK_SKEW_SECONDS = 60.0
 _RETRY_MAX_ATTEMPTS = 10
+# 交易时段是策略参数，固定使用 UTC+8，绝不读取本机时区。
+_UTC_PLUS_8 = timezone(timedelta(hours=8))
+# 计划离场失败会每轮重试，但同类高等级告警最多每分钟一条。
+_SCHEDULED_CLOSE_ALERT_INTERVAL_S = 60.0
+
+
+@dataclass(frozen=True)
+class RiskLayerRequirement:
+    """一层风控的能力依赖与显式启用参数。"""
+
+    label: str
+    capabilities: tuple[str, ...]
+    capability_target: str
+    activation_flag: str | None = None
+    optional_when_disabled: bool = False
+
+
+# 自检和运行期缺失告警共用这一张表，避免能力探测再次散落且不可审计。
+RISK_LAYER_REQUIREMENTS = {
+    "wallet_exposure_cap": RiskLayerRequirement(
+        label="权益比例库存上限",
+        capabilities=("get_balance",),
+        capability_target="adapter",
+        optional_when_disabled=True,
+    ),
+    "equity_drawdown": RiskLayerRequirement(
+        label="净值回撤熔断",
+        capabilities=("get_balance",),
+        capability_target="adapter",
+        activation_flag="--max-drawdown",
+    ),
+    "position_tpsl_equity": RiskLayerRequirement(
+        label="整仓 TPSL 权益约束",
+        capabilities=("get_balance",),
+        capability_target="adapter",
+    ),
+    "liquidation_constraints": RiskLayerRequirement(
+        label="清算相关约束（硬止损 / TPSL）",
+        capabilities=("get_liquidation_info",),
+        capability_target="adapter",
+        activation_flag="--hard-stop-dist",
+    ),
+    "trend_band": RiskLayerRequirement(
+        label="趋势 band 保护",
+        capabilities=("get_hourly_candles",),
+        capability_target="candle_source",
+        activation_flag="--trend-aware",
+    ),
+}
 
 
 @dataclass
@@ -74,6 +124,8 @@ class GridConfig:
     spacing_pct: float = 0.02            # 格距
     unit_usd: float = 50.0               # 每格名义
     max_inventory_usd: float = 150.0     # 最大库存名义
+    # None 表示不启用权益比例上限，逐单行为保持为纯绝对硬顶。
+    wallet_exposure_ratio: float | None = None
     levels_per_side: int = 4             # 上下各挂几格
     adx_period: int = 14
     adx_off: float = 999.0               # 默认禁用 ADX 熔断（只靠库存上限控风险）
@@ -82,6 +134,11 @@ class GridConfig:
     candle_lookback: int = 200
     poll_interval: float = 2.5
     slow_interval: float = 30.0
+    # 两个边界均为 None 时完全禁用窗口，保持变更前的全天交易行为。
+    trading_window_start: str | None = None
+    trading_window_end: str | None = None
+    # 仅用于计划离场；先等 maker，超时后强制转市价。
+    maker_first_timeout_s: float = 15.0
     dry_run: bool = True
     trend_aware: bool = False
     band_k: float = 1.75
@@ -99,6 +156,40 @@ class GridConfig:
     flat_confirmation_interval: float = 0.05
     max_writes_per_round: int = 10
     max_by_id_lookups_per_round: int = 10
+    cancel_backoff_threshold: int = 3
+    cancel_backoff_rounds: int = 3
+    # 空元组表示默认不放弃任何层；仅允许填写 RISK_LAYER_REQUIREMENTS 的键。
+    risk_waivers: tuple[str, ...] = ()
+    # None 表示程序化调用没有 CLI 来源；CLI 入口必须传入实际出现过的三个 flag。
+    explicit_risk_flags: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        """拒绝半配置与歧义边界，避免误把计划停机变成全天交易。"""
+        configured = (
+            self.trading_window_start is not None,
+            self.trading_window_end is not None,
+        )
+        if configured[0] != configured[1]:
+            raise ValueError("交易窗口起点和终点必须同时配置")
+        if configured[0]:
+            start = _parse_clock_minute(self.trading_window_start, "交易窗口起点")
+            end = _parse_clock_minute(self.trading_window_end, "交易窗口终点")
+            if start == end:
+                raise ValueError("交易窗口起点和终点不能相同")
+        if self.maker_first_timeout_s < 0:
+            raise ValueError("maker 优先平仓超时不能为负数")
+
+
+def _parse_clock_minute(value: str | None, label: str) -> int:
+    """把严格 HH:MM 边界转换为当日分钟数。"""
+    raw = str(value or "")
+    if len(raw) != 5 or raw[2] != ":" or not raw[:2].isdigit() or not raw[3:].isdigit():
+        raise ValueError(f"{label}必须使用 HH:MM 格式")
+    hour = int(raw[:2])
+    minute = int(raw[3:])
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError(f"{label}超出有效时间范围")
+    return hour * 60 + minute
 
 
 class GridEngine:
@@ -108,6 +199,7 @@ class GridEngine:
         config: GridConfig | None = None,
         fng_provider=None,
         candle_source=None,
+        clock=None,
     ) -> None:
         self.ext = ext
         self.config = config or GridConfig()
@@ -115,9 +207,14 @@ class GridEngine:
         # 默认用交易所自身的 K 线；Lighter 的 K 线接口返回 403，
         # 做市场景由调用方传入指向 Extended 的行情源。
         self._candles = candle_source or ExtendedCandleSource(ext)
+        # 注入点用于边界、跨日与周末测试；默认值始终生成 UTC 感知时间。
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._orders: dict[int, dict] = {}   # level -> {"id":..., "side": Side}
         self._retry: dict[int, dict] = {}
         self._reject_cooldown: dict[int, dict] = {}
+        self._cancel_counts: dict[int, int] = {}
+        self._cancel_backoff: dict[int, dict] = {}
+        self._market_price_snapshot: MarketPrice | None = None
         self._counters = {
             "fill_detected": 0,
             "replacement_placed": 0,
@@ -154,8 +251,11 @@ class GridEngine:
         self._last_liquidation_price: float | None = None
         self._current_tpsl: tuple[Decimal, Decimal] | None = None
         self._cap_rejection_state: dict[Side, dict] = {}
+        self._cap_equity_fallback_state: dict | None = None
+        self._risk_capability_missing_state: dict[str, dict] = {}
         self._equity_peak: float | None = None
         self._last_equity_check_ts: float = 0.0
+        self._last_equity_drawdown_processed_ts: float = 0.0
         self._last_equity_seen: float | None = None
         self._last_halt_retry_ts: float = 0.0
         # 确认平仓链是否已跑完（空仓 + 残单清净 + TPSL 已撤）。收干净就别再空跑；
@@ -169,6 +269,60 @@ class GridEngine:
         self._write_budget = self.config.max_writes_per_round
         self._by_id_lookup_budget = self.config.max_by_id_lookups_per_round
         self._write_budget_exhausted_this_round = False
+        self._scheduled_stop_active = False
+        self._scheduled_orders_cancelled = False
+        self._scheduled_stop_flat = False
+        self._last_scheduled_close_alert_ts = 0.0
+
+    def _trading_window_enabled(self) -> bool:
+        """仅当两个边界都已配置时启用；半配置属于启动错误。"""
+        start = self.config.trading_window_start
+        end = self.config.trading_window_end
+        if start is None and end is None:
+            return False
+        if start is None or end is None:
+            raise ValueError("交易窗口起点和终点必须同时配置")
+        return True
+
+    def _is_trading_window_open(self, at: datetime | None = None) -> bool:
+        """按固定 UTC+8 判断时段；起点包含、终点不包含。"""
+        if not self._trading_window_enabled():
+            return True
+        raw_now = self._clock() if at is None else at
+        if raw_now.tzinfo is None:
+            # 注入的无时区时间按 UTC 解释，绝不借用本机时区。
+            raw_now = raw_now.replace(tzinfo=timezone.utc)
+        local_now = raw_now.astimezone(_UTC_PLUS_8)
+        minute = local_now.hour * 60 + local_now.minute
+        start = _parse_clock_minute(
+            self.config.trading_window_start,
+            "交易窗口起点",
+        )
+        end = _parse_clock_minute(
+            self.config.trading_window_end,
+            "交易窗口终点",
+        )
+        if start < end:
+            return start <= minute < end
+        return minute >= start or minute < end
+
+    @property
+    def trading_window_state(self) -> str:
+        """返回供启动摘要、live 快照与心跳共同使用的稳定状态值。"""
+        if not self._trading_window_enabled():
+            return "disabled"
+        return "open" if self._is_trading_window_open() else "planned_stop"
+
+    def trading_window_summary(self) -> str:
+        """返回不含本机时区歧义的中文窗口摘要。"""
+        if not self._trading_window_enabled():
+            return "未启用（全天交易）"
+        state = "窗口内" if self._is_trading_window_open() else "计划停机"
+        return (
+            f"UTC+8 {self.config.trading_window_start}–"
+            f"{self.config.trading_window_end}，当前={state}，"
+            f"maker 超时={self.config.maker_first_timeout_s:g}秒"
+        )
 
     @property
     def _log_step(self) -> float:
@@ -179,6 +333,169 @@ class GridEngine:
 
     def _price_level(self, price: float) -> int:
         return round(math.log(price) / self._log_step)
+
+    def _risk_layer_enabled(self, layer: str) -> bool:
+        """按现有配置判断风控层是否开启，不改变任何触发阈值。"""
+        if layer == "wallet_exposure_cap":
+            return self.config.wallet_exposure_ratio is not None
+        if layer == "equity_drawdown":
+            return self.config.max_drawdown_pct > 0
+        if layer == "position_tpsl_equity":
+            return (
+                self.config.exchange_tpsl
+                and self.config.max_equity_loss_pct >= 0
+            )
+        if layer == "liquidation_constraints":
+            return self.config.hard_stop_dist > 0 or self.config.exchange_tpsl
+        if layer == "trend_band":
+            return self.config.trend_aware
+        raise KeyError(f"未知风控层：{layer}")
+
+    def _risk_capability_target(self, layer: str):
+        requirement = RISK_LAYER_REQUIREMENTS[layer]
+        if requirement.capability_target == "adapter":
+            return self.ext
+        if requirement.capability_target == "candle_source":
+            return self._candles
+        raise ValueError(
+            f"风控层 {layer} 使用未知能力目标：{requirement.capability_target}"
+        )
+
+    def _has_risk_capability(self, layer: str, capability: str) -> bool:
+        """判断能力是否真实实现，基类的空默认实现不算可用能力。"""
+        target = self._risk_capability_target(layer)
+        method = getattr(target, capability, None)
+        if not callable(method):
+            return False
+        if isinstance(target, ExchangeAdapter):
+            implementation = getattr(type(target), capability, None)
+            base_implementation = getattr(ExchangeAdapter, capability, None)
+            if implementation is base_implementation:
+                return False
+        return True
+
+    def validate_risk_controls(self) -> dict[str, str]:
+        """启动前校验全部风控层，记录摘要并拒绝未声明的缺失。
+
+        CLI 入口还会提供实际出现过的三个关键 flag。这样即使配置对象有
+        12% 等历史默认值，也不能把「运维未显式配置」伪装成已确认启用。
+        程序化调用没有 CLI 来源时仍按配置的真实开关和能力判断。
+        """
+        waivers = set(self.config.risk_waivers)
+        unknown_waivers = waivers - RISK_LAYER_REQUIREMENTS.keys()
+        if unknown_waivers:
+            names = "、".join(sorted(unknown_waivers))
+            raise RuntimeError(f"未知的风控知情放弃层：{names}")
+
+        explicit_flags = (
+            None
+            if self.config.explicit_risk_flags is None
+            else set(self.config.explicit_risk_flags)
+        )
+        statuses: dict[str, str] = {}
+        issues: list[tuple[str, list[str]]] = []
+
+        for layer, requirement in RISK_LAYER_REQUIREMENTS.items():
+            enabled = self._risk_layer_enabled(layer)
+            hard_stop_closed = (
+                layer == "liquidation_constraints"
+                and enabled
+                and self.config.hard_stop_dist <= 0
+            )
+            missing_capabilities = (
+                [
+                    capability
+                    for capability in requirement.capabilities
+                    if not self._has_risk_capability(layer, capability)
+                ]
+                if enabled
+                else []
+            )
+            missing_explicit_flag = (
+                explicit_flags is not None
+                and requirement.activation_flag is not None
+                and requirement.activation_flag not in explicit_flags
+            )
+
+            if not enabled:
+                status = "未配置" if requirement.optional_when_disabled else "关闭"
+            elif missing_capabilities:
+                status = "不可用"
+            elif hard_stop_closed:
+                status = "部分关闭"
+            elif missing_explicit_flag:
+                status = "未确认"
+            else:
+                status = "启用"
+
+            reasons: list[str] = []
+            if not enabled and not requirement.optional_when_disabled:
+                reasons.append("配置已关闭")
+            if hard_stop_closed:
+                reasons.append("硬止损配置已关闭（hard_stop_dist <= 0）")
+            if missing_capabilities:
+                reasons.append(
+                    "缺少能力 " + "、".join(missing_capabilities)
+                )
+            if missing_explicit_flag:
+                reasons.append(
+                    f"未显式配置 {requirement.activation_flag}"
+                )
+
+            if reasons and layer in waivers:
+                status += "（知情放弃）"
+                logger.warning(
+                    "风控层已知情放弃：%s；%s",
+                    requirement.label,
+                    "；".join(reasons),
+                )
+            elif reasons:
+                issues.append((layer, reasons))
+            statuses[layer] = status
+
+        summary = "；".join(
+            f"{RISK_LAYER_REQUIREMENTS[layer].label}={status}"
+            for layer, status in statuses.items()
+        )
+        logger.info("风控状态摘要：%s", summary)
+
+        if issues:
+            details = "；".join(
+                f"{RISK_LAYER_REQUIREMENTS[layer].label}：{'，'.join(reasons)}"
+                for layer, reasons in issues
+            )
+            raise RuntimeError(
+                f"风控完整性自检失败（{len(issues)} 层）：{details}。"
+                "如确需无此保护运行，必须显式声明对应知情放弃层"
+            )
+        return statuses
+
+    def _log_risk_capability_missing(
+        self,
+        layer: str,
+        capability: str,
+    ) -> None:
+        """运行期能力缺失按状态签名聚合，首次与整百次输出 WARNING。"""
+        requirement = RISK_LAYER_REQUIREMENTS[layer]
+        signature = (layer, capability)
+        previous = self._risk_capability_missing_state.get(layer)
+        repeated = previous is not None and previous["signature"] == signature
+        count = int(previous["count"]) + 1 if repeated else 1
+        self._risk_capability_missing_state[layer] = {
+            "signature": signature,
+            "count": count,
+        }
+        log = (
+            logger.warning
+            if not repeated or count % _CAP_REJECTION_SUMMARY_EVERY == 0
+            else logger.debug
+        )
+        log(
+            "运行期风控跳过：%s 缺少能力 %s；同类累计=%d",
+            requirement.label,
+            capability,
+            count,
+        )
 
     async def connect(self) -> None:
         await self.ext.connect()
@@ -436,20 +753,37 @@ class GridEngine:
             else None
         )
         liquidation_getter = getattr(self.ext, "get_liquidation_info", None)
-        if liq_price is None and callable(liquidation_getter):
-            try:
-                liquidation_info = await liquidation_getter(self.config.market)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("计算 TPSL 时查询清算价失败，将使用其他可用约束：%s", exc)
-            else:
-                if liquidation_info is not None:
-                    candidate_liq = Decimal(str(liquidation_info[1]))
-                    if candidate_liq > 0:
-                        liq_price = candidate_liq
+        if liq_price is None:
+            if not self._has_risk_capability(
+                "liquidation_constraints",
+                "get_liquidation_info",
+            ):
+                self._log_risk_capability_missing(
+                    "liquidation_constraints",
+                    "get_liquidation_info",
+                )
+            elif callable(liquidation_getter):
+                try:
+                    liquidation_info = await liquidation_getter(self.config.market)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("计算 TPSL 时查询清算价失败，将使用其他可用约束：%s", exc)
+                else:
+                    if liquidation_info is not None:
+                        candidate_liq = Decimal(str(liquidation_info[1]))
+                        if candidate_liq > 0:
+                            liq_price = candidate_liq
 
         equity: Decimal | None = None
         balance_getter = getattr(self.ext, "get_balance", None)
-        if callable(balance_getter):
+        if not self._has_risk_capability(
+            "position_tpsl_equity",
+            "get_balance",
+        ):
+            self._log_risk_capability_missing(
+                "position_tpsl_equity",
+                "get_balance",
+            )
+        elif callable(balance_getter):
             try:
                 balance = await balance_getter()
             except Exception as exc:  # noqa: BLE001
@@ -715,6 +1049,8 @@ class GridEngine:
             "blocked_side": state.blocked_side if state is not None else None,
             "effective_blocked_side": self._effective_blocked_side(mode, state),
             "halted": state.halted if state is not None else False,
+            "trading_window_state": self.trading_window_state,
+            "planned_stop": self.trading_window_state == "planned_stop",
             "dist_to_liq_pct": self._last_dist_to_liq,
             "cfg": {
                 "unit": self.config.unit_usd,
@@ -751,6 +1087,8 @@ class GridEngine:
         payload.update(
             consecutive_failures=self._consecutive_failures,
             last_success_ts=self._last_success_ts,
+            trading_window_state=self.trading_window_state,
+            planned_stop=self.trading_window_state == "planned_stop",
         )
         tmp = live_path.with_suffix(live_path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -854,8 +1192,16 @@ class GridEngine:
             return "快速执行完成"
 
         try:
-            candles = await self._candles.get_hourly_candles(
-                self.config.market, self.config.candle_lookback
+            candle_getter = getattr(self._candles, "get_hourly_candles", None)
+            if not callable(candle_getter):
+                self._log_risk_capability_missing(
+                    "trend_band",
+                    "get_hourly_candles",
+                )
+                raise RuntimeError("K 线源缺少 get_hourly_candles 能力")
+            candles = await candle_getter(
+                self.config.market,
+                self.config.candle_lookback,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("K线获取失败，已处理成交并跳过补格：%s", exc)
@@ -956,10 +1302,255 @@ class GridEngine:
         await self._dump_live(mark=mark, mode=mode, inv=inv, closes=closes)
         return result
 
+    async def _refresh_market_price(self) -> None:
+        """每轮只读取一次盘口；任何不可用情况都降级为整轮放行。"""
+        self._market_price_snapshot = None
+        getter = getattr(self.ext, "get_market_price", None)
+        if not callable(getter):
+            logger.warning("盘口读取能力不可用，本轮降级放行所有挂单")
+            return
+        try:
+            market_price = await getter(self.config.market)
+            if market_price is None:
+                raise ValueError("返回空盘口")
+            bid = Decimal(str(market_price.bid))
+            ask = Decimal(str(market_price.ask))
+            if bid <= 0 or ask <= 0 or bid >= ask:
+                raise ValueError(f"无效盘口 bid={bid} ask={ask}")
+            self._market_price_snapshot = MarketPrice(
+                market=self.config.market,
+                bid=bid,
+                ask=ask,
+            )
+        except Exception as exc:  # noqa: BLE001 保护数据不可用时必须失败开放
+            logger.warning("盘口读取失败，本轮降级放行所有挂单：%s", exc)
+
+    def _advance_cancel_backoffs(self) -> None:
+        """按成交检查轮次推进退避，到期时清零连续取消计数。"""
+        for level, state in list(self._cancel_backoff.items()):
+            remaining = int(state.get("remaining_rounds", 0))
+            if remaining <= 0:
+                self._cancel_backoff.pop(level, None)
+                self._cancel_counts.pop(level, None)
+                logger.info("格%d 取消退避期满，恢复正常挂单", level)
+                continue
+            state["remaining_rounds"] = remaining - 1
+
+    def _record_cancelled(self, level: int) -> bool:
+        """记录同格连续取消；返回是否已达到阈值并进入退避。"""
+        count = self._cancel_counts.get(level, 0) + 1
+        self._cancel_counts[level] = count
+        threshold = max(1, int(self.config.cancel_backoff_threshold))
+        if count < threshold:
+            return False
+        rounds = max(1, int(self.config.cancel_backoff_rounds))
+        self._cancel_backoff[level] = {"remaining_rounds": rounds}
+        logger.warning(
+            "格%d 已连续取消 %d 次，进入退避 %d 轮并暂停原格重挂",
+            level,
+            count,
+            rounds,
+        )
+        return True
+
+    def _reset_cancel_state(self, level: int, *, reason: str) -> None:
+        """成交或非取消终态会打断连续取消序列。"""
+        had_backoff = level in self._cancel_backoff
+        had_count = level in self._cancel_counts
+        self._cancel_backoff.pop(level, None)
+        self._cancel_counts.pop(level, None)
+        if had_backoff:
+            logger.info("格%d 因%s退出取消退避，连续计数已归零", level, reason)
+        elif had_count:
+            logger.debug("格%d 因%s将连续取消计数归零", level, reason)
+
+    def _market_side_allows(self, level: int, side: Side, price: Decimal) -> bool:
+        """使用本轮盘口快照校验 post-only 目标价；无快照时失败开放。"""
+        market_price = self._market_price_snapshot
+        if market_price is None:
+            return True
+        wrong_side = (
+            side is Side.SELL and price <= market_price.ask
+        ) or (
+            side is Side.BUY and price >= market_price.bid
+        )
+        if not wrong_side:
+            return True
+        self._retry.pop(level, None)
+        logger.info(
+            "盘口侧校验跳过挂单：格%d 方向=%s 目标价=%s，"
+            "最优买价=%s、最优卖价=%s；不进入重试队列",
+            level,
+            side.value,
+            price,
+            market_price.bid,
+            market_price.ask,
+        )
+        return False
+
+    def _log_scheduled_close_failure(
+        self,
+        reason: str,
+        inventory: Decimal | None,
+    ) -> None:
+        """计划离场失败每轮留痕，高等级告警按一分钟限频。"""
+        now = time.monotonic()
+        message = (
+            "计划离场平仓失败：%s；库存=%s，未归零，下轮继续重试"
+        )
+        if (
+            self._last_scheduled_close_alert_ts == 0.0
+            or now - self._last_scheduled_close_alert_ts
+            >= _SCHEDULED_CLOSE_ALERT_INTERVAL_S
+        ):
+            self._last_scheduled_close_alert_ts = now
+            logger.critical(message, reason, inventory)
+        else:
+            logger.debug(message, reason, inventory)
+
+    def _reset_scheduled_stop(self) -> None:
+        """窗口恢复时清理计划离场的进程内状态，不触碰 halted。"""
+        self._scheduled_stop_active = False
+        self._scheduled_orders_cancelled = False
+        self._scheduled_stop_flat = False
+        self._last_scheduled_close_alert_ts = 0.0
+
+    async def _run_scheduled_stop_cycle(self) -> str:
+        """执行一次计划离场确认：撤单、平仓至零、停止开仓。"""
+        if not self._scheduled_stop_active:
+            self._scheduled_stop_active = True
+            self._scheduled_orders_cancelled = False
+            self._scheduled_stop_flat = False
+            logger.warning(
+                "已进入计划停机时段：开始执行撤单 → 平仓至零 → 停止开仓"
+            )
+
+        if not self._scheduled_orders_cancelled:
+            logger.warning("计划离场步骤 1/3：撤销全部网格挂单")
+            if self.config.dry_run:
+                logger.warning("[dry_run] 计划离场仅模拟撤单，不发送交易所写请求")
+            else:
+                # 批量撤单接口会刻意保留 reduce-only 保护单；恢复阶梯也使用
+                # reduce-only，但它仍属于网格，必须先按引擎记录逐单撤掉。
+                for level, record in list(self._orders.items()):
+                    try:
+                        await self.ext.cancel_order(
+                            self.config.market,
+                            record["id"],
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        self._log_scheduled_close_failure(
+                            f"撤销格 {level} 订单异常：{exc}",
+                            None,
+                        )
+                        return "计划停机：撤单失败，等待下轮重试"
+                    self._orders.pop(level, None)
+                try:
+                    # 再扫一次交易所，清理未能按价格接管的普通孤儿网格单。
+                    await self.ext.cancel_grid_orders(self.config.market)
+                except Exception as exc:  # noqa: BLE001
+                    self._log_scheduled_close_failure(
+                        f"批量清理网格挂单异常：{exc}",
+                        None,
+                    )
+                    return "计划停机：撤单失败，等待下轮重试"
+                # 交易所已确认撤单，不能把旧重试留给窗口恢复后的铺单路径。
+                self._orders.clear()
+                self._retry.clear()
+                self._reject_cooldown.clear()
+            self._scheduled_orders_cancelled = True
+            logger.warning("计划离场步骤 1/3 完成：网格挂单已撤销")
+
+        try:
+            position = await self.ext.get_position(self.config.market)
+        except Exception as exc:  # noqa: BLE001
+            self._log_scheduled_close_failure(f"查询库存异常：{exc}", None)
+            return "计划停机：库存未知，等待下轮重试"
+
+        remaining = Decimal(str(position.signed_size))
+        self._last_inv = remaining
+        if remaining != 0:
+            self._scheduled_stop_flat = False
+            logger.warning(
+                "计划离场步骤 2/3：平仓至零，当前库存=%s；"
+                "maker 优先，超时 %.1f 秒后转市价",
+                remaining,
+                self.config.maker_first_timeout_s,
+            )
+            if self.config.dry_run:
+                self._log_scheduled_close_failure(
+                    "dry_run 不执行真实平仓",
+                    remaining,
+                )
+                return "计划停机（dry_run）：库存未归零"
+            try:
+                result = await maker_first_hedge(
+                    self.ext,
+                    self.config.market,
+                    -remaining,
+                    timeout_s=self.config.maker_first_timeout_s,
+                    reduce_only=True,
+                )
+                logger.warning("计划离场平仓委托完成：%s", result.note)
+            except Exception as exc:  # noqa: BLE001
+                self._log_scheduled_close_failure(
+                    f"maker / 市价平仓异常：{exc}",
+                    remaining,
+                )
+                return "计划停机：平仓异常，等待下轮重试"
+
+            try:
+                position = await self.ext.get_position(self.config.market)
+            except Exception as exc:  # noqa: BLE001
+                self._log_scheduled_close_failure(
+                    f"平仓后复核库存异常：{exc}",
+                    None,
+                )
+                return "计划停机：平仓结果未知，等待下轮重试"
+            remaining = Decimal(str(position.signed_size))
+            self._last_inv = remaining
+            if remaining != 0:
+                self._log_scheduled_close_failure(
+                    "平仓委托后仍有剩余库存",
+                    remaining,
+                )
+                return "计划停机：库存未归零，等待下轮重试"
+            logger.warning("计划离场步骤 2/3 完成：库存已归零")
+
+        if not self._scheduled_stop_flat:
+            cancel_tpsl = getattr(self.ext, "cancel_tpsl", None)
+            if not self.config.dry_run and callable(cancel_tpsl):
+                try:
+                    await cancel_tpsl(self.config.market)
+                except Exception as exc:  # noqa: BLE001
+                    self._log_scheduled_close_failure(
+                        f"空仓后撤销 TPSL 异常：{exc}",
+                        remaining,
+                    )
+                    return "计划停机：保护单清理失败，等待下轮重试"
+            self._current_tpsl = None
+            self._scheduled_stop_flat = True
+            logger.warning(
+                "计划离场步骤 3/3 完成：已停止开仓，库存为零；"
+                "进程继续运行并输出计划停机心跳"
+            )
+        return "计划停机：窗口外，库存已归零，进程保持运行"
+
     async def run_once(self, include_slow: bool = True) -> str:
+        if self._trading_window_enabled():
+            if not self._is_trading_window_open():
+                return await self._run_scheduled_stop_cycle()
+            if self._scheduled_stop_active:
+                logger.warning("交易窗口已恢复：无需重启，恢复网格维护与铺单")
+                self._reset_scheduled_stop()
         self._write_budget = self.config.max_writes_per_round
         self._by_id_lookup_budget = self.config.max_by_id_lookups_per_round
         self._write_budget_exhausted_this_round = False
+        await self._refresh_market_price()
+        if self.config.wallet_exposure_ratio is not None:
+            # legacy 与 trend-aware 都从这里刷新比例上限；trend-aware 随后的
+            # 回撤检查会处理同一代缓存，不会增加第二次 balance 请求。
+            await self._refresh_equity_cache()
         if self.config.trend_aware:
             return await self._run_once_trend_aware(include_slow=include_slow)
 
@@ -1172,7 +1763,14 @@ class GridEngine:
                 )
             )
 
-        terminal_statuses = {"FILLED", "CANCELLED", "EXPIRED", "REJECTED"}
+        terminal_statuses = {
+            "FILLED",
+            "CANCELLED",
+            "CANCELLED-POST-ONLY",
+            "CANCELLED-SELF-TRADE",
+            "EXPIRED",
+            "REJECTED",
+        }
         for level, entry in list(self._retry.items()):
             if entry.get("exhausted"):
                 continue
@@ -1260,6 +1858,9 @@ class GridEngine:
             if placed is not None:
                 self._retry.pop(level, None)
                 continue
+            if level not in self._retry:
+                # 市价侧校验主动丢弃了重试意图，不应计作一次失败。
+                continue
             entry["attempts"] = int(entry.get("attempts", 0)) + 1
             if entry["attempts"] >= _RETRY_MAX_ATTEMPTS:
                 entry["exhausted"] = True
@@ -1282,6 +1883,7 @@ class GridEngine:
         - blocked_side：跳过即将挂出的同方向新单。
         """
         self._max_abs_inv_usd = max(self._max_abs_inv_usd, abs(inv_usd))
+        self._advance_cancel_backoffs()
         if self.config.dry_run:
             logger.debug("dry_run：跳过成交终态处理")
             return
@@ -1315,11 +1917,17 @@ class GridEngine:
             logger.debug("成交检查完成：没有从盘口消失的跟踪单")
             return
         statuses = await self._order_statuses({rec["id"] for rec in missing.values()})
+        cancelled_statuses = {
+            "CANCELLED",
+            "CANCELLED-POST-ONLY",
+            "CANCELLED-SELF-TRADE",
+        }
+        terminal_statuses = {"FILLED", "EXPIRED", "REJECTED"} | cancelled_statuses
         for lv, rec in missing.items():
             o = statuses.get(rec["id"])
             status = str(getattr(o, "status", "") or "").upper() if o else ""
             filled = Decimal(str(getattr(o, "filled_qty", 0) or 0)) if o else Decimal("0")
-            if status not in ("FILLED", "EXPIRED", "CANCELLED", "REJECTED"):
+            if status not in terminal_statuses:
                 attempts = int(rec.get("status_lookup_attempts", 0)) + 1
                 rec["status_lookup_attempts"] = attempts
                 rec["status_pending"] = True
@@ -1353,7 +1961,15 @@ class GridEngine:
                     )
                 continue
 
-            if status != "REJECTED" and self._write_budget <= 0:
+            is_fill = status == "FILLED" or (
+                status in ({"EXPIRED"} | cancelled_statuses) and filled > 0
+            )
+            needs_write = is_fill or status in {
+                "EXPIRED",
+                "CANCELLED",
+                "CANCELLED-SELF-TRADE",
+            }
+            if needs_write and self._write_budget <= 0:
                 rec["status_pending"] = True
                 logger.debug(
                     "格%d 订单 %s 已确认终态=%s，但本轮写请求预算已耗尽；"
@@ -1366,18 +1982,18 @@ class GridEngine:
 
             self._orders.pop(lv, None)
             if rec.get("reduce_only"):
-                if status == "FILLED" or (
-                    status in ("EXPIRED", "CANCELLED") and filled > 0
-                ):
+                if is_fill:
                     self._counters["fill_detected"] += 1
+                    self._reset_cancel_state(lv, reason="成交")
+                elif status not in cancelled_statuses:
+                    self._reset_cancel_state(lv, reason=status)
                 if status == "REJECTED":
                     self._counters["rejected_terminal"] += 1
                 logger.info("格%d reduce-only 减仓单 %s 终态=%s、filled_qty=%s，闭环不翻单",
                             lv, rec["id"], status, filled)
                 continue
-            if status == "FILLED" or (
-                status in ("EXPIRED", "CANCELLED") and filled > 0
-            ):
+            if is_fill:
+                self._reset_cancel_state(lv, reason="成交")
                 self._counters["fill_detected"] += 1
                 raw_fill_price = (
                     getattr(o, "average_price", None)
@@ -1495,7 +2111,20 @@ class GridEngine:
                     qty=qty,
                     is_replacement=True,
                 )
-            elif status in ("EXPIRED", "CANCELLED"):
+            elif status == "CANCELLED-POST-ONLY":
+                self._record_cancelled(lv)
+                logger.warning(
+                    "格%d 订单 %s 因 post-only 冲突取消且无成交，"
+                    "不执行原格重挂",
+                    lv,
+                    rec["id"],
+                )
+            elif status in ({"EXPIRED"} | cancelled_statuses):
+                if status == "EXPIRED":
+                    self._reset_cancel_state(lv, reason="过期")
+                    entered_backoff = False
+                else:
+                    entered_backoff = self._record_cancelled(lv)
                 logger.info(
                     "格%d 订单 %s 终态=%s 且无成交，准备原格 %s 重挂",
                     lv,
@@ -1503,6 +2132,8 @@ class GridEngine:
                     status,
                     rec["side"].value,
                 )
+                if entered_backoff:
+                    continue
                 if self._side_is_blocked(rec["side"], blocked_side):
                     logger.info(
                         "格%d %s 原格重挂被当前冻结方向 %s 阻止",
@@ -1513,6 +2144,7 @@ class GridEngine:
                     continue
                 await self._place(lv, rec["side"], inv_usd, why=f"格{lv}{status}重挂")
             else:
+                self._reset_cancel_state(lv, reason="被拒")
                 self._counters["rejected_terminal"] += 1
                 logger.warning("格%d 订单 %s 终态=REJECTED，仅移除不翻单", lv, rec["id"])
 
@@ -1629,21 +2261,69 @@ class GridEngine:
             acted.append(placed)
         return "；".join(acted) if acted else None
 
+    def _log_cap_equity_fallback(self, reason: str) -> None:
+        """比例保护降级按状态聚合，避免每轮重复输出 WARNING。"""
+        previous = self._cap_equity_fallback_state
+        count = int(previous["count"]) + 1 if previous is not None else 1
+        self._cap_equity_fallback_state = {
+            "count": count,
+            "reason": reason,
+        }
+        log = (
+            logger.warning
+            if count == 1 or count % _CAP_REJECTION_SUMMARY_EVERY == 0
+            else logger.debug
+        )
+        log(
+            "库存权益比例保护当前未生效：%s；已退回绝对硬顶 $%.2f；"
+            "同类累计=%d",
+            reason,
+            self.config.max_inventory_usd,
+            count,
+        )
+
+    def _effective_inventory_cap(self) -> tuple[float, str]:
+        """返回当前库存上限及来源；权益不可用时安全退回绝对硬顶。"""
+        hard_cap = self.config.max_inventory_usd
+        ratio = self.config.wallet_exposure_ratio
+        if ratio is None:
+            return hard_cap, "绝对硬顶（未配置权益比例）"
+
+        equity = self._last_equity_seen
+        if equity is None or equity <= 0:
+            self._log_cap_equity_fallback("共享权益缓存中没有有效权益")
+            return hard_cap, "绝对硬顶（权益不可用降级）"
+
+        ratio_cap = float(Decimal(str(equity)) * Decimal(str(ratio)))
+        if ratio_cap < hard_cap:
+            return (
+                ratio_cap,
+                f"权益比例（权益=${equity:.2f} × {ratio:g}x）",
+            )
+        return (
+            hard_cap,
+            f"绝对硬顶（权益比例计算值=${ratio_cap:.2f}）",
+        )
+
     def _cap_components(
         self,
         side: Side,
         inv_usd: float,
-    ) -> tuple[float, float, float, float]:
-        """返回库存上限算式的四项，供判断与日志共享。"""
+    ) -> tuple[float, float, float, float, str]:
+        """返回库存上限算式及来源，供判断与日志共享。"""
         unit = self.config.unit_usd
         inventory_usd = inv_usd if side is Side.BUY else -inv_usd
         pending_usd = sum(unit for rec in self._orders.values()
                           if rec["side"] is side and not rec.get("reduce_only"))
-        return inventory_usd, pending_usd, unit, self.config.max_inventory_usd
+        cap, source = self._effective_inventory_cap()
+        return inventory_usd, pending_usd, unit, cap, source
 
     def _within_cap(self, side: Side, inv_usd: float) -> bool:
         """严格库存上限：真实持仓与该侧挂单全部成交后仍不超上限。"""
-        inventory_usd, pending_usd, unit, cap = self._cap_components(side, inv_usd)
+        inventory_usd, pending_usd, unit, cap, _ = self._cap_components(
+            side,
+            inv_usd,
+        )
         return inventory_usd + pending_usd + unit <= cap
 
     def _log_cap_rejection(
@@ -1654,9 +2334,12 @@ class GridEngine:
         why: str,
     ) -> None:
         """库存拒绝按状态变化记录，重复事件只做 DEBUG/整百次聚合。"""
-        inventory_usd, pending_usd, unit, cap = self._cap_components(side, inv_usd)
+        inventory_usd, pending_usd, unit, cap, source = self._cap_components(
+            side,
+            inv_usd,
+        )
         projected = inventory_usd + pending_usd + unit
-        signature = (inventory_usd, pending_usd, unit, cap, why)
+        signature = (inventory_usd, pending_usd, unit, cap, source, why)
         previous = self._cap_rejection_state.get(side)
         repeated = previous is not None and previous["signature"] == signature
         count = int(previous["count"]) + 1 if repeated else 1
@@ -1672,7 +2355,8 @@ class GridEngine:
         log(
             "库存上限拒绝挂单：格%d 方向=%s 原因=%s；"
             "inventory_usd=%.2f + pending_usd=%.2f + unit=%.2f"
-            " = %.2f > max_inventory_usd=%.2f；同类累计=%d",
+            " = %.2f > effective_cap=%.2f；上限来源=%s；"
+            "max_inventory_usd=%.2f（绝对硬顶）；同类累计=%d",
             level,
             side.value,
             why or "未说明",
@@ -1681,6 +2365,8 @@ class GridEngine:
             unit,
             projected,
             cap,
+            source,
+            self.config.max_inventory_usd,
             count,
         )
 
@@ -1705,6 +2391,14 @@ class GridEngine:
             self._counters["dup_skipped"] += 1
             logger.debug("格%d 在重试队列中，普通补格跳过", level)
             return None
+        backoff = self._cancel_backoff.get(level)
+        if backoff is not None:
+            logger.debug(
+                "格%d 处于取消退避，剩余 %d 轮，跳过挂单",
+                level,
+                int(backoff.get("remaining_rounds", 0)),
+            )
+            return None
         cooldown = self._reject_cooldown.get(level)
         now = time.monotonic()
         if cooldown and now < cooldown["until"]:
@@ -1719,6 +2413,8 @@ class GridEngine:
             self._log_cap_rejection(level, side, inv_usd, why)
             return None
         lp = self._level_price(level)
+        if not self._market_side_allows(level, side, lp):
+            return None
         qty = qty if qty is not None else Decimal(str(self.config.unit_usd)) / lp
         msg = f"{why}：{side.value} {qty:.6f}@{lp:.0f}(格{level}){' reduce-only' if reduce_only else ''}"
 
@@ -1862,6 +2558,62 @@ class GridEngine:
             return False
         return (peak - equity) / peak >= limit
 
+    async def _refresh_equity_cache(self) -> tuple[float | None, bool]:
+        """按既有限频刷新共享权益缓存，返回（权益，本轮是否完成新查询）。"""
+        ratio_enabled = self.config.wallet_exposure_ratio is not None
+        drawdown_enabled = self.config.max_drawdown_pct > 0
+        if not ratio_enabled and not drawdown_enabled:
+            return self._last_equity_seen, False
+
+        now = time.time()
+        if now - self._last_equity_check_ts < _EQUITY_CHECK_INTERVAL_S:
+            return self._last_equity_seen, False
+
+        layer = "equity_drawdown" if drawdown_enabled else "wallet_exposure_cap"
+        balance_getter = getattr(self.ext, "get_balance", None)
+        if not self._has_risk_capability(layer, "get_balance"):
+            self._last_equity_seen = None
+            self._log_risk_capability_missing(layer, "get_balance")
+            if ratio_enabled:
+                self._log_cap_equity_fallback("适配器缺少 get_balance 能力")
+            return None, False
+
+        # 先记时间戳再发请求：失败也要走限频，否则网络差时会每轮重试、
+        # 把 balance 查询压成 2.5 秒一次。
+        self._last_equity_check_ts = now
+        try:
+            balance = await balance_getter()
+        except Exception as exc:  # noqa: BLE001
+            self._last_equity_seen = None
+            if drawdown_enabled:
+                # 查不到权益就不判定回撤，不可凭陈旧数据主动平仓。
+                logger.warning("回撤熔断取权益失败，本次跳过：%s", exc)
+            if ratio_enabled:
+                self._log_cap_equity_fallback(f"权益查询失败：{exc}")
+            return None, True
+
+        raw_equity = (
+            balance.get("equity")
+            if isinstance(balance, dict)
+            else getattr(balance, "equity", None)
+        )
+        try:
+            equity = float(raw_equity) if raw_equity is not None else None
+        except (TypeError, ValueError, OverflowError):
+            equity = None
+        if equity is None or not math.isfinite(equity) or equity <= 0:
+            self._last_equity_seen = None
+            if ratio_enabled:
+                self._log_cap_equity_fallback(
+                    f"权益值无效：{raw_equity!r}"
+                )
+            return None, True
+
+        self._last_equity_seen = equity
+        # 恢复后的再次失效是新的告警状态，不能沿用旧计数静默掉。
+        self._cap_equity_fallback_state = None
+        return equity, True
+
     async def _check_equity_drawdown(self) -> bool:
         """净值自峰值回撤熔断（跨腿保护），触发则全平停机。
 
@@ -1873,32 +2625,18 @@ class GridEngine:
         不存在"只冻结一侧导致成交后无法翻单"的失效模式（见 2026-08-10 事故）。
         """
         limit = self.config.max_drawdown_pct
-        if limit <= 0:
+        equity, refreshed = await self._refresh_equity_cache()
+        if limit <= 0 or equity is None:
             return False
-        now = time.time()
-        # 限频：熔断不需要秒级精度，每轮查一次 balance 会平白增加超时面
-        if now - self._last_equity_check_ts < _EQUITY_CHECK_INTERVAL_S:
+        if (
+            not refreshed
+            and self._last_equity_drawdown_processed_ts
+            == self._last_equity_check_ts
+        ):
             return False
-        balance_getter = getattr(self.ext, "get_balance", None)
-        if not callable(balance_getter):
-            return False
-        # 先记时间戳再发请求：失败也要走限频，否则网络差时会每轮重试、
-        # 把 balance 查询压成 2.5 秒一次
-        self._last_equity_check_ts = now
-        try:
-            balance = await balance_getter()
-        except Exception as exc:  # noqa: BLE001
-            # 查不到权益就不判定——宁可漏防，不可凭陈旧数据误平仓
-            logger.warning("回撤熔断取权益失败，本次跳过：%s", exc)
-            return False
-        raw_equity = (
-            balance.get("equity")
-            if isinstance(balance, dict)
-            else getattr(balance, "equity", None)
-        )
-        if raw_equity is None or float(raw_equity) <= 0:
-            return False
-        equity = float(raw_equity)
+        # 启动摘要可能已预热缓存；同一代权益仍要在首轮完成一次回撤判定，
+        # 之后才按既有 60 秒节奏等待下一次新查询。
+        self._last_equity_drawdown_processed_ts = self._last_equity_check_ts
 
         # 【曾经在这里用"权益跳变 ≥8% 判为出入金"来避免出金误熔断，已移除】
         # 那是个危险的猜测：真实的快速亏损同样会 ≥8%。实测 1000→900→810 两次
@@ -1910,8 +2648,6 @@ class GridEngine:
         # 出入金后请人工删除 data/equity_peak.json 重新播种。
         # TODO: 交易所 /api/v1/user/assetOperations 提供真实资金流水，
         #       接入后可精确扣除出入金，届时才谈得上自动处理。
-        self._last_equity_seen = equity
-
         peak = self._load_equity_peak()
         if peak is None or equity > peak:
             self._save_equity_peak(equity)
@@ -2006,10 +2742,23 @@ class GridEngine:
             )
             return False
         if liq is None:
-            try:
-                liquidation_info = await self.ext.get_liquidation_info(
-                    self.config.market
+            liquidation_getter = getattr(
+                self.ext,
+                "get_liquidation_info",
+                None,
+            )
+            if not self._has_risk_capability(
+                "liquidation_constraints",
+                "get_liquidation_info",
+            ):
+                self._last_dist_to_liq = None
+                self._log_risk_capability_missing(
+                    "liquidation_constraints",
+                    "get_liquidation_info",
                 )
+                return False
+            try:
+                liquidation_info = await liquidation_getter(self.config.market)
             except Exception as exc:  # noqa: BLE001
                 self._last_dist_to_liq = None
                 logger.error(
@@ -2242,9 +2991,21 @@ class GridEngine:
         return "OFF：已撤单+平库存"
 
     async def run_forever(self) -> None:
+        self.validate_risk_controls()
         self._running = True
         await self.connect()
-        logger.info("网格引擎启动（dry_run=%s，格距%.1f%%，每边%d格，库存上限$%.0f）",
+        # 仅在显式启用比例时预热共享缓存；未配置比例的 legacy 路径不得因
+        # 本变更新增 balance 请求。run_once 会命中同一限频周期，不会重查。
+        if self.config.wallet_exposure_ratio is not None:
+            await self._refresh_equity_cache()
+        effective_cap, cap_source = self._effective_inventory_cap()
+        logger.info(
+            "库存上限状态：当前生效值=$%.2f；上限来源=%s；绝对硬顶=$%.2f",
+            effective_cap,
+            cap_source,
+            self.config.max_inventory_usd,
+        )
+        logger.info("网格引擎启动（dry_run=%s，格距%.1f%%，每边%d格，库存硬顶$%.0f）",
                     self.config.dry_run, self.config.spacing_pct * 100,
                     self.config.levels_per_side, self.config.max_inventory_usd)
         next_fast = time.monotonic()

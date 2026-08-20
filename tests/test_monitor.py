@@ -40,7 +40,12 @@ def test_run_grid_trend_aware_cli_defaults_and_overrides() -> None:
     assert defaults.trend_aware is False
     assert defaults.band_k == 1.75
     assert defaults.min_half_frac == 0.04
-    assert defaults.hard_stop_dist == 0.12
+    assert defaults.max_drawdown is None
+    assert defaults.hard_stop_dist is None
+    default_config = run_grid._grid_config(defaults)
+    assert default_config.max_drawdown_pct == 0.12
+    assert default_config.hard_stop_dist == 0.12
+    assert default_config.explicit_risk_flags == ()
 
     args = parser.parse_args(
         [
@@ -58,6 +63,11 @@ def test_run_grid_trend_aware_cli_defaults_and_overrides() -> None:
     assert config.band_k == 2.25
     assert config.min_half_frac == 0.047
     assert config.hard_stop_dist == 0.08
+    assert config.max_drawdown_pct == 0.12
+    assert config.explicit_risk_flags == (
+        "--trend-aware",
+        "--hard-stop-dist",
+    )
 
 
 def test_read_grid_state_missing_returns_none_fields(tmp_path) -> None:

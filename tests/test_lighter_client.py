@@ -90,6 +90,12 @@ REAL_ORDER_BOOK_DETAILS_RESPONSE = {
     ],
 }
 
+REAL_ORDER_BOOK_ORDERS_RESPONSE = {
+    "code": 200,
+    "asks": [{"price": "64252.8", "remaining_base_amount": "0.01000"}],
+    "bids": [{"price": "64252.7", "remaining_base_amount": "0.01200"}],
+}
+
 
 def _real_position(**overrides) -> dict:
     """复制真实 BTC 持仓，并仅覆盖当前场景关心的字段。"""
@@ -410,8 +416,44 @@ def test_trading_enabled_requires_key() -> None:
         LighterClient(l1_address="0xabc", trading_enabled=True)
 
 
-def test_market_price_uses_mark_price(monkeypatch) -> None:
-    """订单簿详情没有 bid/ask 时，应以标记价构造统一行情。"""
+def test_market_price_uses_real_best_bid_and_ask(monkeypatch) -> None:
+    """统一行情必须来自真实买一卖一，且 market_id 取自市场元数据。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/orderBookOrders"
+        assert dict(request.url.params) == {"market_id": "1", "limit": "1"}
+        return httpx.Response(200, json=deepcopy(REAL_ORDER_BOOK_ORDERS_RESPONSE))
+
+    client = _make_client(monkeypatch, handler)
+    client._market_meta["BTC"] = {"market_id": 1}
+
+    price = _run_and_close(client, client.get_market_price("BTC"))
+
+    assert price.market == "BTC"
+    assert price.bid == Decimal("64252.7")
+    assert price.ask == Decimal("64252.8")
+
+
+@pytest.mark.parametrize("failure_kind", ["empty", "timeout", "server-error"])
+def test_market_price_unavailable_returns_none(monkeypatch, failure_kind: str) -> None:
+    """空盘口、超时和 HTTP 错误都以 None 表示不可用，不把异常泄漏给轮询。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/orderBookOrders"
+        if failure_kind == "timeout":
+            raise httpx.ReadTimeout("模拟盘口超时", request=request)
+        if failure_kind == "server-error":
+            return httpx.Response(503, json={"message": "暂不可用"})
+        return httpx.Response(200, json={"code": 200, "asks": [], "bids": []})
+
+    client = _make_client(monkeypatch, handler)
+    client._market_meta["BTC"] = {"market_id": 1}
+
+    assert _run_and_close(client, client.get_market_price("BTC")) is None
+
+
+def test_mark_price_still_uses_order_book_details(monkeypatch) -> None:
+    """真实盘口改造不得把独立标记价偷换成买卖中值。"""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/orderBookDetails"
@@ -419,12 +461,9 @@ def test_market_price_uses_mark_price(monkeypatch) -> None:
 
     client = _make_client(monkeypatch, handler)
 
-    price = _run_and_close(client, client.get_market_price("BTC"))
+    mark = _run_and_close(client, client.get_mark_price("BTC"))
 
-    assert price.market == "BTC"
-    assert price.bid == Decimal("63015.5")
-    assert price.ask == Decimal("63015.5")
-    assert price.mid == Decimal("63015.5")
+    assert mark == Decimal("63015.5")
 
 
 def test_liquidation_info_uses_position_and_mark_price(monkeypatch) -> None:
@@ -496,6 +535,46 @@ def test_get_collateral_reads_account_field(monkeypatch):
     client = _make_client(monkeypatch, handler)
     client.account_index = 5626
     assert asyncio.run(client.get_collateral()) == Decimal("489.265906")
+
+
+def test_get_balance_returns_total_asset_value_with_unrealized_pnl(monkeypatch) -> None:
+    """权益必须取含未实现盈亏的 total_asset_value，不能误用抵押品。"""
+    response = deepcopy(REAL_ACCOUNT_RESPONSE)
+    account = response["accounts"][0]
+    account["collateral"] = "489.265906"
+    account["positions"][0]["unrealized_pnl"] = "-12.500000"
+    account["total_asset_value"] = "476.765906"
+    client = _make_client(
+        monkeypatch,
+        lambda _request: httpx.Response(200, json=response),
+    )
+    client.account_index = REAL_ACCOUNT_INDEX
+
+    balance = _run_and_close(client, client.get_balance())
+
+    assert balance.equity == Decimal("476.765906")
+    assert balance.equity != Decimal(account["collateral"])
+
+
+def test_get_balance_query_failure_raises_instead_of_returning_zero(monkeypatch) -> None:
+    """账户查询失败必须抛出，不能伪造成零权益。"""
+    client = _make_client(
+        monkeypatch,
+        lambda _request: httpx.Response(503, json={"message": "暂时不可用"}),
+    )
+    client.account_index = REAL_ACCOUNT_INDEX
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _run_and_close(client, client.get_balance())
+
+
+def test_get_balance_docstring_states_equity_basis() -> None:
+    """文档必须明确权益字段与未实现盈亏口径，防止未来误改回 collateral。"""
+    docstring = inspect.getdoc(LighterClient.get_balance) or ""
+
+    assert "total_asset_value" in docstring
+    assert "未实现盈亏" in docstring
+    assert "get_collateral" in docstring
 
 
 class _FakeSendTx:

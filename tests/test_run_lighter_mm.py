@@ -378,10 +378,12 @@ def test_heartbeat_appends_complete_successful_round(monkeypatch, tmp_path) -> N
         "max_inv": 500.0,
         "interval": 1.75,
         "position_size": "0.0123",
-        "inventory_usd": 738.0,
-        "open_orders": 2,
-        "success": True,
-    }
+            "inventory_usd": 738.0,
+            "open_orders": 2,
+            "trading_window_state": "disabled",
+            "planned_stop": False,
+            "success": True,
+        }
 
 
 def test_heartbeat_keeps_inventory_unknown_without_mark_price() -> None:

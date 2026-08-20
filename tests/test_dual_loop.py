@@ -7,10 +7,12 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from adapters.base import Side
-from grid.grid_engine import GridConfig, GridEngine
+from grid.grid_engine import RISK_LAYER_REQUIREMENTS, GridConfig, GridEngine
 from grid.grid_state import GridState
 from grid.regime import GridMode
 from tools.run_grid import _build_parser, _grid_config
+
+_ALL_RISK_WAIVERS = tuple(RISK_LAYER_REQUIREMENTS)
 
 
 def _active_engine(tmp_path) -> GridEngine:
@@ -20,6 +22,8 @@ def _active_engine(tmp_path) -> GridEngine:
             dry_run=False,
             trend_aware=True,
             state_path=str(tmp_path / "grid_state.json"),
+            # 本文件只测调度，交易所桩不实现风控能力，故显式知情放弃。
+            risk_waivers=_ALL_RISK_WAIVERS,
         ),
     )
     eng._state = GridState(95.0, 105.0, False, None, False)
@@ -317,6 +321,8 @@ def test_connectivity_becomes_critical_only_after_two_slow_intervals(
             state_path=str(tmp_path / "grid_state.json"),
             poll_interval=2.5,
             slow_interval=30.0,
+            # 本场景只测失联计时，object() 不代表可交易适配器。
+            risk_waivers=_ALL_RISK_WAIVERS,
         ),
     )
     clock = {"now": 1_000.0}
