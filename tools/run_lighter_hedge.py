@@ -18,7 +18,7 @@ import time  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from adapters.base import ExchangeAdapter  # noqa: E402
+from adapters.base import ExchangeAdapter, Position  # noqa: E402
 from adapters.extended_client import ExtendedClient, filter_grid_orders  # noqa: E402
 from adapters.lighter_client import LighterClient  # noqa: E402
 from engine.hedge_engine import HedgeConfig, HedgeEngine, HedgeState  # noqa: E402
@@ -84,7 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-shared-account",
         action="store_true",
         help=(
-            "知情允许与网格共用 Extended 账户；启动时仍校验无可交易仓位且无网格挂单；"
+            "知情允许与网格共用 Extended 账户；启动时仍校验两腿近似对冲且无网格挂单；"
             "不能与 --risk-selfcheck-only 同用"
         ),
     )
@@ -316,36 +316,121 @@ def _validate_startup(args: argparse.Namespace) -> tuple[str, str]:
     return account_prefix, lighter_address
 
 
-async def _validate_shared_account_state(hedge) -> None:
-    """校验共用账户没有可交易仓位或普通网格挂单。"""
+async def _get_shared_account_min_order_size(hedge, position: Position) -> Decimal:
+    """读取 Extended 最小下单量；失败时回退到保守极小阈值。"""
     try:
-        positions = await hedge.get_all_positions()
-    except Exception as exc:  # noqa: BLE001  无法确认仓位时必须失败关闭
-        raise StartupError(f"拒绝启动：无法确认共用账户持仓状态：{exc}") from exc
+        min_order_size = Decimal(
+            str(await hedge.get_min_order_size(position.market))
+        )
+        if not min_order_size.is_finite() or min_order_size <= 0:
+            raise ValueError(f"返回无效值 {min_order_size}")
+        return min_order_size
+    except Exception as exc:  # noqa: BLE001  查询失败时保守地近似严格零仓
+        logger.warning(
+            "查询共用账户市场 %s 最小下单量失败，回退保守极小阈值 %s：%s",
+            position.market,
+            _SHARED_ACCOUNT_POSITION_FALLBACK,
+            exc,
+        )
+        return _SHARED_ACCOUNT_POSITION_FALLBACK
 
-    for position in positions:
-        if position.signed_size == 0:
+
+def _shared_account_position_error(
+    *,
+    primary_market: str,
+    primary_size: Decimal,
+    hedge_market: str,
+    hedge_size: Decimal,
+    tolerance: Decimal,
+) -> StartupError:
+    """构造包含两腿、净敞口与容差的保守拒绝错误。"""
+    net_delta = primary_size + hedge_size
+    return StartupError(
+        "拒绝启动：共用账户持仓无法构成合法对冲"
+        f"（Lighter {primary_market} {primary_size}，"
+        f"Extended {hedge_market} {hedge_size}，"
+        f"净敞口 {net_delta}，容差 {tolerance}）"
+    )
+
+
+async def _validate_shared_account_state(
+    primary,
+    hedge,
+    *,
+    primary_market: str,
+    hedge_market: str,
+    rebalance_threshold_ratio: Decimal,
+) -> None:
+    """校验共用账户处于合法对冲状态，且没有普通网格挂单。"""
+    try:
+        await primary.connect()
+        primary_position = await primary.get_position(primary_market)
+        primary_size = Decimal(str(primary_position.signed_size))
+        if not primary_size.is_finite():
+            raise ValueError(f"返回无效数量 {primary_size}")
+    except Exception as exc:  # noqa: BLE001  无法确认 Lighter 仓位时必须失败关闭
+        raise StartupError(f"拒绝启动：无法确认 Lighter 持仓状态：{exc}") from exc
+
+    try:
+        positions = list(await hedge.get_all_positions())
+        normalized_positions = [
+            Position(
+                market=str(position.market),
+                signed_size=Decimal(str(position.signed_size)),
+                raw=position.raw,
+            )
+            for position in positions
+        ]
+        if any(not position.signed_size.is_finite() for position in normalized_positions):
+            raise ValueError("Extended 返回非有限持仓数量")
+    except Exception as exc:  # noqa: BLE001  无法确认 Extended 仓位时必须失败关闭
+        raise StartupError(f"拒绝启动：无法确认 Extended 持仓状态：{exc}") from exc
+
+    target_market = hedge_market.upper()
+    target_positions = [
+        position
+        for position in normalized_positions
+        if position.market.upper() == target_market
+    ]
+    hedge_size = sum(
+        (position.signed_size for position in target_positions),
+        Decimal(0),
+    )
+    leg_base = max(abs(primary_size), abs(hedge_size))
+    tolerance = Decimal(str(rebalance_threshold_ratio)) * leg_base
+    net_delta = primary_size + hedge_size
+
+    if abs(net_delta) > tolerance:
+        is_dust = False
+        if primary_size == 0 and hedge_size != 0:
+            aggregate_position = Position(hedge_market, hedge_size)
+            min_order_size = await _get_shared_account_min_order_size(
+                hedge,
+                aggregate_position,
+            )
+            is_dust = abs(hedge_size) < min_order_size
+        if not is_dust:
+            raise _shared_account_position_error(
+                primary_market=primary_market,
+                primary_size=primary_size,
+                hedge_market=hedge_market,
+                hedge_size=hedge_size,
+                tolerance=tolerance,
+            )
+
+    for position in normalized_positions:
+        if position.market.upper() == target_market or position.signed_size == 0:
             continue
-        try:
-            min_order_size = Decimal(
-                str(await hedge.get_min_order_size(position.market))
-            )
-            if not min_order_size.is_finite() or min_order_size <= 0:
-                raise ValueError(f"返回无效值 {min_order_size}")
-        except Exception as exc:  # noqa: BLE001  查询失败时保守地近似严格零仓
-            min_order_size = _SHARED_ACCOUNT_POSITION_FALLBACK
-            logger.warning(
-                "查询共用账户市场 %s 最小下单量失败，回退保守极小阈值 %s：%s",
-                position.market,
-                min_order_size,
-                exc,
-            )
-        if abs(position.signed_size) >= min_order_size:
-            raise StartupError(
-                "拒绝启动：共用账户仍有仓位"
-                f"（{position.market} {position.signed_size}，"
-                f"最小下单量 {min_order_size}）"
-            )
+        min_order_size = await _get_shared_account_min_order_size(hedge, position)
+        if abs(position.signed_size) < min_order_size:
+            continue
+        raise _shared_account_position_error(
+            primary_market="无对应标的",
+            primary_size=Decimal(0),
+            hedge_market=position.market,
+            hedge_size=position.signed_size,
+            tolerance=Decimal(0),
+        )
 
     try:
         grid_orders = filter_grid_orders(await hedge.get_all_open_orders())
@@ -470,7 +555,13 @@ async def _main(args: argparse.Namespace) -> None:
     try:
         hedge = ExtendedClient.from_env(prefix=account_prefix)
         if getattr(args, "allow_shared_account", False):
-            await _validate_shared_account_state(hedge)
+            await _validate_shared_account_state(
+                primary,
+                hedge,
+                primary_market=args.market,
+                hedge_market=args.hedge_market,
+                rebalance_threshold_ratio=args.rebalance_threshold,
+            )
         risk_statuses = _validate_risk_controls(primary, hedge, args)
         config = HedgeConfig(
             market=args.hedge_market,
@@ -510,7 +601,8 @@ async def _main(args: argparse.Namespace) -> None:
             return
 
         # 先解析账户索引才能满足启动自检输出；run_forever 随后会统一连接两腿。
-        await primary.connect()
+        if primary.account_index is None:
+            await primary.connect()
         if primary.account_index is None:
             raise StartupError("拒绝启动：Lighter connect() 未返回 account_index")
         summary = _startup_summary(

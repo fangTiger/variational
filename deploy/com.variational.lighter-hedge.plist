@@ -29,7 +29,7 @@
 		<string>--interval</string>
 		<string>30</string>
 		<string>--rebalance-threshold</string>
-		<string>0.02</string>
+		<string>0.08</string>
 		<string>--min-hedge-free-margin-ratio</string>
 		<string>0.20</string>
 		<string>--maker-first-timeout</string>

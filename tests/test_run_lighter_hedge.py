@@ -13,7 +13,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from adapters.base import Position
+from adapters.base import ExchangeAdapter, Position
+from adapters.extended_client import ExtendedClient
+from adapters.lighter_client import LighterClient
 from engine.hedge_engine import HedgeState
 
 
@@ -52,6 +54,7 @@ class _SharedAccountHedge:
         open_orders: list[object] | None = None,
         min_order_size: Decimal = Decimal("0.0001"),
         min_order_size_error: Exception | None = None,
+        positions_error: Exception | None = None,
     ) -> None:
         self.signed_size = signed_size
         self.positions = (
@@ -66,6 +69,7 @@ class _SharedAccountHedge:
         self.open_orders = list(open_orders or [])
         self.min_order_size = min_order_size
         self.min_order_size_error = min_order_size_error
+        self.positions_error = positions_error
         self.calls: list[tuple[str, str]] = []
         self.closed = False
 
@@ -77,6 +81,8 @@ class _SharedAccountHedge:
 
     async def get_all_positions(self) -> list[Position]:
         self.calls.append(("positions", "全部"))
+        if self.positions_error is not None:
+            raise self.positions_error
         return self.positions
 
     async def get_min_order_size(self, market: str) -> Decimal:
@@ -112,36 +118,78 @@ class _SharedAccountHedge:
         self.closed = True
 
 
-def _patch_shared_account_clients(monkeypatch, cli, hedge: _SharedAccountHedge) -> None:
+class _SharedAccountPrimary:
+    """复刻真实 Lighter 默认只读实例的启动期持仓读取契约。"""
+
+    name = "lighter-rh"
+    supports_trading = False
+    trading_enabled = False
+
+    def __init__(
+        self,
+        *,
+        signed_size: Decimal = Decimal("0"),
+        position_error: Exception | None = None,
+        connect_error: Exception | None = None,
+        l1_address: str = "0x4A3D...3d82",
+    ) -> None:
+        self.signed_size = signed_size
+        self.position_error = position_error
+        self.connect_error = connect_error
+        self.l1_address = l1_address
+        self.account_index = None
+        self.calls: list[tuple[str, str]] = []
+        self.closed = False
+
+    async def connect(self) -> None:
+        self.calls.append(("connect", self.l1_address))
+        if self.connect_error is not None:
+            raise self.connect_error
+        self.account_index = 5626
+
+    async def get_position(self, market: str) -> Position:
+        self.calls.append(("position", market))
+        if self.position_error is not None:
+            raise self.position_error
+        return Position(market, self.signed_size)
+
+    async def get_market_price(self, market: str):
+        return SimpleNamespace(market=market, mid=Decimal("60000"))
+
+    async def get_liquidation_info(self, _market):
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _validate_shared_account(cli, primary, hedge, **overrides) -> None:
+    """以生产入口使用的市场与比例调用共用账户校验。"""
+    options = {
+        "primary_market": "BTC",
+        "hedge_market": "BTC-USD",
+        "rebalance_threshold_ratio": Decimal("0.02"),
+    }
+    options.update(overrides)
+    asyncio.run(cli._validate_shared_account_state(primary, hedge, **options))
+
+
+def _patch_shared_account_clients(
+    monkeypatch,
+    cli,
+    hedge: _SharedAccountHedge,
+    *,
+    primary_signed_size: Decimal = Decimal("0"),
+) -> _SharedAccountPrimary:
     """隔离外部网络，同时保留入口真实的构造与关闭流程。"""
-
-    class FakeLighter:
-        def __init__(self, l1_address: str) -> None:
-            self.l1_address = l1_address
-            self.account_index = None
-            self.closed = False
-
-        async def connect(self) -> None:
-            self.account_index = 5626
-
-        async def get_position(self, market: str) -> Position:
-            return Position(market, Decimal("0"))
-
-        async def get_market_price(self, market: str):
-            return SimpleNamespace(market=market, mid=Decimal("60000"))
-
-        async def get_liquidation_info(self, _market):
-            return None
-
-        async def close(self) -> None:
-            self.closed = True
-
-    monkeypatch.setattr(cli, "LighterClient", FakeLighter)
+    primary = _SharedAccountPrimary(signed_size=primary_signed_size)
+    monkeypatch.setattr(cli, "LighterClient", lambda l1_address: primary)
     monkeypatch.setattr(
         cli,
         "ExtendedClient",
         SimpleNamespace(from_env=lambda prefix: hedge),
     )
+    return primary
 
 
 def test_rejects_grid_account_before_constructing_clients(monkeypatch) -> None:
@@ -210,10 +258,10 @@ def test_declaration_skips_all_static_account_rejections(monkeypatch) -> None:
     assert result == ("X10_GRID", "0x4A3D...3d82")
 
 
-def test_shared_account_with_position_at_or_above_minimum_is_rejected(
+def test_shared_account_with_unmapped_position_at_or_above_minimum_is_rejected(
     monkeypatch,
 ) -> None:
-    """达到可交易最小量的其他标的仓位仍必须拒绝，并说明市场与数量。"""
+    """达到可交易最小量的其他标的仓位无法由 primary 解释，必须拒绝。"""
     cli = _cli_module()
     hedge = _SharedAccountHedge(
         positions=[Position("ETH-USD", Decimal("0.01"))],
@@ -227,7 +275,10 @@ def test_shared_account_with_position_at_or_above_minimum_is_rejected(
 
     monkeypatch.setattr(cli, "HedgeEngine", FailEngine)
 
-    with pytest.raises(cli.StartupError, match=r"仍有仓位.*ETH-USD 0\.01"):
+    with pytest.raises(
+        cli.StartupError,
+        match=r"Lighter.*0.*Extended ETH-USD 0\.01.*净敞口 0\.01",
+    ):
         asyncio.run(
             cli._main(
                 _args(account="X10_GRID", allow_shared_account=True)
@@ -241,6 +292,65 @@ def test_shared_account_with_position_at_or_above_minimum_is_rejected(
     assert hedge.closed is True
 
 
+def test_shared_account_incident_positions_are_allowed() -> None:
+    """事故回放：合法对冲仓位不得阻塞对冲腿重启。"""
+    cli = _cli_module()
+    primary = _SharedAccountPrimary(signed_size=Decimal("-0.01972"))
+    hedge = _SharedAccountHedge(signed_size=Decimal("0.01972"))
+
+    _validate_shared_account(cli, primary, hedge)
+
+    assert primary.calls == [
+        ("connect", "0x4A3D...3d82"),
+        ("position", "BTC"),
+    ]
+    assert hedge.calls == [
+        ("positions", "全部"),
+        ("open_orders", "全部"),
+    ]
+
+
+def test_shared_account_opposite_positions_within_ratio_are_allowed() -> None:
+    """轻微净敞口不超过既有再平衡比例时，应视为合法对冲。"""
+    cli = _cli_module()
+    primary = _SharedAccountPrimary(signed_size=Decimal("-1"))
+    hedge = _SharedAccountHedge(signed_size=Decimal("0.99"))
+
+    _validate_shared_account(cli, primary, hedge)
+
+
+def test_shared_account_position_without_primary_is_rejected() -> None:
+    """Extended 正常仓位而 Lighter 为零时必须保守拒绝并给出净敞口。"""
+    cli = _cli_module()
+    primary = _SharedAccountPrimary()
+    hedge = _SharedAccountHedge(signed_size=Decimal("0.01972"))
+
+    with pytest.raises(
+        cli.StartupError,
+        match=(
+            r"Lighter BTC 0.*Extended BTC-USD 0\.01972.*"
+            r"净敞口 0\.01972.*容差 0\.0003944"
+        ),
+    ):
+        _validate_shared_account(cli, primary, hedge)
+
+
+def test_shared_account_same_direction_positions_are_rejected() -> None:
+    """两侧同向时净敞口放大，必须拒绝并披露两侧数量。"""
+    cli = _cli_module()
+    primary = _SharedAccountPrimary(signed_size=Decimal("0.01972"))
+    hedge = _SharedAccountHedge(signed_size=Decimal("0.01972"))
+
+    with pytest.raises(
+        cli.StartupError,
+        match=(
+            r"Lighter BTC 0\.01972.*Extended BTC-USD 0\.01972.*"
+            r"净敞口 0\.03944"
+        ),
+    ):
+        _validate_shared_account(cli, primary, hedge)
+
+
 def test_shared_account_dust_position_below_minimum_is_allowed() -> None:
     """对冲腿留下的不可交易微仓不得阻塞其自身重启。"""
     cli = _cli_module()
@@ -249,7 +359,9 @@ def test_shared_account_dust_position_below_minimum_is_allowed() -> None:
         min_order_size=Decimal("0.0001"),
     )
 
-    asyncio.run(cli._validate_shared_account_state(hedge))
+    primary = _SharedAccountPrimary()
+
+    _validate_shared_account(cli, primary, hedge)
 
     assert hedge.calls == [
         ("positions", "全部"),
@@ -269,7 +381,7 @@ def test_shared_account_minimum_query_failure_uses_logged_conservative_fallback(
     )
 
     with caplog.at_level(logging.WARNING, logger="lighter_hedge"):
-        asyncio.run(cli._validate_shared_account_state(hedge))
+        _validate_shared_account(cli, _SharedAccountPrimary(), hedge)
 
     assert "最小下单量" in caplog.text
     assert "保守" in caplog.text
@@ -282,7 +394,7 @@ def test_shared_account_minimum_query_failure_uses_logged_conservative_fallback(
 
 
 def test_shared_account_with_grid_orders_is_rejected(monkeypatch) -> None:
-    """已声明但目标账户仍有普通网格单时，入口必须拒绝启动。"""
+    """即使两腿仓位完全对冲，普通网格单仍必须拒绝启动。"""
     cli = _cli_module()
     hedge = _SharedAccountHedge(
         open_orders=[
@@ -295,7 +407,13 @@ def test_shared_account_with_grid_orders_is_rejected(monkeypatch) -> None:
             )
         ]
     )
-    _patch_shared_account_clients(monkeypatch, cli, hedge)
+    hedge.positions = [Position("BTC-USD", Decimal("0.01972"))]
+    _patch_shared_account_clients(
+        monkeypatch,
+        cli,
+        hedge,
+        primary_signed_size=Decimal("-0.01972"),
+    )
 
     class FailEngine:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -315,6 +433,35 @@ def test_shared_account_with_grid_orders_is_rejected(monkeypatch) -> None:
         ("open_orders", "全部"),
     ]
     assert hedge.closed is True
+
+
+@pytest.mark.parametrize(
+    ("primary", "hedge", "message"),
+    [
+        (
+            _SharedAccountPrimary(position_error=RuntimeError("Lighter 暂不可用")),
+            _SharedAccountHedge(),
+            "无法确认 Lighter 持仓状态",
+        ),
+        (
+            _SharedAccountPrimary(),
+            _SharedAccountHedge(
+                positions_error=RuntimeError("Extended 暂不可用")
+            ),
+            "无法确认 Extended 持仓状态",
+        ),
+    ],
+)
+def test_shared_account_position_read_failure_is_rejected(
+    primary,
+    hedge,
+    message,
+) -> None:
+    """任一侧持仓无法读取时都不得把未知状态伪装成可启动。"""
+    cli = _cli_module()
+
+    with pytest.raises(cli.StartupError, match=message):
+        _validate_shared_account(cli, primary, hedge)
 
 
 def test_clean_shared_account_passes_runtime_validation() -> None:
@@ -337,7 +484,7 @@ def test_clean_shared_account_passes_runtime_validation() -> None:
         ]
     )
 
-    asyncio.run(cli._validate_shared_account_state(hedge))
+    _validate_shared_account(cli, _SharedAccountPrimary(), hedge)
 
     assert hedge.calls == [
         ("positions", "全部"),
@@ -371,6 +518,15 @@ def test_clean_shared_account_main_reaches_engine(monkeypatch) -> None:
     ]
     assert captured == {"engine_created": True, "ran_forever": True}
     assert hedge.closed is True
+
+
+def test_shared_account_guard_real_adapters_expose_required_read_methods() -> None:
+    """桩所依赖的方法必须由真实适配器实现，避免接口漂移漏过 P0。"""
+    assert LighterClient.get_position is not ExchangeAdapter.get_position
+    assert callable(getattr(LighterClient, "connect", None))
+    assert callable(getattr(ExtendedClient, "get_all_positions", None))
+    assert callable(getattr(ExtendedClient, "get_min_order_size", None))
+    assert callable(getattr(ExtendedClient, "get_all_open_orders", None))
 
 
 def test_shared_account_rejects_offline_selfcheck_before_constructing_clients(
