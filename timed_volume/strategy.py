@@ -107,8 +107,16 @@ TradeExecutor = Callable[..., Awaitable[HedgeFillResult]]
 AvailabilityCheck = Callable[[], bool | Awaitable[bool]]
 
 
+@dataclass(frozen=True)
+class _OrderLimits:
+    """两侧市场的最小可交易数量。"""
+
+    primary_minimum: Decimal
+    hedge_minimum: Decimal
+
+
 class TimedHedgedVolumeStrategy:
-    """用固定周期驱动 Lighter 与 Extended 反向等量开平仓。"""
+    """用固定周期驱动 Lighter 与 Extended 在容差内反向开平仓。"""
 
     def __init__(
         self,
@@ -127,6 +135,8 @@ class TimedHedgedVolumeStrategy:
         self.state = self._load_state()
         self.hedge_interlock_active = False
         self.hedge_interlock_reason = "尚未判定"
+        self.hedge_tolerance: Decimal | None = None
+        self._order_limits: _OrderLimits | None = None
 
     def _load_state(self) -> TimedVolumeState:
         """读取轮次记录；损坏记录失败关闭为无记录，后续以实仓恢复。"""
@@ -176,17 +186,26 @@ class TimedHedgedVolumeStrategy:
         )
         temporary.replace(path)
 
-    def _is_zero(self, value: Decimal) -> bool:
-        """按配置容差判断仓位是否可视为零。"""
-        return abs(value) <= self.config.position_tolerance
+    def _is_within_hedge_tolerance(self, net_exposure: Decimal) -> bool:
+        """按交易所最小可交易量推导的容差判断净敞口。"""
+        if net_exposure == 0:
+            return True
+        return (
+            self.hedge_tolerance is not None
+            and abs(net_exposure) < self.hedge_tolerance
+        )
 
     def _is_neutral_pair(self, primary_size: Decimal, hedge_size: Decimal) -> bool:
         """判断两腿是否非空、反向且净敞口在容差内。"""
-        if self._is_zero(primary_size) or self._is_zero(hedge_size):
+        if primary_size == 0 or hedge_size == 0:
             return False
         if primary_size * hedge_size >= 0:
             return False
-        return self._is_zero(primary_size + hedge_size)
+        return self._is_within_hedge_tolerance(primary_size + hedge_size)
+
+    def _is_effectively_flat(self, size: Decimal, minimum: Decimal) -> bool:
+        """判断单腿是否为零或低于该市场最小下单量。"""
+        return size == 0 or abs(size) < minimum
 
     async def _read_positions(self) -> tuple[Decimal, Decimal]:
         """并发读取两侧实际持仓。"""
@@ -199,7 +218,49 @@ class TimedHedgedVolumeStrategy:
             Decimal(str(hedge_position.signed_size)),
         )
 
-    async def _check_hedge_available(self) -> bool:
+    async def _get_order_limits(
+        self,
+        warnings: list[str],
+    ) -> _OrderLimits | None:
+        """查询并缓存两侧最小下单量；未知时互锁而不猜测容差。"""
+        if self._order_limits is not None:
+            return self._order_limits
+
+        primary_raw, hedge_raw = await asyncio.gather(
+            self.primary.get_min_order_size(self.config.primary_market),
+            self.hedge.get_min_order_size(self.config.hedge_market),
+            return_exceptions=True,
+        )
+        try:
+            if isinstance(primary_raw, Exception):
+                raise RuntimeError(f"Lighter 最小下单量查询失败：{primary_raw}")
+            if isinstance(hedge_raw, Exception):
+                raise RuntimeError(f"Extended 最小下单量查询失败：{hedge_raw}")
+            primary_minimum = Decimal(str(primary_raw))
+            hedge_minimum = Decimal(str(hedge_raw))
+            if not primary_minimum.is_finite() or primary_minimum <= 0:
+                raise RuntimeError(f"Lighter 最小下单量无效：{primary_minimum}")
+            if not hedge_minimum.is_finite() or hedge_minimum <= 0:
+                raise RuntimeError(f"Extended 最小下单量无效：{hedge_minimum}")
+        except (ArithmeticError, RuntimeError, ValueError) as exc:
+            self.hedge_tolerance = None
+            self.hedge_interlock_active = True
+            self.hedge_interlock_reason = f"对冲容差查询失败：{exc}"
+            self._warn(warnings, self.hedge_interlock_reason)
+            return None
+
+        self._order_limits = _OrderLimits(
+            primary_minimum=primary_minimum,
+            hedge_minimum=hedge_minimum,
+        )
+        self.hedge_tolerance = max(
+            self.config.position_tolerance,
+            primary_minimum,
+            hedge_minimum,
+        )
+        return self._order_limits
+
+    async def _check_hedge_available(self, limits: _OrderLimits) -> bool:
         """刷新 Extended 互锁；默认同时核对交易能力、行情与市场元数据。"""
         if self._availability_check is None:
             try:
@@ -218,10 +279,8 @@ class TimedHedgedVolumeStrategy:
                 ]
                 if missing:
                     raise RuntimeError("Extended 缺少交易能力：" + "、".join(missing))
-                quote, minimum = await asyncio.gather(
-                    self.hedge.get_market_price(self.config.hedge_market),
-                    self.hedge.get_min_order_size(self.config.hedge_market),
-                )
+                quote = await self.hedge.get_market_price(self.config.hedge_market)
+                minimum = limits.hedge_minimum
                 if quote is None:
                     raise RuntimeError("Extended 行情不可用")
                 bid = Decimal(str(quote.bid))
@@ -296,8 +355,11 @@ class TimedHedgedVolumeStrategy:
             )
         )
 
-    async def _target_quantity(self) -> Decimal:
-        """按 Lighter 中间价计算两侧共用数量，并核对两侧精度与最小量。"""
+    async def _target_quantities(
+        self,
+        limits: _OrderLimits,
+    ) -> tuple[Decimal, Decimal]:
+        """按 Lighter 中间价计算并保留两侧各自可下单的舍入数量。"""
         quote = await self.primary.get_market_price(self.config.primary_market)
         if quote is None or Decimal(str(quote.mid)) <= 0:
             raise RuntimeError("Lighter 盘口不可用，无法计算固定名义额数量")
@@ -308,35 +370,53 @@ class TimedHedgedVolumeStrategy:
         )
         primary_qty = Decimal(str(primary_qty))
         hedge_qty = Decimal(str(hedge_qty))
-        if abs(primary_qty - hedge_qty) > self.config.position_tolerance:
-            raise RuntimeError(
-                "两侧数量精度无法形成等量对冲："
-                f"Lighter={primary_qty}，Extended={hedge_qty}"
-            )
-        quantity = min(primary_qty, hedge_qty)
-        primary_minimum, hedge_minimum = await asyncio.gather(
-            self.primary.get_min_order_size(self.config.primary_market),
-            self.hedge.get_min_order_size(self.config.hedge_market),
-        )
-        if quantity < max(
-            Decimal(str(primary_minimum)), Decimal(str(hedge_minimum))
-        ):
-            raise RuntimeError("配置名义额换算后的数量低于交易所最小下单量")
-        return quantity
+        if not primary_qty.is_finite() or primary_qty < limits.primary_minimum:
+            raise RuntimeError("配置名义额换算后的 Lighter 数量低于最小下单量")
+        if not hedge_qty.is_finite() or hedge_qty < limits.hedge_minimum:
+            raise RuntimeError("配置名义额换算后的 Extended 数量低于最小下单量")
+        return primary_qty, hedge_qty
 
     def _warn(self, warnings: list[str], message: str) -> None:
         """记录中文告警并同步写入本轮结果。"""
         warnings.append(message)
         logger.warning(message)
 
-    async def _flatten_all(self, warnings: list[str]) -> tuple[Decimal, Decimal]:
+    async def _flatten_all(
+        self,
+        warnings: list[str],
+        limits: _OrderLimits,
+    ) -> tuple[Decimal, Decimal]:
         """按每次重读到的实仓反复平仓；失败时优先恢复中性而非遗留裸仓。"""
         primary_size, hedge_size = await self._read_positions()
+        primary_dust_warned = False
+        hedge_dust_warned = False
         for _ in range(self.config.convergence_attempts):
-            if self._is_zero(primary_size) and self._is_zero(hedge_size):
-                return Decimal(0), Decimal(0)
+            primary_flat = self._is_effectively_flat(
+                primary_size,
+                limits.primary_minimum,
+            )
+            hedge_flat = self._is_effectively_flat(
+                hedge_size,
+                limits.hedge_minimum,
+            )
+            if primary_flat and primary_size != 0 and not primary_dust_warned:
+                self._warn(
+                    warnings,
+                    "Lighter 平仓残余低于最小下单量，明确放弃不可交易残差："
+                    f"残余={primary_size}，最小下单量={limits.primary_minimum}",
+                )
+                primary_dust_warned = True
+            if hedge_flat and hedge_size != 0 and not hedge_dust_warned:
+                self._warn(
+                    warnings,
+                    "Extended 平仓残余低于最小下单量，明确放弃不可交易残差："
+                    f"残余={hedge_size}，最小下单量={limits.hedge_minimum}",
+                )
+                hedge_dust_warned = True
+            if primary_flat and hedge_flat:
+                return primary_size, hedge_size
             calls = []
-            if not self._is_zero(primary_size):
+            if not primary_flat:
                 calls.append(
                     self._execute(
                         self.primary,
@@ -345,7 +425,7 @@ class TimedHedgedVolumeStrategy:
                         reduce_only=True,
                     )
                 )
-            if not self._is_zero(hedge_size):
+            if not hedge_flat:
                 calls.append(
                     self._execute(
                         self.hedge,
@@ -363,26 +443,35 @@ class TimedHedgedVolumeStrategy:
         if self._is_neutral_pair(primary_size, hedge_size):
             return primary_size, hedge_size
 
-        self._warn(warnings, "多次平仓后仍有净敞口，尝试在可用腿恢复等量反向仓")
+        self._warn(warnings, "多次平仓后仍有净敞口，尝试在可用腿恢复容差内反向仓")
         net = primary_size + hedge_size
-        if not self._is_zero(net):
+        if not self._is_within_hedge_tolerance(net):
             if abs(primary_size) <= abs(hedge_size):
-                recovery = self._execute(
-                    self.primary,
-                    self.config.primary_market,
-                    -net,
-                    reduce_only=False,
+                adapter = self.primary
+                market = self.config.primary_market
+                minimum = limits.primary_minimum
+                label = "Lighter"
+            else:
+                adapter = self.hedge
+                market = self.config.hedge_market
+                minimum = limits.hedge_minimum
+                label = "Extended"
+            if abs(net) < minimum:
+                self._warn(
+                    warnings,
+                    f"恢复中性所需数量 {abs(net)} 低于 {label} 最小下单量 "
+                    f"{minimum}，明确放弃不可交易补单",
                 )
             else:
                 recovery = self._execute(
-                    self.hedge,
-                    self.config.hedge_market,
+                    adapter,
+                    market,
                     -net,
                     reduce_only=False,
                 )
-            recovered = await asyncio.gather(recovery, return_exceptions=True)
-            if isinstance(recovered[0], Exception):
-                self._warn(warnings, f"恢复中性仓位失败：{recovered[0]}")
+                recovered = await asyncio.gather(recovery, return_exceptions=True)
+                if isinstance(recovered[0], Exception):
+                    self._warn(warnings, f"恢复中性仓位失败：{recovered[0]}")
         return await self._read_positions()
 
     async def _reconcile_actual_state(
@@ -391,18 +480,28 @@ class TimedHedgedVolumeStrategy:
         primary_size: Decimal,
         hedge_size: Decimal,
         warnings: list[str],
+        limits: _OrderLimits,
     ) -> tuple[Decimal, Decimal, bool]:
         """以实际持仓校正记录；返回的布尔值表示本轮执行过风险收敛交易。"""
-        actual_flat = self._is_zero(primary_size) and self._is_zero(hedge_size)
+        actual_flat = self._is_effectively_flat(
+            primary_size,
+            limits.primary_minimum,
+        ) and self._is_effectively_flat(
+            hedge_size,
+            limits.hedge_minimum,
+        )
         if actual_flat:
             if self.state.is_open:
-                self._warn(warnings, "持久化状态与实际持仓不一致：记录有仓但实际已归零")
+                self._warn(
+                    warnings,
+                    "持久化状态与实际持仓不一致：记录有仓但实际已归零或仅剩不可交易残余",
+                )
                 self.state.last_direction = self.state.current_direction
                 self.state.current_direction = None
                 self.state.opened_at = None
                 self.state.due_at = None
                 self._save_state()
-            return Decimal(0), Decimal(0), False
+            return primary_size, hedge_size, False
 
         if self._is_neutral_pair(primary_size, hedge_size):
             actual_direction = (
@@ -430,27 +529,34 @@ class TimedHedgedVolumeStrategy:
             "持久化状态与实际持仓不一致：检测到非中性实仓，立即按实仓收敛",
         )
         if (
-            not self._is_zero(primary_size)
-            and not self._is_zero(hedge_size)
+            primary_size != 0
+            and hedge_size != 0
             and primary_size * hedge_size < 0
         ):
             net = primary_size + hedge_size
-            if not self._is_zero(net):
+            if not self._is_within_hedge_tolerance(net):
                 if abs(primary_size) < abs(hedge_size):
-                    result = await asyncio.gather(
-                        self._execute(
-                            self.primary,
-                            self.config.primary_market,
-                            -net,
-                            reduce_only=False,
-                        ),
-                        return_exceptions=True,
+                    adapter = self.primary
+                    market = self.config.primary_market
+                    minimum = limits.primary_minimum
+                    label = "Lighter"
+                else:
+                    adapter = self.hedge
+                    market = self.config.hedge_market
+                    minimum = limits.hedge_minimum
+                    label = "Extended"
+                if abs(net) < minimum:
+                    self._warn(
+                        warnings,
+                        f"按实仓差补齐所需数量 {abs(net)} 低于 {label} "
+                        f"最小下单量 {minimum}，明确放弃不可交易补单",
                     )
+                    result = ()
                 else:
                     result = await asyncio.gather(
                         self._execute(
-                            self.hedge,
-                            self.config.hedge_market,
+                            adapter,
+                            market,
                             -net,
                             reduce_only=False,
                         ),
@@ -478,8 +584,14 @@ class TimedHedgedVolumeStrategy:
                     self._save_state()
                     return primary_size, hedge_size, True
 
-        primary_size, hedge_size = await self._flatten_all(warnings)
-        if self._is_zero(primary_size) and self._is_zero(hedge_size):
+        primary_size, hedge_size = await self._flatten_all(warnings, limits)
+        if self._is_effectively_flat(
+            primary_size,
+            limits.primary_minimum,
+        ) and self._is_effectively_flat(
+            hedge_size,
+            limits.hedge_minimum,
+        ):
             self.state.last_direction = self.state.current_direction or self.state.last_direction
             self.state.current_direction = None
             self.state.opened_at = None
@@ -491,6 +603,7 @@ class TimedHedgedVolumeStrategy:
         self,
         now: float,
         warnings: list[str],
+        limits: _OrderLimits,
     ) -> TimedVolumeResult:
         """同步建立两腿，并按实仓差补齐；无法完成时回滚到零。"""
         direction = (
@@ -498,9 +611,9 @@ class TimedHedgedVolumeStrategy:
             if self.state.last_direction is None
             else self.state.last_direction.opposite()
         )
-        quantity = await self._target_quantity()
-        primary_target = direction.sign * quantity
-        hedge_target = -primary_target
+        primary_quantity, hedge_quantity = await self._target_quantities(limits)
+        primary_target = direction.sign * primary_quantity
+        hedge_target = -direction.sign * hedge_quantity
         primary_before, hedge_before = await self._read_positions()
         outcomes = await self._execute_pair(
             primary_target - primary_before,
@@ -512,51 +625,79 @@ class TimedHedgedVolumeStrategy:
                 self._warn(warnings, f"同步开仓执行异常：{outcome}")
 
         primary_size, hedge_size = await self._read_positions()
-        primary_only = not self._is_zero(primary_size) and self._is_zero(hedge_size)
-        hedge_only = self._is_zero(primary_size) and not self._is_zero(hedge_size)
+        primary_flat = self._is_effectively_flat(
+            primary_size,
+            limits.primary_minimum,
+        )
+        hedge_flat = self._is_effectively_flat(
+            hedge_size,
+            limits.hedge_minimum,
+        )
+        primary_only = not primary_flat and hedge_flat
+        hedge_only = primary_flat and not hedge_flat
         if primary_only:
             self._warn(warnings, "Extended 对冲未建立，立即回滚 Lighter 实际持仓")
         elif hedge_only:
             self._warn(warnings, "Lighter 开仓未成交，立即平掉 Extended 实际持仓")
 
-        if not primary_only and not hedge_only:
-            primary_delta = primary_target - primary_size
-            hedge_delta = hedge_target - hedge_size
-            supplement_calls = []
-            if not self._is_zero(primary_delta):
-                supplement_calls.append(
-                    self._execute(
-                        self.primary,
-                        self.config.primary_market,
-                        primary_delta,
-                        reduce_only=False,
+        if (
+            not primary_only
+            and not hedge_only
+            and primary_size * hedge_size < 0
+        ):
+            net = primary_size + hedge_size
+            if net != 0:
+                if abs(primary_size) < abs(hedge_size):
+                    adapter = self.primary
+                    market = self.config.primary_market
+                    minimum = limits.primary_minimum
+                    label = "Lighter"
+                else:
+                    adapter = self.hedge
+                    market = self.config.hedge_market
+                    minimum = limits.hedge_minimum
+                    label = "Extended"
+                if self._is_within_hedge_tolerance(net):
+                    if abs(net) < minimum:
+                        self._warn(
+                            warnings,
+                            f"补齐所需数量 {abs(net)} 低于 {label} 最小下单量 "
+                            f"{minimum}，净敞口已在容差内，不提交不可交易补单",
+                        )
+                elif abs(net) < minimum:
+                    self._warn(
+                        warnings,
+                        f"补齐所需数量 {abs(net)} 低于 {label} 最小下单量 "
+                        f"{minimum}，明确放弃不可交易补单",
                     )
-                )
-            if not self._is_zero(hedge_delta):
-                supplement_calls.append(
-                    self._execute(
-                        self.hedge,
-                        self.config.hedge_market,
-                        hedge_delta,
-                        reduce_only=False,
+                else:
+                    supplements = await asyncio.gather(
+                        self._execute(
+                            adapter,
+                            market,
+                            -net,
+                            reduce_only=False,
+                        ),
+                        return_exceptions=True,
                     )
-                )
-            supplements = await asyncio.gather(
-                *supplement_calls,
-                return_exceptions=True,
-            )
-            if any(isinstance(item, Exception) for item in supplements):
-                self._warn(warnings, "部分成交按实际持仓差补齐失败，立即回滚")
+                    if any(isinstance(item, Exception) for item in supplements):
+                        self._warn(warnings, "部分成交按实际持仓差补齐失败，立即回滚")
             primary_size, hedge_size = await self._read_positions()
 
         targets_reached = (
-            self._is_zero(primary_size - primary_target)
-            and self._is_zero(hedge_size - hedge_target)
-            and self._is_zero(primary_size + hedge_size)
+            primary_size * direction.sign > 0
+            and hedge_size * direction.sign < 0
+            and self._is_neutral_pair(primary_size, hedge_size)
         )
         if not targets_reached:
-            primary_size, hedge_size = await self._flatten_all(warnings)
-            flat = self._is_zero(primary_size) and self._is_zero(hedge_size)
+            primary_size, hedge_size = await self._flatten_all(warnings, limits)
+            flat = self._is_effectively_flat(
+                primary_size,
+                limits.primary_minimum,
+            ) and self._is_effectively_flat(
+                hedge_size,
+                limits.hedge_minimum,
+            )
             if not flat:
                 self._warn(warnings, "开仓失败后的回滚未能归零，保持中性并等待重试")
             return self._result(
@@ -573,17 +714,27 @@ class TimedHedgedVolumeStrategy:
         self._save_state()
         return self._result("opened", primary_size, hedge_size, warnings)
 
-    async def _close_round(self, warnings: list[str]) -> TimedVolumeResult:
-        """按两侧实际持仓同步平仓；只在两侧均归零后结束本轮。"""
-        primary_size, hedge_size = await self._flatten_all(warnings)
-        flat = self._is_zero(primary_size) and self._is_zero(hedge_size)
+    async def _close_round(
+        self,
+        warnings: list[str],
+        limits: _OrderLimits,
+    ) -> TimedVolumeResult:
+        """按两侧实仓同步平仓；只剩不可交易残余时也确定性结束本轮。"""
+        primary_size, hedge_size = await self._flatten_all(warnings, limits)
+        flat = self._is_effectively_flat(
+            primary_size,
+            limits.primary_minimum,
+        ) and self._is_effectively_flat(
+            hedge_size,
+            limits.hedge_minimum,
+        )
         if flat:
             self.state.last_direction = self.state.current_direction
             self.state.current_direction = None
             self.state.opened_at = None
             self.state.due_at = None
             self._save_state()
-            return self._result("closed", Decimal(0), Decimal(0), warnings)
+            return self._result("closed", primary_size, hedge_size, warnings)
         self._warn(warnings, "到期平仓未能两侧归零，保留轮次并在下一次继续收敛")
         return self._result(
             "close_failed_neutral",
@@ -631,12 +782,21 @@ class TimedHedgedVolumeStrategy:
             return self._result("position_read_failed", None, None, warnings)
 
         try:
-            hedge_available = await self._check_hedge_available()
+            limits = await self._get_order_limits(warnings)
+            if limits is None:
+                return self._result(
+                    "interlocked",
+                    primary_size,
+                    hedge_size,
+                    warnings,
+                )
+            hedge_available = await self._check_hedge_available(limits)
             primary_size, hedge_size, converged = await self._reconcile_actual_state(
                 current_time,
                 primary_size,
                 hedge_size,
                 warnings,
+                limits,
             )
             if converged:
                 return self._result(
@@ -649,13 +809,13 @@ class TimedHedgedVolumeStrategy:
             if self.state.is_open:
                 due_at = self.state.due_at
                 if due_at is None or current_time >= due_at:
-                    return await self._close_round(warnings)
+                    return await self._close_round(warnings, limits)
                 return self._result("wait", primary_size, hedge_size, warnings)
 
             if not hedge_available:
                 self._warn(warnings, "Extended 侧不可用，对冲互锁跳过新开仓")
                 return self._result("interlocked", primary_size, hedge_size, warnings)
-            return await self._open_round(current_time, warnings)
+            return await self._open_round(current_time, warnings, limits)
         except Exception as exc:  # noqa: BLE001 成交后事实未知时必须保持循环存活
             self.hedge_interlock_active = True
             self.hedge_interlock_reason = f"策略执行后持仓事实未知：{exc}"

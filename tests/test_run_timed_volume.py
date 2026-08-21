@@ -416,3 +416,52 @@ def test_heartbeat_write_failure_does_not_stop_safety_convergence(
 
     assert strategy.calls == 2
     assert writes == 2
+
+
+def test_tolerance_metadata_interlock_uses_normal_poll_interval(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """容差查询失败已明确互锁时，不得因固定旧容差退化成每秒死循环。"""
+    cli = _cli()
+
+    class FakeStrategy:
+        config = SimpleNamespace(position_tolerance=Decimal("0.000001"))
+        hedge_tolerance = None
+
+        async def run_once(self):
+            return TimedVolumeResult(
+                action="interlocked",
+                round_index=0,
+                direction=None,
+                due_at=None,
+                primary_size=Decimal("0.00129"),
+                hedge_size=Decimal("-0.00128"),
+                net_exposure=Decimal("0.00001"),
+                hedge_available=False,
+                interlock_reason="对冲容差查询失败",
+            )
+
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+    iterations = 0
+
+    def stop_requested():
+        nonlocal iterations
+        iterations += 1
+        return iterations > 1
+
+    asyncio.run(
+        cli.run_loop(
+            FakeStrategy(),
+            poll_interval=30.0,
+            heartbeat_path=tmp_path / "heartbeat.jsonl",
+            stop_requested=stop_requested,
+        )
+    )
+
+    assert sleeps == [30.0]

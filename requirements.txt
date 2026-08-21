@@ -8,6 +8,10 @@ x10-python-trading-starknet>=2.4.0
 # 变化，而单测全部绕过真实包，不锁版本等于把生产行为交给上游默认分支
 lighter_sdk @ git+https://github.com/elliottech/lighter-python.git@da322db2ca4fb3fac56b463d0ade4e54960e32be
 
+# Hyperliquid 官方 SDK —— 代理钱包签名与永续交易适配器
+# 注意：0.24.0 会将 eth-utils 6.0.0 降级到 5.3.1；该组合已通过完整回归测试
+hyperliquid-python-sdk==0.24.0
+
 # Variational 私有 API 客户端：curl_cffi 提供 Chrome TLS 指纹伪装，绕过 Cloudflare 指纹检测
 curl_cffi>=0.7.0
 

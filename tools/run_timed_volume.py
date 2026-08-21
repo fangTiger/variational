@@ -91,7 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--position-tolerance",
         type=Decimal,
         default=Decimal("0.000001"),
-        help="两侧净敞口数量容差（默认 0.000001）",
+        help=(
+            "净敞口数值误差容差下限；实际容差同时取两侧最小下单量较大者"
+            "（默认 0.000001）"
+        ),
     )
     parser.add_argument(
         "--state-path",
@@ -222,9 +225,15 @@ async def run_loop(
             "convergence_failed",
             "close_failed_neutral",
         }
+        hedge_tolerance = getattr(
+            strategy,
+            "hedge_tolerance",
+            strategy.config.position_tolerance,
+        )
         net_is_unsafe = (
             result.net_exposure is not None
-            and abs(result.net_exposure) > strategy.config.position_tolerance
+            and hedge_tolerance is not None
+            and abs(result.net_exposure) >= hedge_tolerance
         )
         delay = 1.0 if result.action in urgent_actions or net_is_unsafe else poll_interval
         await asyncio.sleep(delay)

@@ -25,10 +25,23 @@ from engine.hedge_engine import HedgeFillResult
 class _AdapterCore:
     """共享的内存持仓与订单行为；公开方法由两种真实签名的子类提供。"""
 
-    def __init__(self, name: str, *, maker_fill: Decimal = Decimal("1")) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        maker_fill: Decimal = Decimal("1"),
+        min_order_size: Decimal = Decimal("0.001"),
+        rounded_amount: Decimal | None = None,
+        min_order_size_error: Exception | None = None,
+    ) -> None:
         self.name = name
         self.position = Decimal("0")
         self.maker_fill = Decimal(str(maker_fill))
+        self.min_order_size = Decimal(str(min_order_size))
+        self.rounded_amount = (
+            Decimal(str(rounded_amount)) if rounded_amount is not None else None
+        )
+        self.min_order_size_error = min_order_size_error
         self.events: list[tuple] = []
         self._orders: dict[str, SimpleNamespace] = {}
 
@@ -40,10 +53,14 @@ class _AdapterCore:
 
     async def get_min_order_size(self, market: str):
         del market
-        return Decimal("0.001")
+        if self.min_order_size_error is not None:
+            raise self.min_order_size_error
+        return self.min_order_size
 
     async def round_amount(self, market: str, amount: Decimal):
         del market
+        if self.rounded_amount is not None:
+            return self.rounded_amount
         return Decimal(str(amount)).quantize(Decimal("0.001"))
 
     async def _place(
@@ -169,7 +186,9 @@ class _ScriptedExecutor:
             else {}
         )
         fraction = Decimal(str(plan.get("fraction", "1")))
-        actual_delta = target_delta * fraction
+        actual_delta = Decimal(
+            str(plan.get("actual_delta", target_delta * fraction))
+        )
         adapter.position += actual_delta
         self.calls.append(
             {
@@ -238,6 +257,7 @@ def _build_strategy(
     state_name: str = "state.json",
     initial_direction: str = "long",
     maker_timeout_s: float = 300.0,
+    position_tolerance: Decimal = Decimal("0.000001"),
 ):
     api = _api()
     lighter = lighter or _LighterAdapter("lighter")
@@ -250,7 +270,7 @@ def _build_strategy(
         initial_direction=api.RoundDirection(initial_direction),
         maker_timeout_s=maker_timeout_s,
         maker_poll_s=0.0,
-        position_tolerance=Decimal("0.000001"),
+        position_tolerance=position_tolerance,
         state_path=tmp_path / state_name,
     )
     strategy = api.TimedHedgedVolumeStrategy(
@@ -411,6 +431,338 @@ def test_partial_fill_uses_actual_position_difference(tmp_path) -> None:
     assert result.net_exposure == 0
     assert lighter.position == Decimal("20.0000")
     assert extended.position == Decimal("-20.000")
+
+
+def test_incident_rounding_gap_is_accepted_and_round_advances(tmp_path) -> None:
+    """事故回放：跨所相差一个数量步长仍应在容差内完成轮次。"""
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size=Decimal("0.00020"),
+        rounded_amount=Decimal("0.00129"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        min_order_size=Decimal("0.00010"),
+        rounded_amount=Decimal("0.00128"),
+    )
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=executor,
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "opened"
+    assert result.action != "execution_uncertain"
+    assert result.round_index == 1
+    assert lighter.position == Decimal("0.00129")
+    assert extended.position == Decimal("-0.00128")
+    assert result.net_exposure == Decimal("0.00001")
+    assert len(executor.calls) == 2
+
+    replayed = asyncio.run(strategy.run_once(now=1.0))
+    assert replayed.action == "wait"
+    assert replayed.action != "execution_uncertain"
+    assert len(executor.calls) == 2
+
+
+def test_exposure_above_dynamic_tolerance_supplements_from_actual_positions(
+    tmp_path,
+) -> None:
+    """净敞口超过动态容差时，必须按重读实仓补齐较小的一腿。"""
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size=Decimal("0.00020"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        min_order_size=Decimal("0.00010"),
+    )
+    lighter.position = Decimal("0.00129")
+    extended.position = Decimal("-0.00098")
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=executor,
+    )
+
+    result = asyncio.run(strategy.run_once(now=100.0))
+
+    assert result.action == "reconciled"
+    assert len(executor.calls) == 1
+    assert executor.calls[0]["adapter"] == "extended"
+    assert executor.calls[0]["target_delta"] == Decimal("-0.00031")
+    assert result.net_exposure == 0
+
+
+def test_exposure_equal_to_dynamic_tolerance_still_supplements(tmp_path) -> None:
+    """净敞口恰等于动态容差不算达成，必须继续按实仓补齐。"""
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size=Decimal("0.00010"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        min_order_size=Decimal("0.00010"),
+    )
+    lighter.position = Decimal("0.00100")
+    extended.position = Decimal("-0.00080")
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=executor,
+        position_tolerance=Decimal("0.00020"),
+    )
+
+    result = asyncio.run(strategy.run_once(now=100.0))
+
+    assert result.action == "reconciled"
+    assert len(executor.calls) == 1
+    assert executor.calls[0]["adapter"] == "extended"
+    assert executor.calls[0]["target_delta"] == Decimal("-0.00020")
+    assert result.net_exposure == 0
+
+
+def test_tradeable_neutral_legs_are_not_hidden_by_configured_tolerance(
+    tmp_path,
+) -> None:
+    """两腿达到各自最小量时，即使小于配置容差也必须识别为真实对冲仓。"""
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size=Decimal("0.00010"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        min_order_size=Decimal("0.00010"),
+    )
+    lighter.position = Decimal("0.00015")
+    extended.position = Decimal("-0.00015")
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=executor,
+        position_tolerance=Decimal("0.00020"),
+    )
+
+    result = asyncio.run(strategy.run_once(now=100.0))
+
+    assert result.action == "wait"
+    assert result.round_index == 1
+    assert result.primary_size == Decimal("0.00015")
+    assert result.hedge_size == Decimal("-0.00015")
+    assert executor.calls == []
+
+
+def test_supplement_below_side_minimum_is_skipped_and_warned(
+    tmp_path,
+    caplog,
+) -> None:
+    """容差内缺口低于该侧最小下单量时，不得发送注定失败的补单。"""
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size=Decimal("0.00020"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        min_order_size=Decimal("0.00010"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    executor = _ScriptedExecutor(
+        {"lighter": [{"actual_delta": "0.00095"}]}
+    )
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=executor,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "opened"
+    assert result.net_exposure == Decimal("-0.00005")
+    assert len(executor.calls) == 2
+    assert "补齐所需数量" in caplog.text
+    assert "低于 Lighter 最小下单量" in caplog.text
+
+
+def test_neutral_partial_fills_do_not_trigger_target_gap_supplements(
+    tmp_path,
+) -> None:
+    """两腿部分成交但净敞口已在容差内时，不得再按各自目标缺口补单。"""
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size=Decimal("0.00020"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        min_order_size=Decimal("0.00010"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    executor = _ScriptedExecutor(
+        {
+            "lighter": [
+                {"actual_delta": "0.00050"},
+                {"fraction": "0"},
+            ],
+            "extended": [
+                {"actual_delta": "-0.00050"},
+                {"fraction": "0"},
+            ],
+        }
+    )
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=executor,
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "opened"
+    assert result.round_index == 1
+    assert result.primary_size == Decimal("0.00050")
+    assert result.hedge_size == Decimal("-0.00050")
+    assert len(executor.calls) == 2
+
+
+def test_flatten_dust_below_each_side_minimum_closes_without_retry(
+    tmp_path,
+    caplog,
+) -> None:
+    """平仓只剩不可交易微仓时应结束轮次，不得反复提交残差。"""
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size=Decimal("0.00020"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        min_order_size=Decimal("0.00010"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    opening_executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=opening_executor,
+        position_tolerance=Decimal("0.00020"),
+    )
+    opened = asyncio.run(strategy.run_once(now=0.0))
+    assert opened.action == "opened"
+
+    closing_executor = _ScriptedExecutor(
+        {
+            "lighter": [{"actual_delta": "-0.00095"}],
+            "extended": [{"actual_delta": "0.00095"}],
+        }
+    )
+    _, restarted, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=closing_executor,
+        position_tolerance=Decimal("0.00020"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = asyncio.run(restarted.run_once(now=7200.0))
+
+    assert result.action == "closed"
+    assert result.primary_size == Decimal("0.00005")
+    assert result.hedge_size == Decimal("-0.00005")
+    assert restarted.state.current_direction is None
+    assert len(closing_executor.calls) == 2
+    assert "低于最小下单量" in caplog.text
+
+
+def test_tradeable_close_residual_is_not_hidden_by_configured_tolerance(
+    tmp_path,
+) -> None:
+    """配置数值容差大于最小量时，仍必须平掉达到最小量的可交易残余。"""
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size=Decimal("0.00010"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        min_order_size=Decimal("0.00010"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    opening_executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=opening_executor,
+        position_tolerance=Decimal("0.00020"),
+    )
+    opened = asyncio.run(strategy.run_once(now=0.0))
+    assert opened.action == "opened"
+    lighter.position = Decimal("0.00015")
+    extended.position = Decimal("0")
+
+    closing_executor = _ScriptedExecutor()
+    _, restarted, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=closing_executor,
+        position_tolerance=Decimal("0.00020"),
+    )
+
+    result = asyncio.run(restarted.run_once(now=7200.0))
+
+    assert result.action == "reconciled"
+    assert lighter.position == 0
+    assert extended.position == 0
+    assert len(closing_executor.calls) == 1
+    assert closing_executor.calls[0]["target_delta"] == Decimal("-0.00015")
+    assert closing_executor.calls[0]["reduce_only"] is True
+
+
+def test_minimum_query_failure_interlocks_without_uncertain_retry(
+    tmp_path,
+    caplog,
+) -> None:
+    """容差元数据未知时失败关闭并告警，不得落入成交未知死循环。"""
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size_error=RuntimeError("Lighter 市场元数据超时"),
+    )
+    extended = _ExtendedAdapter("extended")
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=executor,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "interlocked"
+    assert result.action != "execution_uncertain"
+    assert result.hedge_available is False
+    assert executor.calls == []
+    assert "对冲容差" in caplog.text
+    assert "市场元数据超时" in caplog.text
 
 
 def test_restart_before_due_does_not_open_again(tmp_path) -> None:
