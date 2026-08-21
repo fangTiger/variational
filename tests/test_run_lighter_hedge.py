@@ -50,6 +50,8 @@ class _SharedAccountHedge:
         signed_size: Decimal = Decimal("0"),
         positions: list[Position] | None = None,
         open_orders: list[object] | None = None,
+        min_order_size: Decimal = Decimal("0.0001"),
+        min_order_size_error: Exception | None = None,
     ) -> None:
         self.signed_size = signed_size
         self.positions = (
@@ -62,6 +64,8 @@ class _SharedAccountHedge:
             )
         )
         self.open_orders = list(open_orders or [])
+        self.min_order_size = min_order_size
+        self.min_order_size_error = min_order_size_error
         self.calls: list[tuple[str, str]] = []
         self.closed = False
 
@@ -74,6 +78,12 @@ class _SharedAccountHedge:
     async def get_all_positions(self) -> list[Position]:
         self.calls.append(("positions", "全部"))
         return self.positions
+
+    async def get_min_order_size(self, market: str) -> Decimal:
+        self.calls.append(("min_order_size", market))
+        if self.min_order_size_error is not None:
+            raise self.min_order_size_error
+        return self.min_order_size
 
     async def get_open_orders(self, market: str) -> list[object]:
         return [
@@ -200,11 +210,14 @@ def test_declaration_skips_all_static_account_rejections(monkeypatch) -> None:
     assert result == ("X10_GRID", "0x4A3D...3d82")
 
 
-def test_shared_account_with_position_is_rejected(monkeypatch) -> None:
-    """即使其他标的仍有仓位，共用账户也必须拒绝启动。"""
+def test_shared_account_with_position_at_or_above_minimum_is_rejected(
+    monkeypatch,
+) -> None:
+    """达到可交易最小量的其他标的仓位仍必须拒绝，并说明市场与数量。"""
     cli = _cli_module()
     hedge = _SharedAccountHedge(
-        positions=[Position("ETH-USD", Decimal("0.01"))]
+        positions=[Position("ETH-USD", Decimal("0.01"))],
+        min_order_size=Decimal("0.001"),
     )
     _patch_shared_account_clients(monkeypatch, cli, hedge)
 
@@ -214,15 +227,58 @@ def test_shared_account_with_position_is_rejected(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "HedgeEngine", FailEngine)
 
-    with pytest.raises(cli.StartupError, match="仍有仓位"):
+    with pytest.raises(cli.StartupError, match=r"仍有仓位.*ETH-USD 0\.01"):
         asyncio.run(
             cli._main(
                 _args(account="X10_GRID", allow_shared_account=True)
             )
         )
 
-    assert hedge.calls == [("positions", "全部")]
+    assert hedge.calls == [
+        ("positions", "全部"),
+        ("min_order_size", "ETH-USD"),
+    ]
     assert hedge.closed is True
+
+
+def test_shared_account_dust_position_below_minimum_is_allowed() -> None:
+    """对冲腿留下的不可交易微仓不得阻塞其自身重启。"""
+    cli = _cli_module()
+    hedge = _SharedAccountHedge(
+        positions=[Position("BTC-USD", Decimal("-0.00003"))],
+        min_order_size=Decimal("0.0001"),
+    )
+
+    asyncio.run(cli._validate_shared_account_state(hedge))
+
+    assert hedge.calls == [
+        ("positions", "全部"),
+        ("min_order_size", "BTC-USD"),
+        ("open_orders", "全部"),
+    ]
+
+
+def test_shared_account_minimum_query_failure_uses_logged_conservative_fallback(
+    caplog,
+) -> None:
+    """最小量查不到时仅忽略极小尾差，并留下明确日志。"""
+    cli = _cli_module()
+    hedge = _SharedAccountHedge(
+        positions=[Position("BTC-USD", Decimal("1E-13"))],
+        min_order_size_error=RuntimeError("市场元数据暂不可用"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="lighter_hedge"):
+        asyncio.run(cli._validate_shared_account_state(hedge))
+
+    assert "最小下单量" in caplog.text
+    assert "保守" in caplog.text
+    assert "BTC-USD" in caplog.text
+    assert hedge.calls == [
+        ("positions", "全部"),
+        ("min_order_size", "BTC-USD"),
+        ("open_orders", "全部"),
+    ]
 
 
 def test_shared_account_with_grid_orders_is_rejected(monkeypatch) -> None:

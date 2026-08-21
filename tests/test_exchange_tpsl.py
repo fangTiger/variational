@@ -92,6 +92,29 @@ def test_extended_account_wide_reads_omit_market_filter() -> None:
     ]
 
 
+def test_extended_exposes_market_minimum_order_size() -> None:
+    """共用账户门禁使用真实适配器公开接口读取交易所最小下单量。"""
+    calls = []
+    markets = {
+        "BTC-USD": SimpleNamespace(
+            trading_config=SimpleNamespace(min_order_size=Decimal("0.0001"))
+        )
+    }
+
+    async def get_markets_dict():
+        calls.append("get_markets_dict")
+        return markets
+
+    client = ExtendedClient(
+        SimpleNamespace(info=SimpleNamespace(get_markets_dict=get_markets_dict))
+    )
+
+    minimum = asyncio.run(client.get_min_order_size("BTC-USD"))
+
+    assert minimum == Decimal("0.0001")
+    assert calls == ["get_markets_dict"]
+
+
 def test_position_stop_loss_rounds_trigger_and_execution_prices(monkeypatch) -> None:
     """整仓 TPSL 的触发价与滑点执行价都必须按市场 tick 取整。"""
     rounded_inputs = []

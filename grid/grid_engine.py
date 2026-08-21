@@ -73,6 +73,8 @@ _UTC_PLUS_8 = timezone(timedelta(hours=8))
 _SCHEDULED_CLOSE_ALERT_INTERVAL_S = 60.0
 # 对冲持续失效时每累计这么多轮再聚合告警一次，状态变化仍立即告警。
 _HEDGE_INTERLOCK_SUMMARY_EVERY = 100
+# 最小量查询失败后短时缓存，避免故障期每轮请求放大交易所限流；过期后允许恢复。
+_MIN_ORDER_SIZE_ERROR_CACHE_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -265,6 +267,9 @@ class GridEngine:
         self._last_inv: Decimal | float | None = None
         self._last_liquidation_price: float | None = None
         self._current_tpsl: tuple[Decimal, Decimal] | None = None
+        self._min_order_size_cache: dict[str, Decimal | None] = {}
+        self._min_order_size_failure_ts: dict[str, float] = {}
+        self._tpsl_dust_log_signature: tuple[str, Decimal] | None = None
         self._cap_rejection_state: dict[Side, dict] = {}
         self._cap_equity_fallback_state: dict | None = None
         self._risk_capability_missing_state: dict[str, dict] = {}
@@ -810,6 +815,50 @@ class GridEngine:
             return None
         return tick if tick is not None and tick > 0 else None
 
+    async def _get_min_order_size(self) -> Decimal | None:
+        """查询并缓存市场最小下单量；未知时返回 None 供风控失败关闭。"""
+        market = self.config.market
+        if market in self._min_order_size_cache:
+            cached = self._min_order_size_cache[market]
+            if cached is not None:
+                return cached
+            failed_at = self._min_order_size_failure_ts.get(market, 0.0)
+            if time.monotonic() - failed_at < _MIN_ORDER_SIZE_ERROR_CACHE_S:
+                return None
+
+        getter = getattr(self.ext, "get_min_order_size", None)
+        try:
+            if not callable(getter):
+                raise RuntimeError("适配器缺少 get_min_order_size 能力")
+            minimum = Decimal(str(await getter(market)))
+            if not minimum.is_finite() or minimum <= 0:
+                raise ValueError(f"返回无效值 {minimum}")
+        except Exception as exc:  # noqa: BLE001 最小量未知时必须保守执行原风控
+            self._min_order_size_cache[market] = None
+            self._min_order_size_failure_ts[market] = time.monotonic()
+            logger.warning(
+                "查询市场 %s 最小下单量失败，保守按需要 TPSL 与硬止损处理；"
+                "%.0f 秒内不重复查询：%s",
+                market,
+                _MIN_ORDER_SIZE_ERROR_CACHE_S,
+                exc,
+            )
+            return None
+
+        self._min_order_size_cache[market] = minimum
+        self._min_order_size_failure_ts.pop(market, None)
+        return minimum
+
+    async def _dust_position_minimum(
+        self,
+        signed_size: Decimal,
+    ) -> Decimal | None:
+        """若持仓低于已知市场最小量则返回该门槛，否则返回 None。"""
+        minimum = await self._get_min_order_size()
+        if minimum is None:
+            return None
+        return minimum if abs(Decimal(str(signed_size))) < minimum else None
+
     async def _advance_band(
         self,
         mark: float,
@@ -916,9 +965,27 @@ class GridEngine:
         if signed_size == 0:
             # 空仓后旧保护已经失去对应仓位，新开同尺寸仓位时必须重新挂单。
             self._current_tpsl = None
+            self._tpsl_dust_log_signature = None
             return True
         if not self.config.exchange_tpsl:
             return True
+
+        dust_minimum = await self._dust_position_minimum(signed_size)
+        if dust_minimum is not None:
+            # 不保留旧内存命中，否则仓位重新达到可交易量时可能误判已有保护。
+            self._current_tpsl = None
+            signature = (self.config.market, dust_minimum)
+            if self._tpsl_dust_log_signature != signature:
+                logger.info(
+                    "持仓低于最小下单量，不挂 TPSL：市场=%s 持仓=%s "
+                    "最小下单量=%s",
+                    self.config.market,
+                    signed_size,
+                    dust_minimum,
+                )
+                self._tpsl_dust_log_signature = signature
+            return True
+        self._tpsl_dust_log_signature = None
 
         mark_decimal = Decimal(str(mark))
         stop_distance = Decimal(str(self.config.hard_stop_dist))
@@ -2932,6 +2999,22 @@ class GridEngine:
                 return False
         if pos is not None:
             signed_size = pos.signed_size
+        if signed_size is None:
+            self._last_dist_to_liq = None
+            logger.error("硬止损检查进入 fail-safe：无法取得仓位数据")
+            return False
+        signed_size = Decimal(str(signed_size))
+        self._last_inv = signed_size
+        if signed_size == 0:
+            self._last_dist_to_liq = None
+            return False
+
+        dust_minimum = await self._dust_position_minimum(signed_size)
+        if dust_minimum is not None:
+            self._last_dist_to_liq = None
+            return False
+
+        if pos is not None:
             raw = getattr(pos, "raw", None)
             if raw is not None:
                 raw_mark = getattr(raw, "mark_price", None)
@@ -2946,15 +3029,6 @@ class GridEngine:
                         if raw_liq_float is not None and raw_liq_float > 0
                         else None
                     )
-        if signed_size is None:
-            self._last_dist_to_liq = None
-            logger.error("硬止损检查进入 fail-safe：无法取得仓位数据")
-            return False
-        self._last_inv = signed_size
-        if signed_size == 0:
-            self._last_dist_to_liq = None
-            return False
-
         liq = self._last_liquidation_price
         if liq is None and position_liq_seen:
             self._last_dist_to_liq = None

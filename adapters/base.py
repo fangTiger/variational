@@ -126,6 +126,11 @@ class ExchangeAdapter(ABC):
         del market
         return None
 
+    async def get_min_order_size(self, market: str) -> Decimal:
+        """返回市场最小下单量；适配器无法提供时应抛出异常。"""
+        del market
+        raise NotImplementedError
+
     async def get_mark_price(self, market: str) -> Decimal:
         """标记价。默认取买卖中值；有独立标记价的交易所应覆盖。"""
         return (await self.get_market_price(market)).mid

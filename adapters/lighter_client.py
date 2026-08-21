@@ -16,7 +16,7 @@ import httpx
 
 from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
 from adapters.lighter_order import LighterOrder, filter_grid_orders
-from adapters.lighter_scale import to_base_amount, to_price
+from adapters.lighter_scale import from_base_amount, to_base_amount, to_price
 from adapters.order_ref import ClientOrderIndexAllocator, OrderRef
 from infra.logger import get_logger
 from infra.runtime import ensure_ssl_cert
@@ -310,6 +310,14 @@ class LighterClient(ExchangeAdapter):
             self._market_meta[symbol] = meta
             return meta
         raise KeyError(f"Lighter 没有标的 {market}")
+
+    async def get_min_order_size(self, market: str) -> Decimal:
+        """从已缓存市场元数据把最小整数单位换算为基础资产数量。"""
+        meta = await self._load_market_meta(market)
+        return from_base_amount(
+            int(meta["min_base_units"]),
+            int(meta["size_decimals"]),
+        )
 
     @staticmethod
     def _require_min_quote(

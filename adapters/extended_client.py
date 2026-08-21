@@ -125,7 +125,12 @@ class ExtendedClient(ExchangeAdapter):
 
     async def connect(self) -> None:
         """加载并缓存市场元数据（下单需要）。"""
-        self._markets = await self._client.info.get_markets_dict()
+        await self._ensure_markets()
+
+    async def _ensure_markets(self) -> None:
+        """按需加载市场元数据，避免重复请求交易所。"""
+        if self._markets is None:
+            self._markets = await self._client.info.get_markets_dict()
 
     def _market(self, market_name: str):
         if self._markets is None:
@@ -152,6 +157,11 @@ class ExtendedClient(ExchangeAdapter):
             bid=Decimal(str(stats.data.bid_price)),
             ask=Decimal(str(stats.data.ask_price)),
         )
+
+    async def get_min_order_size(self, market: str) -> Decimal:
+        """从交易所市场元数据读取最小下单量。"""
+        await self._ensure_markets()
+        return Decimal(str(self._market(market).trading_config.min_order_size))
 
     async def get_mark_price(self, market_name: str) -> Decimal:
         """标记价。

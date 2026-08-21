@@ -28,7 +28,7 @@
 		<string>--spacing</string>
 		<string>0.000986</string>
 		<string>--interval</string>
-		<string>2.5</string>
+		<string>10</string>
 		<string>--trend-aware</string>
 		<string>--max-drawdown</string>
 		<string>0.12</string>

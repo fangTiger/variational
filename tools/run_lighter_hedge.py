@@ -28,6 +28,7 @@ logger = get_logger("lighter_hedge")
 
 _ROOT = Path(__file__).resolve().parent.parent
 _HEDGE_SNAPSHOT = _ROOT / "data" / "lighter_hedge.jsonl"
+_SHARED_ACCOUNT_POSITION_FALLBACK = Decimal("1E-12")
 
 HEDGE_RISK_LAYER_REQUIREMENTS = {
     "position_visibility": (
@@ -83,7 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-shared-account",
         action="store_true",
         help=(
-            "知情允许与网格共用 Extended 账户；启动时仍校验零持仓且无网格挂单；"
+            "知情允许与网格共用 Extended 账户；启动时仍校验无可交易仓位且无网格挂单；"
             "不能与 --risk-selfcheck-only 同用"
         ),
     )
@@ -316,17 +317,35 @@ def _validate_startup(args: argparse.Namespace) -> tuple[str, str]:
 
 
 async def _validate_shared_account_state(hedge) -> None:
-    """校验共用账户没有遗留仓位或普通网格挂单。"""
+    """校验共用账户没有可交易仓位或普通网格挂单。"""
     try:
         positions = await hedge.get_all_positions()
-    except Exception as exc:  # noqa: BLE001  无法确认空仓时必须失败关闭
+    except Exception as exc:  # noqa: BLE001  无法确认仓位时必须失败关闭
         raise StartupError(f"拒绝启动：无法确认共用账户持仓状态：{exc}") from exc
-    active_positions = [position for position in positions if position.signed_size != 0]
-    if active_positions:
-        position = active_positions[0]
-        raise StartupError(
-            f"拒绝启动：共用账户仍有仓位（{position.market} {position.signed_size}）"
-        )
+
+    for position in positions:
+        if position.signed_size == 0:
+            continue
+        try:
+            min_order_size = Decimal(
+                str(await hedge.get_min_order_size(position.market))
+            )
+            if not min_order_size.is_finite() or min_order_size <= 0:
+                raise ValueError(f"返回无效值 {min_order_size}")
+        except Exception as exc:  # noqa: BLE001  查询失败时保守地近似严格零仓
+            min_order_size = _SHARED_ACCOUNT_POSITION_FALLBACK
+            logger.warning(
+                "查询共用账户市场 %s 最小下单量失败，回退保守极小阈值 %s：%s",
+                position.market,
+                min_order_size,
+                exc,
+            )
+        if abs(position.signed_size) >= min_order_size:
+            raise StartupError(
+                "拒绝启动：共用账户仍有仓位"
+                f"（{position.market} {position.signed_size}，"
+                f"最小下单量 {min_order_size}）"
+            )
 
     try:
         grid_orders = filter_grid_orders(await hedge.get_all_open_orders())
