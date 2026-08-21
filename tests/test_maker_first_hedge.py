@@ -46,6 +46,8 @@ class _Adapter:
         fill_sequence=None,
         cancel_error=None,
         size=Decimal("0"),
+        place_error=None,
+        position_sequence=None,
     ):
         """fill_sequence: 每次查询订单返回的已成交量或 (成交量, 状态)。"""
         self.limit_orders = []
@@ -56,6 +58,12 @@ class _Adapter:
         self._fills = list(fill_sequence or [Decimal("0")])
         self._cancel_error = cancel_error
         self._size = size
+        self._place_error = place_error
+        self._positions = (
+            [Decimal(str(value)) for value in position_sequence]
+            if position_sequence is not None
+            else None
+        )
 
     async def get_market_price(self, market_name):
         return MarketPrice(
@@ -65,6 +73,8 @@ class _Adapter:
         )
 
     async def get_position(self, market):
+        if self._positions:
+            self._size = self._positions.pop(0)
         return Position(market, self._size)
 
     async def place_limit_order(
@@ -89,6 +99,8 @@ class _Adapter:
                 "reduce_only": reduce_only,
             }
         )
+        if self._place_error is not None:
+            raise self._place_error
         return _Response(_Order("L1"))
 
     async def get_order_by_id(self, market, order_id):
@@ -115,6 +127,7 @@ class _Adapter:
                 "reduce_only": reduce_only,
             }
         )
+        self._size += amount if side is Side.BUY else -amount
         return _Response(_Order("M1", filled=amount, status="FILLED"))
 
     async def hedge(self, market, target_signed_size):
@@ -240,6 +253,118 @@ def test_full_maker_fill_avoids_taker():
     assert adapter.market_orders == []
     assert result.used_taker is False
     assert result.filled == Decimal("1")
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "Hyperliquid 下单失败：Post only order would have immediately matched, bbo was 77479@77480",
+        "POST-ONLY order rejected because it would cross the book",
+        "Maker order would IMMEDIATELY MATCH current liquidity",
+        "Order would immediately execute as a taker",
+    ],
+)
+def test_post_only_rejection_falls_back_without_raising_and_converges(
+    error_message,
+):
+    """不同交易所措辞的只挂单竞态都必须降级，最终仓位精确收敛。"""
+    adapter = _Adapter(
+        place_error=RuntimeError(error_message),
+        position_sequence=[Decimal("0"), Decimal("0")],
+    )
+
+    result = _run(adapter, delta=Decimal("-1"))
+
+    assert adapter.market_orders == [
+        {
+            "market": "BTC-USD",
+            "side": Side.SELL,
+            "amount": Decimal("1"),
+            "reduce_only": False,
+        }
+    ]
+    hedge_size = asyncio.run(adapter.get_position("BTC-USD")).signed_size
+    assert Decimal("1") + hedge_size == 0
+    assert result.used_taker is True
+    assert result.filled == Decimal("1")
+
+
+def test_post_only_rejection_takes_actual_position_gap_not_original_amount():
+    """拒绝期间若仓位已变化，只能补真实差值，绝不能重吃原委托量。"""
+    adapter = _Adapter(
+        place_error=RuntimeError(
+            "Hyperliquid 下单失败：Post only order would have immediately matched"
+        ),
+        position_sequence=[Decimal("0"), Decimal("-0.4")],
+    )
+
+    result = _run(adapter, delta=Decimal("-1"))
+
+    assert adapter.market_orders == [
+        {
+            "market": "BTC-USD",
+            "side": Side.SELL,
+            "amount": Decimal("0.6"),
+            "reduce_only": False,
+        }
+    ]
+    assert adapter.market_orders[0]["amount"] != adapter.limit_orders[0]["amount"]
+    hedge_size = asyncio.run(adapter.get_position("BTC-USD")).signed_size
+    assert Decimal("1") + hedge_size == 0
+    assert result.filled == Decimal("1")
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "Hyperliquid 下单失败：Insufficient margin",
+        "Post only order rejected: insufficient margin",
+        "Post-only order rejected: invalid price precision",
+        "Permission denied for maker-only trading",
+        "Order size would match zero after rounding",
+        "Post-only order would match zero after rounding",
+        "Maker order would cross account margin limit",
+    ],
+)
+def test_non_immediate_match_place_error_still_propagates(error_message):
+    """余额等真实下单失败不得被误吞或转换成市价单。"""
+    adapter = _Adapter(
+        place_error=RuntimeError(error_message),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _run(adapter, delta=Decimal("-1"))
+
+    assert str(exc_info.value) == error_message
+    assert adapter.market_orders == []
+
+
+def test_post_only_rejection_fallback_preserves_reduce_only():
+    """平仓挂单被拒后，按真实差值补单仍必须保持只减仓。"""
+    adapter = _Adapter(
+        place_error=RuntimeError(
+            "Hyperliquid 下单失败：Post only order would have immediately matched"
+        ),
+        position_sequence=[Decimal("-1"), Decimal("-0.4")],
+    )
+
+    result = _run(
+        adapter,
+        delta=Decimal("1"),
+        reduce_only=True,
+    )
+
+    assert adapter.limit_orders[0]["reduce_only"] is True
+    assert adapter.market_orders == [
+        {
+            "market": "BTC-USD",
+            "side": Side.BUY,
+            "amount": Decimal("0.4"),
+            "reduce_only": True,
+        }
+    ]
+    assert asyncio.run(adapter.get_position("BTC-USD")).signed_size == 0
+    assert result.used_taker is True
 
 
 def test_timeout_cancels_then_takes_full_amount():

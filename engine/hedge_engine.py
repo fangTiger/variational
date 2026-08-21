@@ -377,6 +377,35 @@ class HedgeFillResult:
     note: str = ""
 
 
+def _is_post_only_immediate_match_error(exc: Exception) -> bool:
+    """识别不同交易所对 post-only 立即成交竞态的拒绝措辞。"""
+    normalized = " ".join(
+        str(exc).casefold().replace("-", " ").replace("_", " ").split()
+    )
+    post_only_markers = (
+        "post only",
+        "postonly",
+        "maker only",
+        "maker order",
+        "as a taker",
+    )
+    immediate_match_markers = (
+        "immediately match",
+        "immediate match",
+        "cross the book",
+        "take liquidity",
+        "immediately execute",
+        "immediate execute",
+    )
+    has_post_only_marker = any(
+        marker in normalized for marker in post_only_markers
+    )
+    has_immediate_match_marker = any(
+        marker in normalized for marker in immediate_match_markers
+    )
+    return has_post_only_marker and has_immediate_match_marker
+
+
 async def maker_first_hedge(
     adapter,
     market: str,
@@ -430,14 +459,47 @@ async def maker_first_hedge(
             note="maker 前仓位不可读，已直接吃单",
         )
 
-    response = await adapter.place_limit_order(
-        market,
-        side,
-        amount,
-        price,
-        post_only=True,
-        reduce_only=reduce_only,
-    )
+    try:
+        response = await adapter.place_limit_order(
+            market,
+            side,
+            amount,
+            price,
+            post_only=True,
+            reduce_only=reduce_only,
+        )
+    except Exception as exc:  # noqa: BLE001 交易所业务拒绝的异常类型不统一
+        if not _is_post_only_immediate_match_error(exc):
+            raise
+        logger.warning(
+            "maker post-only 被拒，将按实际仓位差直接吃单补齐：%s",
+            exc,
+        )
+        position_after = Decimal(
+            str((await adapter.get_position(market)).signed_size)
+        )
+        actual_delta = position_after - position_before
+        remaining_delta = target_delta - actual_delta
+        same_direction = remaining_delta * target_delta > 0
+        remaining = abs(remaining_delta) if same_direction else Decimal(0)
+        covered = min(amount, abs(actual_delta))
+        if remaining <= 0:
+            return HedgeFillResult(
+                filled=covered,
+                used_taker=False,
+                note="post-only 被拒；实际仓位差显示无需补单",
+            )
+        await adapter.market_order(
+            market,
+            side,
+            remaining,
+            reduce_only=reduce_only,
+        )
+        return HedgeFillResult(
+            filled=amount,
+            used_taker=True,
+            note=f"post-only 被拒；按实际仓位差吃单补 {remaining}",
+        )
 
     def _field(value, name: str):
         if isinstance(value, dict):

@@ -20,6 +20,7 @@ from pathlib import Path  # noqa: E402
 from typing import Callable  # noqa: E402
 
 from adapters.extended_client import ExtendedClient  # noqa: E402
+from adapters.hyperliquid_client import HyperliquidClient  # noqa: E402
 from adapters.lighter_client import LighterClient  # noqa: E402
 from infra.logger import get_logger  # noqa: E402
 from timed_volume.strategy import (  # noqa: E402
@@ -114,9 +115,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--account",
         default="X10_HEDGE",
-        help="Extended 环境变量前缀（默认 X10_HEDGE）",
+        help="Extended 环境变量前缀（默认 X10_HEDGE，仅 --hedge-venue=extended 时生效）",
+    )
+    parser.add_argument(
+        "--hedge-venue",
+        choices=("extended", "hyperliquid"),
+        default="extended",
+        help="对冲腿交易所（默认 extended）",
     )
     return parser
+
+
+def _build_hedge_client(args: argparse.Namespace):
+    """按 --hedge-venue 装配对冲腿；两者都以显式交易开关构造。"""
+    if args.hedge_venue == "hyperliquid":
+        return HyperliquidClient.from_env(trading_enabled=True)
+    return ExtendedClient.from_env(prefix=args.account)
 
 
 def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
@@ -259,7 +273,7 @@ async def run(args: argparse.Namespace) -> None:
         api_private_key=api_private_key,
         api_key_index=int(os.environ.get("LIGHTER_API_KEY_INDEX", "255")),
     )
-    hedge = ExtendedClient.from_env(prefix=args.account)
+    hedge = _build_hedge_client(args)
     try:
         await asyncio.gather(primary.connect(), hedge.connect())
         strategy = TimedHedgedVolumeStrategy(primary, hedge, config)

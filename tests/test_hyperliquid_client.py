@@ -185,6 +185,17 @@ def _order_response(oid: int = 101, state: str = "resting") -> dict:
     }
 
 
+def _order_error_response(message: str) -> dict:
+    """返回 SDK 对业务拒绝的真实 statuses 错误结构。"""
+    return {
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {"statuses": [{"error": message}]},
+        },
+    }
+
+
 class FakeInfo:
     """只替代同步 HTTP 边界，方法签名逐项对齐 SDK 0.24.0。"""
 
@@ -556,6 +567,31 @@ def test_limit_order_uses_alo_for_post_only() -> None:
     assert call[5] == {"limit": {"tif": "Alo"}}
     assert call[6] is False
     assert result.id == 101
+
+
+def test_post_only_business_rejection_becomes_runtime_error() -> None:
+    """锁定 SDK 业务响应到真实适配器异常的转换，避免事故桩漂移。"""
+    exchange = FakeExchange()
+    exchange.order_result = _order_error_response(
+        "Post only order would have immediately matched, bbo was 77479@77480. asset=0"
+    )
+    client = _client(exchange=exchange, trading_enabled=True)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Post only order would have immediately matched",
+    ):
+        asyncio.run(
+            client.place_limit_order(
+                "BTC",
+                Side.SELL,
+                Decimal("0.001"),
+                Decimal("62510"),
+                post_only=True,
+            )
+        )
+
+    assert exchange.calls[0][5] == {"limit": {"tif": "Alo"}}
 
 
 def test_market_order_uses_ioc_and_forwards_reduce_only() -> None:
