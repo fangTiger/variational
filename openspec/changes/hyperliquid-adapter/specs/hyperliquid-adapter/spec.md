@@ -32,7 +32,26 @@
 
 #### Scenario: 返回账户权益
 - **WHEN** 查询余额
-- **THEN** 返回可经 `equity` 取到的正权益值
+- **THEN** 将 `clearinghouseState.marginSummary.accountValue` 与
+  `spotClearinghouseState.balances` 中 `coin=USDC` 的 `total` 相加后作为
+  `equity` 返回
+- **AND** 返回永续与 Spot USDC 两部分原始数值供诊断
+
+#### Scenario: 非 USDC Spot 资产不计入权益
+- **WHEN** Spot 账户同时持有 USDC、HYPE、MAX 或其他代币
+- **THEN** `equity` 只计入 USDC，不计入其他 Spot 代币
+
+#### Scenario: 单侧查询失败时降级
+- **WHEN** 永续账户与 Spot 账户查询中仅一侧失败
+- **THEN** 失败侧按零计入，使用成功侧计算正权益
+
+#### Scenario: 双侧查询失败时保守关闭
+- **WHEN** 永续账户与 Spot 账户查询均失败
+- **THEN** 抛出异常，不得返回零权益
+
+#### Scenario: 合计权益非正时拒绝返回
+- **WHEN** 永续账户权益与 Spot USDC 余额的合计值不大于零
+- **THEN** 抛出异常，不得返回无效权益
 
 #### Scenario: 返回持仓
 - **WHEN** 查询某标的持仓

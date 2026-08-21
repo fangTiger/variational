@@ -23,6 +23,9 @@
 - 补齐引擎与对冲所需能力：持仓、盘口、标记价、余额、挂单、订单查询、
   限价/市价下单、撤单、最小下单量、价格精度、清算信息。
 - 新增依赖 `hyperliquid-python-sdk`。
+- 修正统一账户权益口径：`get_balance()` 合计永续
+  `marginSummary.accountValue` 与 Spot `USDC` 的 `total`，并保留两部分原始值；
+  单侧读取失败时按零降级，双侧均失败或合计非正时保守抛出。
 
 ## Capabilities
 

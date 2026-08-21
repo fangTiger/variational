@@ -45,10 +45,12 @@ MAX_PRICE_SIGNIFICANT_DIGITS = 5
 
 @dataclass(frozen=True)
 class HyperliquidBalance:
-    """供通用引擎读取的 Hyperliquid 权益视图。"""
+    """供通用引擎读取的统一账户权益及其组成。"""
 
     equity: Decimal
     withdrawable: Decimal
+    perps_account_value: Decimal = Decimal(0)
+    spot_usdc_total: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True)
@@ -397,6 +399,18 @@ class HyperliquidClient(ExchangeAdapter):
             raise ValueError("Hyperliquid 账户状态缺少 assetPositions 数组")
         return raw
 
+    async def _spot_user_state(self) -> dict[str, Any]:
+        """读取 Spot 账户状态，严格校验 SDK 返回的余额数组。"""
+        raw = await asyncio.to_thread(
+            self._require_info().spot_user_state,
+            self._require_account_address(),
+        )
+        if not isinstance(raw, dict) or not isinstance(raw.get("balances"), list):
+            raise ValueError("Hyperliquid Spot 账户状态缺少 balances 数组")
+        if not all(isinstance(item, dict) for item in raw["balances"]):
+            raise ValueError("Hyperliquid Spot 账户余额元素结构无效")
+        return raw
+
     @staticmethod
     def _normalize_position(raw: dict[str, Any]) -> Position:
         """``szi`` 本身带方向，直接归一化为统一有符号数量。"""
@@ -422,18 +436,65 @@ class HyperliquidClient(ExchangeAdapter):
         return Position(market=market, signed_size=Decimal(0))
 
     async def get_balance(self) -> HyperliquidBalance:
-        """返回包含未实现盈亏的 ``marginSummary.accountValue`` 权益。"""
-        state = await self._user_state()
-        summary = state.get("marginSummary")
-        if not isinstance(summary, dict) or summary.get("accountValue") is None:
-            raise ValueError("Hyperliquid 账户状态缺少 marginSummary.accountValue")
-        equity = _positive_decimal(summary["accountValue"], context="账户权益")
-        withdrawable = _decimal(
-            state.get("withdrawable"),
-            context="可提现余额",
-            non_negative=True,
+        """合计永续账户权益与 Spot USDC，返回统一账户可用保证金总额。"""
+        perps_account_value = Decimal(0)
+        spot_usdc_total = Decimal(0)
+        withdrawable = Decimal(0)
+        perps_error: Exception | None = None
+        spot_error: Exception | None = None
+
+        try:
+            state = await self._user_state()
+            summary = state.get("marginSummary")
+            if not isinstance(summary, dict) or summary.get("accountValue") is None:
+                raise ValueError(
+                    "Hyperliquid 账户状态缺少 marginSummary.accountValue"
+                )
+            perps_account_value = _decimal(
+                summary["accountValue"],
+                context="永续账户权益",
+            )
+            withdrawable = _decimal(
+                state.get("withdrawable"),
+                context="可提现余额",
+                non_negative=True,
+            )
+        except Exception as exc:  # noqa: BLE001 单侧失败须按零降级
+            perps_error = exc
+            logger.warning("Hyperliquid 永续账户余额查询失败，本次按零计入：%s", exc)
+
+        try:
+            spot_state = await self._spot_user_state()
+            for item in spot_state["balances"]:
+                if item.get("coin") != "USDC":
+                    continue
+                if item.get("total") is None:
+                    raise ValueError("Hyperliquid Spot USDC 余额缺少 total")
+                spot_usdc_total += _decimal(
+                    item["total"],
+                    context="Spot USDC 余额",
+                    non_negative=True,
+                )
+        except Exception as exc:  # noqa: BLE001 单侧失败须按零降级
+            spot_error = exc
+            logger.warning("Hyperliquid Spot USDC 余额查询失败，本次按零计入：%s", exc)
+
+        if perps_error is not None and spot_error is not None:
+            raise RuntimeError(
+                "Hyperliquid 永续与 Spot 账户余额查询均失败："
+                f"永续={perps_error}；Spot={spot_error}"
+            ) from perps_error
+
+        equity = _positive_decimal(
+            perps_account_value + spot_usdc_total,
+            context="账户权益合计",
         )
-        return HyperliquidBalance(equity=equity, withdrawable=withdrawable)
+        return HyperliquidBalance(
+            equity=equity,
+            withdrawable=withdrawable,
+            perps_account_value=perps_account_value,
+            spot_usdc_total=spot_usdc_total,
+        )
 
     async def get_free_margin_ratio(self) -> Decimal | None:
         """用可提现余额近似可用保证金占权益比例。"""

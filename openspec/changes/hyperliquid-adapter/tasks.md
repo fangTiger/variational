@@ -33,3 +33,14 @@
 - [x] 3.2 完整 `tests/` 无既有回归
 - [x] 3.3 断言真实适配器实现了统一接口要求的全部方法（防桩与实现漂移）
 - [x] 3.4 确认未修改 plist、未改动风控与现有适配器、未访问真实网络、未提交推送
+
+## 4. 统一账户权益修复
+
+- [x] 4.1 按 SDK 0.24.0 的 `spot_user_state(address)` 与
+  `balances[].coin/total/hold/entryNtl` 结构补测试桩及签名断言
+- [x] 4.2 先补测试并确认 RED：覆盖永续 0 + Spot USDC 457.31、两侧求和、
+  双零拒绝、两种单侧失败、双侧失败、排除 HYPE/MAX
+- [x] 4.3 `get_balance()` 合计永续账户权益与 Spot USDC，并返回两部分诊断字段
+- [x] 4.4 单侧失败按零降级；双侧均失败或权益合计非正时抛出
+- [x] 4.5 定向测试、离线实盘场景回放与完整 `tests/` 全绿
+- [x] 4.6 `openspec validate hyperliquid-adapter --strict` 通过，并核对未越界修改

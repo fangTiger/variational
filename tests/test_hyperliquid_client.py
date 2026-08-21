@@ -94,23 +94,47 @@ def _position(coin: str, size: str, liquidation_price: str | None) -> dict:
     }
 
 
-def _user_state(positions: list[dict] | None = None) -> dict:
+def _user_state(
+    positions: list[dict] | None = None,
+    *,
+    account_value: str = "125.5",
+    withdrawable: str = "103.25",
+) -> dict:
     """返回与 SDK 文档一致的完整账户状态响应。"""
     return {
         "assetPositions": positions or [],
         "crossMarginSummary": {
-            "accountValue": "120.5",
+            "accountValue": account_value,
             "totalMarginUsed": "20",
             "totalNtlPos": "200",
-            "totalRawUsd": "120.5",
+            "totalRawUsd": account_value,
         },
         "marginSummary": {
-            "accountValue": "125.5",
+            "accountValue": account_value,
             "totalMarginUsed": "22",
             "totalNtlPos": "220",
-            "totalRawUsd": "125.5",
+            "totalRawUsd": account_value,
         },
-        "withdrawable": "103.25",
+        "withdrawable": withdrawable,
+    }
+
+
+def _spot_user_state(
+    usdc_total: str = "0",
+    *,
+    extra_balances: list[dict] | None = None,
+) -> dict:
+    """返回 ``Info.spot_user_state`` 的真实完整余额元素结构。"""
+    return {
+        "balances": [
+            {
+                "coin": "USDC",
+                "hold": "0.0",
+                "total": usdc_total,
+                "entryNtl": "0.0",
+            },
+            *(extra_balances or []),
+        ]
     }
 
 
@@ -170,6 +194,7 @@ class FakeInfo:
         meta_contexts: list | None = None,
         book: dict | None = None,
         state: dict | None = None,
+        spot_state: dict | None = None,
         orders: list[dict] | None = None,
         history: list[dict] | None = None,
         query_result: dict | None = None,
@@ -177,9 +202,12 @@ class FakeInfo:
         self.meta_contexts = meta_contexts or _meta_and_contexts()
         self.book = book or _book()
         self.state = state or _user_state()
+        self.spot_state = spot_state or _spot_user_state()
         self.orders = orders or []
         self.history = history or []
         self.query_result = query_result or {"status": "unknownOid"}
+        self.user_state_error: Exception | None = None
+        self.spot_state_error: Exception | None = None
         self.query_error: Exception | None = None
         self.calls: list[tuple] = []
 
@@ -193,7 +221,15 @@ class FakeInfo:
 
     def user_state(self, address: str, dex: str = ""):
         self.calls.append(("user_state", address, dex))
+        if self.user_state_error is not None:
+            raise self.user_state_error
         return self.state
+
+    def spot_user_state(self, address: str):
+        self.calls.append(("spot_user_state", address))
+        if self.spot_state_error is not None:
+            raise self.spot_state_error
+        return self.spot_state
 
     def frontend_open_orders(self, address: str, dex: str = ""):
         self.calls.append(("frontend_open_orders", address, dex))
@@ -346,6 +382,110 @@ def test_balance_exposes_positive_equity_attribute() -> None:
 
     assert balance.equity == Decimal("125.5")
     assert balance.equity > 0
+
+
+def test_balance_uses_spot_usdc_when_perps_account_value_is_zero() -> None:
+    info = FakeInfo(
+        state=_user_state(account_value="0.0", withdrawable="0.0"),
+        spot_state=_spot_user_state("457.3100"),
+    )
+    client = _client(info=info)
+
+    balance = asyncio.run(client.get_balance())
+
+    assert balance.equity == Decimal("457.3100")
+    assert balance.perps_account_value == Decimal("0.0")
+    assert balance.spot_usdc_total == Decimal("457.3100")
+
+
+def test_balance_sums_perps_account_value_and_spot_usdc() -> None:
+    info = FakeInfo(
+        state=_user_state(account_value="100", withdrawable="80"),
+        spot_state=_spot_user_state("50"),
+    )
+    client = _client(info=info)
+
+    balance = asyncio.run(client.get_balance())
+
+    assert balance.equity == Decimal("150")
+    assert balance.perps_account_value == Decimal("100")
+    assert balance.spot_usdc_total == Decimal("50")
+
+
+def test_balance_rejects_zero_total_equity() -> None:
+    client = _client(
+        info=FakeInfo(
+            state=_user_state(account_value="0", withdrawable="0"),
+            spot_state=_spot_user_state("0"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="账户权益.*必须为正数"):
+        asyncio.run(client.get_balance())
+
+
+@pytest.mark.parametrize(
+    ("failed_side", "expected_equity", "expected_perps", "expected_spot"),
+    [
+        ("perps", Decimal("50"), Decimal("0"), Decimal("50")),
+        ("spot", Decimal("100"), Decimal("100"), Decimal("0")),
+    ],
+)
+def test_balance_uses_successful_side_when_other_query_fails(
+    failed_side: str,
+    expected_equity: Decimal,
+    expected_perps: Decimal,
+    expected_spot: Decimal,
+) -> None:
+    info = FakeInfo(
+        state=_user_state(account_value="100", withdrawable="80"),
+        spot_state=_spot_user_state("50"),
+    )
+    if failed_side == "perps":
+        info.user_state_error = RuntimeError("永续查询失败")
+    else:
+        info.spot_state_error = RuntimeError("Spot 查询失败")
+    client = _client(info=info)
+
+    balance = asyncio.run(client.get_balance())
+
+    assert balance.equity == expected_equity
+    assert balance.perps_account_value == expected_perps
+    assert balance.spot_usdc_total == expected_spot
+
+
+def test_balance_raises_when_both_queries_fail() -> None:
+    info = FakeInfo()
+    info.user_state_error = RuntimeError("永续查询失败")
+    info.spot_state_error = RuntimeError("Spot 查询失败")
+    client = _client(info=info)
+
+    with pytest.raises(RuntimeError, match="均失败"):
+        asyncio.run(client.get_balance())
+
+    assert ("user_state", ACCOUNT_ADDRESS, "") in info.calls
+    assert ("spot_user_state", ACCOUNT_ADDRESS) in info.calls
+
+
+def test_balance_excludes_non_usdc_spot_assets() -> None:
+    spot_state = _spot_user_state(
+        "50",
+        extra_balances=[
+            {"coin": "HYPE", "hold": "1", "total": "999", "entryNtl": "5"},
+            {"coin": "MAX", "hold": "2", "total": "888", "entryNtl": "6"},
+        ],
+    )
+    client = _client(
+        info=FakeInfo(
+            state=_user_state(account_value="0", withdrawable="0"),
+            spot_state=spot_state,
+        )
+    )
+
+    balance = asyncio.run(client.get_balance())
+
+    assert balance.equity == Decimal("50")
+    assert balance.spot_usdc_total == Decimal("50")
 
 
 def test_position_is_zero_when_market_is_absent() -> None:
@@ -637,6 +777,10 @@ def test_real_sdk_signatures_match_the_stubbed_boundary() -> None:
         "self",
         "address",
         "dex",
+    ]
+    assert list(inspect.signature(Info.spot_user_state).parameters) == [
+        "self",
+        "address",
     ]
     assert list(inspect.signature(Info.frontend_open_orders).parameters) == [
         "self",
