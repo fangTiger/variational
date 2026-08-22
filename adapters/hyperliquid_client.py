@@ -12,6 +12,10 @@
     已由上述账户授权的 API 代理钱包私钥。仅开启交易时需要。
 ``HYPERLIQUID_API_URL``
     可选，默认使用 SDK 的主网地址。
+``HYPERLIQUID_BUILDER_ADDRESS``
+    可选 Builder Code 地址；必须与费率同时配置。
+``HYPERLIQUID_BUILDER_FEE_TENTHS_BPS``
+    可选 Builder Code 费率，整数，单位为 0.1bp；必须与地址同时配置。
 
 ``trading_enabled`` 必须由调用方显式传入，不从环境变量自动开启。无地址、无
 私钥时仍可构造只读实例并读取公共行情；调用账户方法前需补充公开地址。
@@ -21,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_HALF_EVEN, Decimal
 from typing import Any, Callable
@@ -41,6 +46,8 @@ DEFAULT_MARKET_ORDER_SLIPPAGE = Decimal("0.05")
 MIN_ORDER_NOTIONAL_USD = Decimal("10")
 PERP_MAX_PRICE_DECIMALS = 6
 MAX_PRICE_SIGNIFICANT_DIGITS = 5
+# Hyperliquid 永续 builder 费率上限为 10bp，即 100 个 0.1bp。
+MAX_BUILDER_FEE_TENTHS_BPS = 100
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,7 @@ class HyperliquidBalance:
     withdrawable: Decimal
     perps_account_value: Decimal = Decimal(0)
     spot_usdc_total: Decimal = Decimal(0)
+    unrealized_pnl_total: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True)
@@ -185,6 +193,45 @@ def _normalize_order_status(value: Any) -> str:
     return status
 
 
+def _builder_info(
+    address: str | None,
+    fee_tenths_bps: int | str | None,
+) -> dict[str, Any] | None:
+    """校验可选 builder 配置并生成 SDK 0.24.0 所需的 ``b/f`` 对象。"""
+    if address is None and fee_tenths_bps is None:
+        return None
+    if address is None or fee_tenths_bps is None:
+        raise ValueError("Hyperliquid builder 地址与费率必须同时配置")
+    if not isinstance(address, str) or re.fullmatch(r"0x[0-9a-fA-F]{40}", address) is None:
+        raise ValueError("Hyperliquid builder 地址格式无效，必须是 0x 加 40 位十六进制字符")
+
+    if isinstance(fee_tenths_bps, bool):
+        raise ValueError("Hyperliquid builder 费率必须是整数")
+    if isinstance(fee_tenths_bps, int):
+        fee = fee_tenths_bps
+    elif isinstance(fee_tenths_bps, str) and re.fullmatch(
+        r"[+-]?\d+", fee_tenths_bps.strip()
+    ):
+        fee_text = fee_tenths_bps.strip()
+        fee_digits = fee_text.lstrip("+-").lstrip("0") or "0"
+        if len(fee_digits) > len(str(MAX_BUILDER_FEE_TENTHS_BPS)):
+            fee = -1 if fee_text.startswith("-") else MAX_BUILDER_FEE_TENTHS_BPS + 1
+        else:
+            fee = int(fee_digits)
+            if fee_text.startswith("-"):
+                fee = -fee
+    else:
+        raise ValueError("Hyperliquid builder 费率必须是整数")
+    if fee < 0:
+        raise ValueError("Hyperliquid builder 费率不得为负")
+    if fee > MAX_BUILDER_FEE_TENTHS_BPS:
+        raise ValueError(
+            "Hyperliquid builder 费率超过永续上限 "
+            f"{MAX_BUILDER_FEE_TENTHS_BPS}（单位 0.1bp）"
+        )
+    return {"b": address, "f": fee}
+
+
 class HyperliquidClient(ExchangeAdapter):
     """Hyperliquid 永续适配器，构造时默认只读且不访问网络。
 
@@ -207,6 +254,8 @@ class HyperliquidClient(ExchangeAdapter):
         info_factory: Callable[..., Any] = Info,
         exchange_factory: Callable[..., Any] = Exchange,
         market_order_slippage: Decimal = DEFAULT_MARKET_ORDER_SLIPPAGE,
+        builder_address: str | None = None,
+        builder_fee_tenths_bps: int | str | None = None,
     ) -> None:
         """保存配置但不联网；交易模式必须具备账户地址与代理签名能力。"""
         if trading_enabled and not account_address:
@@ -217,6 +266,7 @@ class HyperliquidClient(ExchangeAdapter):
         slippage = _decimal(market_order_slippage, context="市价单滑点")
         if slippage < 0 or slippage >= 1:
             raise ValueError("Hyperliquid 市价单滑点必须在 [0, 1) 之间")
+        builder = _builder_info(builder_address, builder_fee_tenths_bps)
 
         self.account_address = account_address
         self.base_url = base_url.rstrip("/")
@@ -228,6 +278,7 @@ class HyperliquidClient(ExchangeAdapter):
         self._info_factory = info_factory
         self._exchange_factory = exchange_factory
         self._market_order_slippage = slippage
+        self._builder = builder
         self._market_meta: dict[str, _MarketMeta] = {}
         self._market_aliases: dict[str, str] = {}
 
@@ -241,14 +292,18 @@ class HyperliquidClient(ExchangeAdapter):
     ) -> "HyperliquidClient":
         """从环境变量构造，且绝不从环境变量隐式开启交易。
 
-        读取 ``{prefix}_ACCOUNT_ADDRESS``、``{prefix}_AGENT_PRIVATE_KEY`` 与
-        可选的 ``{prefix}_API_URL``。只读公共行情不要求前两项；账户读取只
-        要求公开地址；交易模式同时要求公开地址与代理钱包私钥。
+        读取 ``{prefix}_ACCOUNT_ADDRESS``、``{prefix}_AGENT_PRIVATE_KEY``、
+        可选的 ``{prefix}_API_URL`` 以及成对可选的 builder 地址和费率。只读
+        公共行情不要求账户凭据；交易模式同时要求公开地址与代理钱包私钥。
         """
         return cls(
             account_address=os.getenv(f"{prefix}_ACCOUNT_ADDRESS") or None,
             agent_private_key=os.getenv(f"{prefix}_AGENT_PRIVATE_KEY") or None,
             base_url=os.getenv(f"{prefix}_API_URL") or MAINNET_API_URL,
+            builder_address=os.getenv(f"{prefix}_BUILDER_ADDRESS") or None,
+            builder_fee_tenths_bps=(
+                os.getenv(f"{prefix}_BUILDER_FEE_TENTHS_BPS") or None
+            ),
             trading_enabled=trading_enabled,
             **kwargs,
         )
@@ -436,57 +491,56 @@ class HyperliquidClient(ExchangeAdapter):
         return Position(market=market, signed_size=Decimal(0))
 
     async def get_balance(self) -> HyperliquidBalance:
-        """合计永续账户权益与 Spot USDC，返回统一账户可用保证金总额。"""
-        perps_account_value = Decimal(0)
+        """返回全平口径权益：Spot USDC 加全部持仓未实现盈亏。"""
         spot_usdc_total = Decimal(0)
-        withdrawable = Decimal(0)
-        perps_error: Exception | None = None
-        spot_error: Exception | None = None
-
         try:
             state = await self._user_state()
-            summary = state.get("marginSummary")
-            if not isinstance(summary, dict) or summary.get("accountValue") is None:
-                raise ValueError(
-                    "Hyperliquid 账户状态缺少 marginSummary.accountValue"
-                )
-            perps_account_value = _decimal(
-                summary["accountValue"],
-                context="永续账户权益",
+        except Exception as exc:  # noqa: BLE001 SDK 查询异常类型不稳定
+            raise RuntimeError(f"Hyperliquid 永续账户状态查询失败：{exc}") from exc
+
+        summary = state.get("marginSummary")
+        if not isinstance(summary, dict) or summary.get("accountValue") is None:
+            raise ValueError("Hyperliquid 账户状态缺少 marginSummary.accountValue")
+        perps_account_value = _decimal(
+            summary["accountValue"],
+            context="永续账户权益诊断值",
+        )
+        withdrawable = _decimal(
+            state.get("withdrawable"),
+            context="可提现余额",
+            non_negative=True,
+        )
+        unrealized_pnl_total = Decimal(0)
+        for raw_position in state["assetPositions"]:
+            if not isinstance(raw_position, dict) or not isinstance(
+                raw_position.get("position"), dict
+            ):
+                raise ValueError(f"Hyperliquid 持仓结构无效：{raw_position!r}")
+            position = raw_position["position"]
+            if position.get("unrealizedPnl") is None:
+                raise ValueError(f"Hyperliquid 持仓缺少未实现盈亏：{raw_position!r}")
+            unrealized_pnl_total += _decimal(
+                position["unrealizedPnl"],
+                context="持仓未实现盈亏",
             )
-            withdrawable = _decimal(
-                state.get("withdrawable"),
-                context="可提现余额",
-                non_negative=True,
-            )
-        except Exception as exc:  # noqa: BLE001 单侧失败须按零降级
-            perps_error = exc
-            logger.warning("Hyperliquid 永续账户余额查询失败，本次按零计入：%s", exc)
 
         try:
             spot_state = await self._spot_user_state()
-            for item in spot_state["balances"]:
-                if item.get("coin") != "USDC":
-                    continue
-                if item.get("total") is None:
-                    raise ValueError("Hyperliquid Spot USDC 余额缺少 total")
-                spot_usdc_total += _decimal(
-                    item["total"],
-                    context="Spot USDC 余额",
-                    non_negative=True,
-                )
-        except Exception as exc:  # noqa: BLE001 单侧失败须按零降级
-            spot_error = exc
-            logger.warning("Hyperliquid Spot USDC 余额查询失败，本次按零计入：%s", exc)
-
-        if perps_error is not None and spot_error is not None:
-            raise RuntimeError(
-                "Hyperliquid 永续与 Spot 账户余额查询均失败："
-                f"永续={perps_error}；Spot={spot_error}"
-            ) from perps_error
+        except Exception as exc:  # noqa: BLE001 SDK 查询异常类型不稳定
+            raise RuntimeError(f"Hyperliquid Spot 账户状态查询失败：{exc}") from exc
+        for item in spot_state["balances"]:
+            if item.get("coin") != "USDC":
+                continue
+            if item.get("total") is None:
+                raise ValueError("Hyperliquid Spot USDC 余额缺少 total")
+            spot_usdc_total += _decimal(
+                item["total"],
+                context="Spot USDC 余额",
+                non_negative=True,
+            )
 
         equity = _positive_decimal(
-            perps_account_value + spot_usdc_total,
+            spot_usdc_total + unrealized_pnl_total,
             context="账户权益合计",
         )
         return HyperliquidBalance(
@@ -494,6 +548,7 @@ class HyperliquidClient(ExchangeAdapter):
             withdrawable=withdrawable,
             perps_account_value=perps_account_value,
             spot_usdc_total=spot_usdc_total,
+            unrealized_pnl_total=unrealized_pnl_total,
         )
 
     async def get_free_margin_ratio(self) -> Decimal | None:
@@ -645,6 +700,14 @@ class HyperliquidClient(ExchangeAdapter):
             )
         return rounded
 
+    def _order_options(self, *, reduce_only: bool) -> dict[str, Any]:
+        """仅在启用时加入 builder，默认调用不得产生 builder 字段。"""
+        options: dict[str, Any] = {"reduce_only": reduce_only}
+        if self._builder is not None:
+            # SDK 会原地把地址转成小写，每次传副本以保持客户端配置不可变。
+            options["builder"] = dict(self._builder)
+        return options
+
     @staticmethod
     def _order_result(raw: Any) -> HyperliquidOrderResult:
         """解析下单响应，任何业务拒绝都转为明确异常。"""
@@ -695,7 +758,7 @@ class HyperliquidClient(ExchangeAdapter):
             float(rounded_amount),
             float(rounded_price),
             {"limit": {"tif": tif}},
-            reduce_only=reduce_only,
+            **self._order_options(reduce_only=reduce_only),
         )
         return self._order_result(raw)
 
@@ -726,7 +789,7 @@ class HyperliquidClient(ExchangeAdapter):
             float(rounded_amount),
             float(limit_price),
             {"limit": {"tif": "Ioc"}},
-            reduce_only=reduce_only,
+            **self._order_options(reduce_only=reduce_only),
         )
         return self._order_result(raw)
 

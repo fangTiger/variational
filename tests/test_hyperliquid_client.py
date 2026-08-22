@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import inspect
 from decimal import Decimal
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -14,6 +15,7 @@ from adapters.base import ExchangeAdapter, Side
 
 ACCOUNT_ADDRESS = "0x1111111111111111111111111111111111111111"
 AGENT_PRIVATE_KEY = "0x" + "22" * 32
+ENTROPY_BUILDER_ADDRESS = "0xcD254d2A328f7f67C7c6FEf930A4757516F7b601"
 
 
 def _meta_and_contexts(mark_price: str = "62500") -> list:
@@ -76,7 +78,13 @@ def _book(bid: str = "62490", ask: str = "62510") -> dict:
     }
 
 
-def _position(coin: str, size: str, liquidation_price: str | None) -> dict:
+def _position(
+    coin: str,
+    size: str,
+    liquidation_price: str | None,
+    *,
+    unrealized_pnl: str = "1.5",
+) -> dict:
     """返回与 ``Info.user_state`` 文档一致的完整持仓元素。"""
     return {
         "position": {
@@ -88,7 +96,7 @@ def _position(coin: str, size: str, liquidation_price: str | None) -> dict:
             "positionValue": "100",
             "returnOnEquity": "0.1",
             "szi": size,
-            "unrealizedPnl": "1.5",
+            "unrealizedPnl": unrealized_pnl,
         },
         "type": "oneWay",
     }
@@ -210,13 +218,17 @@ class FakeInfo:
         history: list[dict] | None = None,
         query_result: dict | None = None,
     ) -> None:
-        self.meta_contexts = meta_contexts or _meta_and_contexts()
-        self.book = book or _book()
-        self.state = state or _user_state()
-        self.spot_state = spot_state or _spot_user_state()
-        self.orders = orders or []
-        self.history = history or []
-        self.query_result = query_result or {"status": "unknownOid"}
+        self.meta_contexts = (
+            _meta_and_contexts() if meta_contexts is None else meta_contexts
+        )
+        self.book = _book() if book is None else book
+        self.state = _user_state() if state is None else state
+        self.spot_state = _spot_user_state() if spot_state is None else spot_state
+        self.orders = [] if orders is None else orders
+        self.history = [] if history is None else history
+        self.query_result = (
+            {"status": "unknownOid"} if query_result is None else query_result
+        )
         self.user_state_error: Exception | None = None
         self.spot_state_error: Exception | None = None
         self.query_error: Exception | None = None
@@ -255,6 +267,23 @@ class FakeInfo:
     def historical_orders(self, user: str):
         self.calls.append(("historical_orders", user))
         return self.history
+
+
+def test_fake_info_preserves_falsy_malformed_responses() -> None:
+    """测试桩不得把畸形空响应静默替换成默认成功响应。"""
+    info = FakeInfo(
+        meta_contexts=[],
+        book={},
+        state={},
+        spot_state={},
+        query_result={},
+    )
+
+    assert info.meta_contexts == []
+    assert info.book == {}
+    assert info.state == {}
+    assert info.spot_state == {}
+    assert info.query_result == {}
 
 
 class FakeExchange:
@@ -387,7 +416,12 @@ def test_mark_price_uses_exchange_mark_field_not_book_mid() -> None:
 
 
 def test_balance_exposes_positive_equity_attribute() -> None:
-    client = _client(info=FakeInfo(state=_user_state()))
+    client = _client(
+        info=FakeInfo(
+            state=_user_state(account_value="999"),
+            spot_state=_spot_user_state("125.5"),
+        )
+    )
 
     balance = asyncio.run(client.get_balance())
 
@@ -407,27 +441,86 @@ def test_balance_uses_spot_usdc_when_perps_account_value_is_zero() -> None:
     assert balance.equity == Decimal("457.3100")
     assert balance.perps_account_value == Decimal("0.0")
     assert balance.spot_usdc_total == Decimal("457.3100")
+    assert balance.unrealized_pnl_total == Decimal("0")
 
 
-def test_balance_sums_perps_account_value_and_spot_usdc() -> None:
+def test_balance_uses_spot_usdc_plus_unrealized_pnl_with_open_position() -> None:
     info = FakeInfo(
-        state=_user_state(account_value="100", withdrawable="80"),
-        spot_state=_spot_user_state("50"),
+        state=_user_state(
+            [
+                _position(
+                    "BTC",
+                    "0.032",
+                    "45000",
+                    unrealized_pnl="5.47",
+                )
+            ],
+            account_value="72.453029",
+            withdrawable="0",
+        ),
+        spot_state=_spot_user_state("498.20"),
     )
     client = _client(info=info)
 
     balance = asyncio.run(client.get_balance())
 
-    assert balance.equity == Decimal("150")
-    assert balance.perps_account_value == Decimal("100")
-    assert balance.spot_usdc_total == Decimal("50")
+    assert balance.equity == Decimal("503.67")
+    assert balance.perps_account_value == Decimal("72.453029")
+    assert balance.spot_usdc_total == Decimal("498.20")
+    assert balance.unrealized_pnl_total == Decimal("5.47")
 
 
-def test_balance_rejects_zero_total_equity() -> None:
+def test_balance_subtracts_unrealized_loss() -> None:
+    state = _user_state(
+        [_position("BTC", "0.032", "45000", unrealized_pnl="-30")],
+        account_value="72",
+    )
+    client = _client(
+        info=FakeInfo(state=state, spot_state=_spot_user_state("500"))
+    )
+
+    balance = asyncio.run(client.get_balance())
+
+    assert balance.equity == Decimal("470")
+    assert balance.unrealized_pnl_total == Decimal("-30")
+
+
+def test_balance_sums_unrealized_pnl_across_all_positions() -> None:
+    state = _user_state(
+        [
+            _position("BTC", "0.032", "45000", unrealized_pnl="4.25"),
+            _position("ETH", "-0.5", "4200", unrealized_pnl="-1.50"),
+            _position("SOL", "2", "80", unrealized_pnl="0.75"),
+        ],
+        account_value="90",
+    )
+    client = _client(
+        info=FakeInfo(state=state, spot_state=_spot_user_state("500"))
+    )
+
+    balance = asyncio.run(client.get_balance())
+
+    assert balance.unrealized_pnl_total == Decimal("3.50")
+    assert balance.equity == Decimal("503.50")
+
+
+@pytest.mark.parametrize(
+    ("spot_total", "unrealized_pnl"),
+    [("0", None), ("20", "-20"), ("20", "-30")],
+)
+def test_balance_rejects_non_positive_total_equity(
+    spot_total: str,
+    unrealized_pnl: str | None,
+) -> None:
+    positions = (
+        []
+        if unrealized_pnl is None
+        else [_position("BTC", "0.01", "45000", unrealized_pnl=unrealized_pnl)]
+    )
     client = _client(
         info=FakeInfo(
-            state=_user_state(account_value="0", withdrawable="0"),
-            spot_state=_spot_user_state("0"),
+            state=_user_state(positions, account_value="100", withdrawable="0"),
+            spot_state=_spot_user_state(spot_total),
         )
     )
 
@@ -436,20 +529,19 @@ def test_balance_rejects_zero_total_equity() -> None:
 
 
 @pytest.mark.parametrize(
-    ("failed_side", "expected_equity", "expected_perps", "expected_spot"),
-    [
-        ("perps", Decimal("50"), Decimal("0"), Decimal("50")),
-        ("spot", Decimal("100"), Decimal("100"), Decimal("0")),
-    ],
+    ("failed_side", "error_pattern"),
+    [("perps", "永续.*查询失败"), ("spot", "Spot.*查询失败")],
 )
-def test_balance_uses_successful_side_when_other_query_fails(
+def test_balance_raises_when_either_required_query_fails(
     failed_side: str,
-    expected_equity: Decimal,
-    expected_perps: Decimal,
-    expected_spot: Decimal,
+    error_pattern: str,
 ) -> None:
     info = FakeInfo(
-        state=_user_state(account_value="100", withdrawable="80"),
+        state=_user_state(
+            [_position("BTC", "0.01", "45000", unrealized_pnl="5")],
+            account_value="100",
+            withdrawable="80",
+        ),
         spot_state=_spot_user_state("50"),
     )
     if failed_side == "perps":
@@ -458,24 +550,58 @@ def test_balance_uses_successful_side_when_other_query_fails(
         info.spot_state_error = RuntimeError("Spot 查询失败")
     client = _client(info=info)
 
-    balance = asyncio.run(client.get_balance())
-
-    assert balance.equity == expected_equity
-    assert balance.perps_account_value == expected_perps
-    assert balance.spot_usdc_total == expected_spot
-
-
-def test_balance_raises_when_both_queries_fail() -> None:
-    info = FakeInfo()
-    info.user_state_error = RuntimeError("永续查询失败")
-    info.spot_state_error = RuntimeError("Spot 查询失败")
-    client = _client(info=info)
-
-    with pytest.raises(RuntimeError, match="均失败"):
+    with pytest.raises(RuntimeError, match=error_pattern):
         asyncio.run(client.get_balance())
 
-    assert ("user_state", ACCOUNT_ADDRESS, "") in info.calls
-    assert ("spot_user_state", ACCOUNT_ADDRESS) in info.calls
+
+def test_balance_raises_when_position_lacks_unrealized_pnl() -> None:
+    position = _position("BTC", "0.01", "45000")
+    del position["position"]["unrealizedPnl"]
+    client = _client(
+        info=FakeInfo(
+            state=_user_state([position]),
+            spot_state=_spot_user_state("50"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="未实现盈亏"):
+        asyncio.run(client.get_balance())
+
+
+@pytest.mark.parametrize(
+    ("malformed", "error_type", "error_pattern"),
+    [
+        ("margin_summary", ValueError, "marginSummary.accountValue"),
+        ("withdrawable", ValueError, "可提现余额"),
+        ("unrealized_pnl", ValueError, "未实现盈亏.*有限数字"),
+        ("spot_balances", RuntimeError, "Spot.*balances"),
+        ("usdc_total", ValueError, "USDC.*total"),
+    ],
+)
+def test_balance_rejects_malformed_required_account_fields(
+    malformed: str,
+    error_type: type[Exception],
+    error_pattern: str,
+) -> None:
+    state = _user_state(
+        [_position("BTC", "0.01", "45000", unrealized_pnl="5")],
+        account_value="100",
+    )
+    spot_state = _spot_user_state("50")
+    if malformed == "margin_summary":
+        del state["marginSummary"]
+    elif malformed == "withdrawable":
+        state["withdrawable"] = None
+    elif malformed == "unrealized_pnl":
+        state["assetPositions"][0]["position"]["unrealizedPnl"] = "NaN"
+    elif malformed == "spot_balances":
+        spot_state = {}
+    else:
+        del spot_state["balances"][0]["total"]
+    client = _client(info=FakeInfo(state=state, spot_state=spot_state))
+
+    with pytest.raises(error_type, match=error_pattern):
+        asyncio.run(client.get_balance())
 
 
 def test_balance_excludes_non_usdc_spot_assets() -> None:
@@ -484,6 +610,7 @@ def test_balance_excludes_non_usdc_spot_assets() -> None:
         extra_balances=[
             {"coin": "HYPE", "hold": "1", "total": "999", "entryNtl": "5"},
             {"coin": "MAX", "hold": "2", "total": "888", "entryNtl": "6"},
+            {"coin": "USDT0", "hold": "3", "total": "777", "entryNtl": "7"},
         ],
     )
     client = _client(
@@ -567,6 +694,134 @@ def test_limit_order_uses_alo_for_post_only() -> None:
     assert call[5] == {"limit": {"tif": "Alo"}}
     assert call[6] is False
     assert result.id == 101
+
+
+def test_unconfigured_builder_is_omitted_from_limit_and_market_orders(
+    monkeypatch,
+) -> None:
+    """默认路径必须省略 builder 关键字，锁定 SDK action 不含 builder。"""
+    from hyperliquid.exchange import Exchange
+
+    monkeypatch.setenv("HYPERLIQUID_ACCOUNT_ADDRESS", ACCOUNT_ADDRESS)
+    monkeypatch.delenv("HYPERLIQUID_BUILDER_ADDRESS", raising=False)
+    monkeypatch.delenv("HYPERLIQUID_BUILDER_FEE_TENTHS_BPS", raising=False)
+    exchange = create_autospec(Exchange, instance=True)
+    exchange.order.return_value = _order_response()
+    client = _client_class().from_env(
+        trading_enabled=True,
+        info=FakeInfo(),
+        exchange=exchange,
+    )
+
+    asyncio.run(
+        client.place_limit_order(
+            "BTC", Side.BUY, Decimal("0.001"), Decimal("62500")
+        )
+    )
+    exchange.order.return_value = _order_response(state="filled")
+    asyncio.run(client.market_order("BTC", Side.SELL, Decimal("0.001")))
+
+    assert len(exchange.order.call_args_list) == 2
+    assert all("builder" not in call.kwargs for call in exchange.order.call_args_list)
+
+
+def test_configured_zero_fee_builder_is_forwarded_to_limit_and_market_orders(
+    monkeypatch,
+) -> None:
+    """费率 0 是有效配置，限价与 IOC 市价路径都必须归属同一 builder。"""
+    from hyperliquid.exchange import Exchange
+
+    monkeypatch.setenv("HYPERLIQUID_ACCOUNT_ADDRESS", ACCOUNT_ADDRESS)
+    monkeypatch.setenv("HYPERLIQUID_BUILDER_ADDRESS", ENTROPY_BUILDER_ADDRESS)
+    monkeypatch.setenv("HYPERLIQUID_BUILDER_FEE_TENTHS_BPS", "0")
+    exchange = create_autospec(Exchange, instance=True)
+    exchange.order.return_value = _order_response()
+    client = _client_class().from_env(
+        trading_enabled=True,
+        info=FakeInfo(),
+        exchange=exchange,
+    )
+
+    asyncio.run(
+        client.place_limit_order(
+            "BTC", Side.BUY, Decimal("0.001"), Decimal("62500")
+        )
+    )
+    exchange.order.return_value = _order_response(state="filled")
+    asyncio.run(client.market_order("BTC", Side.SELL, Decimal("0.001")))
+
+    expected = {"b": ENTROPY_BUILDER_ADDRESS, "f": 0}
+    assert [call.kwargs["builder"] for call in exchange.order.call_args_list] == [
+        expected,
+        expected,
+    ]
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["entropy", "0x1234", "0x" + "gg" * 20],
+)
+def test_builder_address_validation_fails_during_construction(address: str) -> None:
+    with pytest.raises(ValueError, match="builder 地址.*无效"):
+        _client_class()(
+            builder_address=address,
+            builder_fee_tenths_bps=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("fee", "error_pattern"),
+    [("-1", "费率.*不得为负"), ("101", "费率.*上限"), ("1.5", "费率.*整数")],
+)
+def test_builder_fee_validation_fails_during_construction(
+    fee: str,
+    error_pattern: str,
+) -> None:
+    with pytest.raises(ValueError, match=error_pattern):
+        _client_class()(
+            builder_address=ENTROPY_BUILDER_ADDRESS,
+            builder_fee_tenths_bps=fee,
+        )
+
+
+def test_extremely_long_builder_fee_still_has_chinese_error() -> None:
+    with pytest.raises(ValueError, match="Hyperliquid builder 费率.*上限"):
+        _client_class()(
+            builder_address=ENTROPY_BUILDER_ADDRESS,
+            builder_fee_tenths_bps="9" * 5000,
+        )
+
+
+def test_builder_fee_with_many_leading_zeroes_is_parsed_normally() -> None:
+    client = _client_class()(
+        builder_address=ENTROPY_BUILDER_ADDRESS,
+        builder_fee_tenths_bps="0" * 5000 + "100",
+    )
+
+    assert client._builder == {"b": ENTROPY_BUILDER_ADDRESS, "f": 100}
+
+
+def test_negative_builder_fee_with_many_leading_zeroes_has_chinese_error() -> None:
+    with pytest.raises(ValueError, match="Hyperliquid builder 费率.*不得为负"):
+        _client_class()(
+            builder_address=ENTROPY_BUILDER_ADDRESS,
+            builder_fee_tenths_bps="-" + "0" * 5000 + "1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("address", "fee"),
+    [(ENTROPY_BUILDER_ADDRESS, None), (None, "0")],
+)
+def test_builder_configuration_must_include_address_and_fee(
+    address: str | None,
+    fee: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="builder.*必须同时配置"):
+        _client_class()(
+            builder_address=address,
+            builder_fee_tenths_bps=fee,
+        )
 
 
 def test_post_only_business_rejection_becomes_runtime_error() -> None:
@@ -852,6 +1107,12 @@ def test_real_sdk_signatures_match_the_stubbed_boundary() -> None:
         "reduce_only",
         "cloid",
         "builder",
+    ]
+    assert list(inspect.signature(Exchange.bulk_orders).parameters) == [
+        "self",
+        "order_requests",
+        "builder",
+        "grouping",
     ]
     assert list(inspect.signature(Exchange.cancel).parameters) == [
         "self",
