@@ -53,10 +53,15 @@ class ExchangeAdapter(ABC):
 
     子类必须实现只读查询与 `market_order`；`hedge` 与 `close_position`
     在基类用通用逻辑实现，子类通常无需重写。
+
+    `execution_model` 声明执行模型：`"orderbook"` 表示支持订单簿限价单，
+    `"rfq"` 表示只能先询价再接受报价成交。未声明的旧适配器默认按订单簿处理。
     """
 
     #: 适配器名称，用于日志（子类覆盖）
     name: str = "exchange"
+    #: 执行模型；订单簿适配器用 orderbook，纯询价适配器用 rfq。
+    execution_model: str = "orderbook"
     #: 是否允许引擎自动改变仓位；人工只读腿必须覆盖为 False。
     supports_trading: bool = True
 

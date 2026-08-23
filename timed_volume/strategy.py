@@ -308,11 +308,14 @@ class TimedHedgedVolumeStrategy:
                 required = (
                     "get_market_price",
                     "get_min_order_size",
-                    "place_limit_order",
-                    "get_order_by_id",
-                    "cancel_order",
                     "market_order",
                 )
+                if getattr(self.hedge, "execution_model", "orderbook") != "rfq":
+                    required += (
+                        "place_limit_order",
+                        "get_order_by_id",
+                        "cancel_order",
+                    )
                 missing = [
                     name for name in required if not callable(getattr(self.hedge, name, None))
                 ]

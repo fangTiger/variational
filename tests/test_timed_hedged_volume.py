@@ -19,6 +19,7 @@ import pytest
 from adapters.base import MarketPrice, Position, Side
 from adapters.extended_client import ExtendedClient
 from adapters.lighter_client import LighterClient
+from adapters.variational_client import VariationalClient
 from engine.hedge_engine import HedgeFillResult
 
 
@@ -161,6 +162,51 @@ class _ExtendedAdapter(_AdapterCore):
             post_only=post_only,
             reduce_only=reduce_only,
         )
+
+
+class _RfqAdapter:
+    """只实现 RFQ 公共能力，不伪造订单簿方法。"""
+
+    execution_model = "rfq"
+
+    def __init__(
+        self,
+        name: str = "rfq",
+        *,
+        min_order_size: Decimal = Decimal("0.001"),
+    ) -> None:
+        self.name = name
+        self.position = Decimal("0")
+        self.min_order_size = Decimal(str(min_order_size))
+        self.events: list[tuple] = []
+
+    async def get_market_price(self, market: str):
+        self.events.append(("quote", market))
+        return MarketPrice(market, bid=Decimal("99"), ask=Decimal("101"))
+
+    async def get_position(self, market: str):
+        return Position(market, self.position)
+
+    async def get_min_order_size(self, market: str):
+        del market
+        return self.min_order_size
+
+    async def round_amount(self, market: str, amount: Decimal):
+        del market
+        return Decimal(str(amount)).quantize(Decimal("0.001"))
+
+    async def market_order(
+        self,
+        market: str,
+        side: Side,
+        amount: Decimal,
+        *,
+        reduce_only: bool = False,
+    ):
+        signed = amount if side is Side.BUY else -amount
+        self.position += signed
+        self.events.append(("market", market, side, amount, reduce_only))
+        return SimpleNamespace(data=SimpleNamespace(id=f"market-{self.name}"))
 
 
 class _ScriptedExecutor:
@@ -764,6 +810,171 @@ def test_minimum_query_failure_interlocks_without_uncertain_retry(
     assert executor.calls == []
     assert "对冲容差" in caplog.text
     assert "市场元数据超时" in caplog.text
+
+
+def test_variational_missing_minimum_interlocks_without_submitting_orders(
+    tmp_path,
+    caplog,
+) -> None:
+    """Variational 未返回最小量时策略必须明确拒绝，不能按零下单。"""
+    variational = object.__new__(VariationalClient)
+    variational._quantity_limits = {}
+
+    async def get_position(market: str):
+        return Position(market, Decimal("0"))
+
+    async def request_quote(
+        underlying: str,
+        side: str,
+        qty: Decimal,
+        *,
+        instrument_type: str = "perpetual_future",
+        funding_interval_s: int = 3600,
+        kind: str | None = None,
+    ):
+        del underlying, side, qty, instrument_type, funding_interval_s, kind
+        return {"margin_requirements": {"initial_margin": "0.2"}}
+
+    async def get_supported_assets():
+        return {"BTC": [{"asset": "BTC", "price": "60000"}]}
+
+    variational.get_position = get_position
+    variational.request_quote = request_quote
+    variational.get_supported_assets = get_supported_assets
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=variational,
+        executor=executor,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "interlocked"
+    assert result.hedge_available is False
+    assert executor.calls == []
+    # 只断言稳定的关键信息（字段名 + 拒绝语义），不锁死具体文案措辞。
+    assert "min_qty" in caplog.text
+    assert "拒绝" in caplog.text
+
+
+def test_rfq_availability_does_not_require_orderbook_capabilities(tmp_path) -> None:
+    """RFQ 对冲腿缺少限价、单查和撤单能力时仍可通过可用性检查。"""
+    rfq = _RfqAdapter()
+    assert not hasattr(rfq, "place_limit_order")
+    assert not hasattr(rfq, "get_order_by_id")
+    assert not hasattr(rfq, "cancel_order")
+    executor = _ScriptedExecutor()
+    _, strategy, lighter, _ = _build_strategy(
+        tmp_path,
+        extended=rfq,
+        executor=executor,
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "opened"
+    assert result.hedge_available is True
+    assert lighter.position == -rfq.position != 0
+
+
+@pytest.mark.parametrize(
+    "capability",
+    ["market_order", "get_market_price", "get_min_order_size"],
+)
+def test_rfq_availability_still_requires_common_capabilities(
+    tmp_path,
+    capability: str,
+) -> None:
+    """RFQ 也必须失败关闭缺失的公共交易能力。"""
+    api = _api()
+    rfq = _RfqAdapter()
+    setattr(rfq, capability, None)
+    _, strategy, _, _ = _build_strategy(tmp_path, extended=rfq)
+    limits = api._OrderLimits(Decimal("0.001"), Decimal("0.001"))
+
+    available = asyncio.run(strategy._check_hedge_available(limits))
+
+    assert available is False
+    assert strategy.hedge_interlock_active is True
+    assert capability in strategy.hedge_interlock_reason
+
+
+def test_mixed_execution_models_submit_both_legs_concurrently(tmp_path) -> None:
+    """RFQ 与订单簿两腿用事件栅栏证明仍在同一节拍并发提交。"""
+
+    async def scenario() -> tuple[object, object, _RfqAdapter, _LighterAdapter]:
+        rfq_started = asyncio.Event()
+        orderbook_started = asyncio.Event()
+
+        class ConcurrentRfqAdapter(_RfqAdapter):
+            async def market_order(
+                self,
+                market: str,
+                side: Side,
+                amount: Decimal,
+                *,
+                reduce_only: bool = False,
+            ):
+                rfq_started.set()
+                await orderbook_started.wait()
+                return await super().market_order(
+                    market,
+                    side,
+                    amount,
+                    reduce_only=reduce_only,
+                )
+
+        class ConcurrentOrderbookAdapter(_LighterAdapter):
+            async def place_limit_order(
+                self,
+                market: str,
+                side: Side,
+                amount: Decimal,
+                price: Decimal,
+                *,
+                post_only: bool = True,
+                reduce_only: bool = False,
+            ):
+                orderbook_started.set()
+                await rfq_started.wait()
+                return await super().place_limit_order(
+                    market,
+                    side,
+                    amount,
+                    price,
+                    post_only=post_only,
+                    reduce_only=reduce_only,
+                )
+
+        rfq = ConcurrentRfqAdapter("variational")
+        orderbook = ConcurrentOrderbookAdapter("lighter")
+        _, strategy, _, _ = _build_strategy(
+            tmp_path,
+            lighter=rfq,
+            extended=orderbook,
+            maker_timeout_s=0.1,
+        )
+        results = await asyncio.wait_for(
+            strategy._execute_pair(
+                Decimal("1"),
+                Decimal("-1"),
+                reduce_only=False,
+            ),
+            timeout=0.5,
+        )
+        return results[0], results[1], rfq, orderbook
+
+    rfq_result, orderbook_result, rfq, orderbook = asyncio.run(scenario())
+
+    assert isinstance(rfq_result, HedgeFillResult)
+    assert isinstance(orderbook_result, HedgeFillResult)
+    assert rfq_result.used_taker is True
+    assert orderbook_result.used_taker is False
+    assert [event[0] for event in rfq.events] == ["market"]
+    assert [event[0] for event in orderbook.events] == ["limit"]
+    assert rfq.position == -orderbook.position == Decimal("1")
 
 
 def test_restart_before_due_does_not_open_again(tmp_path) -> None:

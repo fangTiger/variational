@@ -179,6 +179,39 @@ class _AdapterWithoutOrderLookup:
         return _Response(_Order("M1", filled=amount, status="FILLED"))
 
 
+class _RfqAdapter:
+    """不提供限价单能力的 RFQ 假适配器。"""
+
+    execution_model = "rfq"
+
+    def __init__(self, *, market_error: Exception | None = None) -> None:
+        self.market_error = market_error
+        self.market_price_reads = 0
+        self.position_reads = 0
+        self.market_orders: list[dict] = []
+
+    async def get_market_price(self, market):
+        self.market_price_reads += 1
+        return MarketPrice(market, bid=Decimal("60000"), ask=Decimal("60001"))
+
+    async def get_position(self, market):
+        self.position_reads += 1
+        return Position(market, Decimal("0"))
+
+    async def market_order(self, market, side, amount, *, reduce_only=False):
+        self.market_orders.append(
+            {
+                "market": market,
+                "side": side,
+                "amount": amount,
+                "reduce_only": reduce_only,
+            }
+        )
+        if self.market_error is not None:
+            raise self.market_error
+        return _Response(_Order("R1", filled=amount, status="FILLED"))
+
+
 def _signature_shape(method):
     """只比较调用契约，不要求测试桩复制生产类型注解。"""
     return [
@@ -253,6 +286,53 @@ def test_full_maker_fill_avoids_taker():
     assert adapter.market_orders == []
     assert result.used_taker is False
     assert result.filled == Decimal("1")
+
+
+def test_missing_execution_model_keeps_orderbook_maker_path():
+    """未声明执行模型的旧适配器继续走订单簿 maker 路径。"""
+    adapter = _Adapter(fill_sequence=[Decimal("1")])
+    assert not hasattr(adapter, "execution_model")
+
+    result = _run(adapter, delta=Decimal("-1"))
+
+    assert len(adapter.limit_orders) == 1
+    assert adapter.market_orders == []
+    assert result.used_taker is False
+
+
+def test_rfq_without_limit_order_executes_market_without_extra_quote():
+    """RFQ 应直接市价成交，不得额外询价或读取持仓。"""
+    adapter = _RfqAdapter()
+
+    result = _run(adapter, delta=Decimal("1"), reduce_only=True)
+
+    assert adapter.market_price_reads == 0
+    assert adapter.position_reads == 0
+    assert adapter.market_orders == [
+        {
+            "market": "BTC-USD",
+            "side": Side.BUY,
+            "amount": Decimal("1"),
+            "reduce_only": True,
+        }
+    ]
+    assert result == HedgeFillResult(
+        filled=Decimal("1"),
+        used_taker=True,
+        note="RFQ 执行模型，已直接市价成交",
+    )
+
+
+def test_rfq_market_failure_is_propagated_without_extra_quote():
+    """RFQ 市价失败必须原样暴露，测试桩不得把失败伪装成成交。"""
+    adapter = _RfqAdapter(market_error=RuntimeError("RFQ 接受报价失败"))
+
+    with pytest.raises(RuntimeError, match="RFQ 接受报价失败"):
+        _run(adapter, delta=Decimal("1"))
+
+    assert adapter.market_price_reads == 0
+    assert adapter.position_reads == 0
+    assert len(adapter.market_orders) == 1
 
 
 @pytest.mark.parametrize(

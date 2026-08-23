@@ -1,14 +1,14 @@
 ## 1. 适配器能力声明
-- [ ] 1.1 `adapters/base.py` 增加 `execution_model` 属性,默认 `"orderbook"`
-- [ ] 1.2 `VariationalClient` 声明 `execution_model = "rfq"`
-- [ ] 1.3 实现 `VariationalClient.get_min_order_size`(先写失败测试:未实现时策略应拒绝启动而非静默下 0 单)
-- [ ] 1.4 实现 `VariationalClient.round_amount`,按 Variational 的 qty 精度对齐
+- [x] 1.1 `adapters/base.py` 增加 `execution_model` 属性,默认 `"orderbook"`
+- [x] 1.2 `VariationalClient` 声明 `execution_model = "rfq"`
+- [x] 1.3 实现 `VariationalClient.get_min_order_size`(先写失败测试:未实现时策略应拒绝启动而非静默下 0 单)
+- [x] 1.4 实现 `VariationalClient.round_amount`,按 Variational 的 qty 精度对齐
 
 ## 2. 执行路径分流
-- [ ] 2.1 先写失败测试:RFQ 适配器(无 `place_limit_order`)走 `maker_first_hedge` 应抛 AttributeError —— 复现当前 bug
-- [ ] 2.2 `engine/hedge_engine.py` 增加 RFQ 分支,直接 `market_order` 并返回 `used_taker=True`
-- [ ] 2.3 `_check_hedge_available` 的能力清单按 `execution_model` 区分
-- [ ] 2.4 验证两腿模型不同时仍并发提交(不得退化为串行)
+- [x] 2.1 先写失败测试:RFQ 适配器(无 `place_limit_order`)走 `maker_first_hedge` 应抛 AttributeError —— 复现当前 bug
+- [x] 2.2 `engine/hedge_engine.py` 增加 RFQ 分支,直接 `market_order` 并返回 `used_taker=True`
+- [x] 2.3 `_check_hedge_available` 的能力清单按 `execution_model` 区分
+- [x] 2.4 验证两腿模型不同时仍并发提交(不得退化为串行)
 
 ## 3. 认证自愈
 - [ ] 3.1 先写失败测试:主腿抛认证异常时,当前实现会让整轮崩溃

@@ -75,8 +75,14 @@ def test_lighter_mm_plist_arguments_pass_startup_validation(monkeypatch) -> None
     run_lighter_mm.validate_args(parsed)
 
 
-def test_readme_lists_lighter_mm_as_live_system() -> None:
-    """防止实盘做市服务漏出系统清单，导致运维人员忽略其常驻状态。"""
+def test_readme_lists_lighter_mm_with_status() -> None:
+    """做市服务必须出现在系统清单里，且状态标注与真实运行状态一致。
+
+    做市已于 2026-08-23 停用（被定时定量对冲取代，launchd 中已无常驻任务）。
+    这条测试原先硬断言「实盘运行中」，停用后反而会把正确的 README 判成错的，
+    因此改为断言标注了明确状态——防的是「漏出清单」和「状态没人维护」，
+    而不是锁死某一个具体状态。
+    """
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     system_row = next(
         (line for line in readme.splitlines() if "tools/run_lighter_mm.py" in line),
@@ -85,4 +91,4 @@ def test_readme_lists_lighter_mm_as_live_system() -> None:
 
     assert "Lighter 做市" in system_row
     assert "Lighter" in system_row
-    assert "实盘运行中" in system_row
+    assert "实盘运行中" in system_row or "已停用" in system_row

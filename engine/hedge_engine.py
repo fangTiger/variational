@@ -430,6 +430,19 @@ async def maker_first_hedge(
     side = Side.BUY if target_delta > 0 else Side.SELL
     amount = abs(target_delta)
 
+    if getattr(adapter, "execution_model", "orderbook") == "rfq":
+        await adapter.market_order(
+            market,
+            side,
+            amount,
+            reduce_only=reduce_only,
+        )
+        return HedgeFillResult(
+            filled=amount,
+            used_taker=True,
+            note="RFQ 执行模型，已直接市价成交",
+        )
+
     # 挂在本方最优价：卖挂 ask、买挂 bid。挂在对手价会立即成交，
     # 从而被 post_only 拒绝。
     quote = await adapter.get_market_price(market)

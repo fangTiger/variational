@@ -14,7 +14,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,19 @@ class VariationalAuthError(Exception):
 
 class VariationalJurisdictionError(Exception):
     """当前 IP 所在地区被禁止执行该操作（下单等）。读取不受影响。"""
+
+
+@dataclass(frozen=True)
+class _QuantityLimits:
+    """某标的某方向的下单数量约束。
+
+    对应报价响应里的 ``qty_limits.bid`` / ``qty_limits.ask``。
+    三项都可能缺失：minimum 缺失必须拒绝交易，另外两项缺失只是降级。
+    """
+
+    minimum: Decimal | None
+    maximum: Decimal | None
+    step: Decimal | None
 
 
 class VariationalRequestError(Exception):
@@ -104,6 +117,7 @@ class VariationalClient(ExchangeAdapter):
     """基于捕获会话 Cookie 的 Omni 私有 API 客户端（异步）。"""
 
     name = "variational"
+    execution_model = "rfq"
 
     def __init__(
         self,
@@ -119,6 +133,8 @@ class VariationalClient(ExchangeAdapter):
         # 市价单最大滑点（f64 数字，分数：0.01=1%）。accept 按 quote_id 锁价成交，实际滑点≈0。
         self._max_slippage = float(os.getenv("VARIATIONAL_MAX_SLIPPAGE") or "0.01")
         self._timeout = timeout
+        # 按 (market, side) 缓存数量约束：读取一次要打一发真实 RFQ 询价。
+        self._quantity_limits: dict[tuple[str, str | None], "_QuantityLimits"] = {}
         self._headers = {
             "user-agent": session.user_agent or USER_AGENT,
             "content-type": "application/json",
@@ -223,6 +239,118 @@ class VariationalClient(ExchangeAdapter):
         return await self._get("/metadata/supported_assets")
 
     # ---- 统一接口实现 ----
+
+    @staticmethod
+    def _decimal_or_none(value: Any) -> Decimal | None:
+        """把元数据字段解析成正数 Decimal；缺失、非法或非正数一律返回 None。"""
+        if value in (None, ""):
+            return None
+        try:
+            parsed = Decimal(str(value))
+        except (ArithmeticError, ValueError):
+            return None
+        if not parsed.is_finite() or parsed <= 0:
+            return None
+        return parsed
+
+    async def _get_quantity_limits(
+        self,
+        market: str,
+        side: Side | None = None,
+    ) -> _QuantityLimits:
+        """读取并缓存某标的某方向的数量约束。
+
+        结构取自前端实现：``qty_limits.bid`` 与 ``qty_limits.ask`` 各自带
+        ``min_qty`` / ``max_qty`` / ``min_qty_tick``。前端按方向取值——
+        买单读 bid 侧、卖单读 ask 侧，本实现与之保持一致。
+
+        side 为 None 时（基类单参数契约的调用方）取两侧中**更严格**的组合：
+        最小量取较大者、步长取较大者、上限取较小者。宁可少下也不要超限。
+        """
+        cache_key = (market, side.value if side is not None else None)
+        if cache_key in self._quantity_limits:
+            return self._quantity_limits[cache_key]
+
+        # 询价本身是一次真实 RFQ 调用，因此按 (market, side) 缓存，进程内只打一次。
+        quote = await self.request_quote(market, "buy", Decimal("0.0001"))
+        quote_data = quote if isinstance(quote, dict) else {}
+        qty_limits = quote_data.get("qty_limits")
+        if not isinstance(qty_limits, dict):
+            limits = _QuantityLimits(None, None, None)
+            self._quantity_limits[cache_key] = limits
+            return limits
+
+        if side is Side.BUY:
+            wanted = ("bid",)
+        elif side is Side.SELL:
+            wanted = ("ask",)
+        else:
+            wanted = ("bid", "ask")
+
+        minimums: list[Decimal] = []
+        maximums: list[Decimal] = []
+        steps: list[Decimal] = []
+        for key in wanted:
+            entry = qty_limits.get(key)
+            if not isinstance(entry, dict):
+                continue
+            if (value := self._decimal_or_none(entry.get("min_qty"))) is not None:
+                minimums.append(value)
+            if (value := self._decimal_or_none(entry.get("max_qty"))) is not None:
+                maximums.append(value)
+            if (value := self._decimal_or_none(entry.get("min_qty_tick"))) is not None:
+                steps.append(value)
+
+        limits = _QuantityLimits(
+            minimum=max(minimums) if minimums else None,
+            maximum=min(maximums) if maximums else None,
+            step=max(steps) if steps else None,
+        )
+        self._quantity_limits[cache_key] = limits
+        return limits
+
+    async def get_min_order_size(
+        self, market: str, side: Side | None = None
+    ) -> Decimal:
+        """返回 RFQ 报价声明的最小下单量；未知时明确拒绝交易。
+
+        下限缺失必须失败关闭：不知道下限就可能提交低于门槛的单，
+        被拒后策略会误判成「已下单」，进而留下单边裸仓。绝不编造默认值。
+        """
+        limits = await self._get_quantity_limits(market, side)
+        if limits.minimum is None:
+            raise RuntimeError(
+                "Variational 报价未提供 qty_limits.min_qty，已拒绝按未知下限交易"
+            )
+        return limits.minimum
+
+    async def get_max_order_size(
+        self, market: str, side: Side | None = None
+    ) -> Decimal | None:
+        """返回单笔数量上限；未声明时返回 None 表示无上限。
+
+        与下限相反，上限缺失不影响安全，因此不抛异常。但调用方必须处理
+        非 None 的情况——本策略单边名义额较大，撞上上限会直接下不进单。
+        """
+        limits = await self._get_quantity_limits(market, side)
+        return limits.maximum
+
+    async def round_amount(
+        self, market: str, amount: Decimal, side: Side | None = None
+    ) -> Decimal:
+        """按 min_qty_tick 向下对齐；步长未知时保持基类行为原样返回。
+
+        向下取整而非四舍五入：宁可少下一个步长，也不要超过调用方算出的目标量。
+        """
+        normalized = Decimal(str(amount))
+        limits = await self._get_quantity_limits(market, side)
+        if limits.step is None:
+            # API 未提供数量精度时保持基类兼容行为，避免猜测步长导致错误数量。
+            return await super().round_amount(market, normalized)
+        aligned = (normalized / limits.step).to_integral_value(
+            rounding=ROUND_DOWN
+        ) * limits.step
+        return aligned
 
     @staticmethod
     def _position_matches_underlying(
