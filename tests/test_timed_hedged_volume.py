@@ -248,6 +248,8 @@ class _ScriptedExecutor:
             }
         )
         if error := plan.get("error"):
+            if isinstance(error, Exception):
+                raise error
             raise RuntimeError(str(error))
         reported = Decimal(str(plan.get("reported_fill", abs(target_delta))))
         return HedgeFillResult(filled=reported, used_taker=False)
@@ -304,6 +306,8 @@ def _build_strategy(
     initial_direction: str = "long",
     maker_timeout_s: float = 300.0,
     position_tolerance: Decimal = Decimal("0.000001"),
+    auth_error_types: tuple[type[Exception], ...] = (),
+    on_auth_error=None,
 ):
     api = _api()
     lighter = lighter or _LighterAdapter("lighter")
@@ -326,8 +330,144 @@ def _build_strategy(
         config,
         trade_executor=executor,
         hedge_available=hedge_available,
+        auth_error_types=auth_error_types,
+        on_auth_error=on_auth_error,
     )
     return api, strategy, lighter, extended
+
+
+def test_primary_auth_error_reloads_client_and_skips_round(tmp_path) -> None:
+    """3.1/3.2：主腿认证失效后重建客户端，本轮不得下单。"""
+
+    class TestAuthError(Exception):
+        """测试专用认证异常。"""
+
+    class ExpiredPrimary(_LighterAdapter):
+        async def get_position(self, market: str):
+            del market
+            raise TestAuthError("Cookie 已过期")
+
+    replacement = _LighterAdapter("lighter")
+    reload_calls = []
+
+    def reload_primary():
+        reload_calls.append(True)
+        return replacement
+
+    executor = _ScriptedExecutor()
+    _, strategy, _, extended = _build_strategy(
+        tmp_path,
+        lighter=ExpiredPrimary("lighter"),
+        extended=_ExtendedAdapter("extended"),
+        executor=executor,
+        auth_error_types=(TestAuthError,),
+        on_auth_error=reload_primary,
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "auth_reloaded"
+    assert reload_calls == [True]
+    assert strategy.primary is replacement
+    assert executor.calls == []
+    assert extended.position == 0
+
+
+def test_primary_auth_reload_still_failing_interlocks_open(tmp_path) -> None:
+    """3.3：重建后的主腿仍认证失败时必须互锁并告警。"""
+
+    class TestAuthError(Exception):
+        """测试专用认证异常。"""
+
+    class ExpiredPrimary(_LighterAdapter):
+        async def get_position(self, market: str):
+            del market
+            raise TestAuthError("Cookie 已过期")
+
+    async def reload_primary():
+        return ExpiredPrimary("lighter")
+
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=ExpiredPrimary("lighter"),
+        executor=executor,
+        auth_error_types=(TestAuthError,),
+        on_auth_error=reload_primary,
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "auth_reload_failed"
+    assert result.hedge_available is False
+    assert "认证重载失败" in result.interlock_reason
+    assert any("认证重载失败" in warning for warning in result.warnings)
+    assert executor.calls == []
+
+
+def test_primary_auth_error_from_minimum_query_also_reloads(tmp_path) -> None:
+    """3.2：主腿元数据查询的认证异常不得被包装成普通互锁。"""
+
+    class TestAuthError(Exception):
+        """测试专用认证异常。"""
+
+    primary = _LighterAdapter(
+        "lighter",
+        min_order_size_error=TestAuthError("数量约束认证失效"),
+    )
+    replacement = _LighterAdapter("lighter")
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=primary,
+        executor=_ScriptedExecutor(),
+        auth_error_types=(TestAuthError,),
+        on_auth_error=lambda: replacement,
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "auth_reloaded"
+    assert strategy.primary is replacement
+    assert "认证已重载" in result.interlock_reason
+
+
+def test_auth_failure_after_other_leg_fill_rolls_back_filled_leg(tmp_path) -> None:
+    """3.4：主腿认证拒绝而对冲腿成交时，即使重载失败也必须回滚对冲腿。"""
+
+    class TestAuthError(Exception):
+        """测试专用认证异常。"""
+
+    primary = _LighterAdapter("lighter")
+    hedge = _ExtendedAdapter("extended")
+    executor = _ScriptedExecutor(
+        {
+            "lighter": [
+                {"fraction": "0", "error": TestAuthError("下单认证失效")},
+            ],
+            "extended": [{}, {}],
+        }
+    )
+
+    def failed_reload():
+        raise TestAuthError("新 Cookie 仍失效")
+
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=primary,
+        extended=hedge,
+        executor=executor,
+        auth_error_types=(TestAuthError,),
+        on_auth_error=failed_reload,
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "auth_reload_failed"
+    assert primary.position == 0
+    assert hedge.position == 0
+    assert executor.calls[-1]["adapter"] == "extended"
+    assert executor.calls[-1]["target_delta"] == Decimal("20.000")
+    assert executor.calls[-1]["reduce_only"] is True
 
 
 def test_position_before_due_is_not_closed(tmp_path) -> None:

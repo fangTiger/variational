@@ -130,6 +130,7 @@ class TimedVolumeResult:
 TradeExecutor = Callable[..., Awaitable[HedgeFillResult]]
 AvailabilityCheck = Callable[[], bool | Awaitable[bool]]
 RandomInt = Callable[[int, int], int]
+AuthReload = Callable[[], object | Awaitable[object]]
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,8 @@ class TimedHedgedVolumeStrategy:
         trade_executor: TradeExecutor | None = None,
         hedge_available: AvailabilityCheck | None = None,
         random_int: RandomInt | None = None,
+        auth_error_types: tuple[type[Exception], ...] = (),
+        on_auth_error: AuthReload | None = None,
     ) -> None:
         self.primary = primary
         self.hedge = hedge
@@ -159,9 +162,12 @@ class TimedHedgedVolumeStrategy:
         self._trade_executor = trade_executor or maker_first_hedge
         self._availability_check = hedge_available
         self._random_int = random_int or random.randint
+        self._auth_error_types = tuple(auth_error_types)
+        self._on_auth_error = on_auth_error
         self.state = self._load_state()
         self.hedge_interlock_active = False
         self.hedge_interlock_reason = "尚未判定"
+        self._primary_auth_interlock_active = False
         self.hedge_tolerance: Decimal | None = None
         self._order_limits: _OrderLimits | None = None
 
@@ -272,6 +278,8 @@ class TimedHedgedVolumeStrategy:
         )
         try:
             if isinstance(primary_raw, Exception):
+                if self._is_auth_error(primary_raw):
+                    raise primary_raw
                 raise RuntimeError(f"Lighter 最小下单量查询失败：{primary_raw}")
             if isinstance(hedge_raw, Exception):
                 raise RuntimeError(f"Extended 最小下单量查询失败：{hedge_raw}")
@@ -442,6 +450,71 @@ class TimedHedgedVolumeStrategy:
         warnings.append(message)
         logger.warning(message)
 
+    def _is_auth_error(self, exc: Exception) -> bool:
+        """仅把显式注册的异常类型识别为主腿认证失效。"""
+        return bool(self._auth_error_types) and isinstance(
+            exc,
+            self._auth_error_types,
+        )
+
+    async def _try_reload_primary(self, warnings: list[str]) -> bool:
+        """重建并实读验证主腿；失败时保持认证互锁。"""
+        try:
+            if self._on_auth_error is None:
+                raise RuntimeError("未配置主腿认证重载回调")
+            replacement = self._on_auth_error()
+            if asyncio.iscoroutine(replacement):
+                replacement = await replacement
+            if replacement is None:
+                raise RuntimeError("主腿认证重载回调未返回客户端")
+            await replacement.get_position(self.config.primary_market)
+        except Exception as exc:  # noqa: BLE001 认证恢复必须失败关闭
+            self._primary_auth_interlock_active = True
+            self.hedge_interlock_active = True
+            self.hedge_interlock_reason = f"主腿认证重载失败，停止开新仓：{exc}"
+            self._warn(warnings, self.hedge_interlock_reason)
+            return False
+
+        self.primary = replacement
+        self._primary_auth_interlock_active = False
+        self.hedge_interlock_active = False
+        self.hedge_interlock_reason = "主腿认证已重载，本轮跳过"
+        self._warn(warnings, self.hedge_interlock_reason)
+        return True
+
+    async def _restore_leg_position(
+        self,
+        adapter,
+        market: str,
+        position_before: Decimal,
+        minimum: Decimal,
+        warnings: list[str],
+        label: str,
+    ) -> Decimal:
+        """认证失败时把已成交的另一腿恢复到提交前实仓。"""
+        current = Decimal(str((await adapter.get_position(market)).signed_size))
+        for _ in range(self.config.convergence_attempts):
+            delta = position_before - current
+            if delta == 0 or abs(delta) < minimum:
+                return current
+            reduce_only = position_before == 0 or abs(position_before) < abs(current)
+            try:
+                await self._execute(
+                    adapter,
+                    market,
+                    delta,
+                    reduce_only=reduce_only,
+                )
+            except Exception as exc:  # noqa: BLE001 回滚按实仓重试
+                self._warn(warnings, f"{label} 认证事故回滚失败，将按实仓重试：{exc}")
+            current = Decimal(str((await adapter.get_position(market)).signed_size))
+        if abs(position_before - current) >= minimum:
+            self._warn(
+                warnings,
+                f"{label} 认证事故回滚多次后仍未恢复提交前实仓",
+            )
+        return current
+
     async def _flatten_all(
         self,
         warnings: list[str],
@@ -476,29 +549,66 @@ class TimedHedgedVolumeStrategy:
                 hedge_dust_warned = True
             if primary_flat and hedge_flat:
                 return primary_size, hedge_size
-            calls = []
+            calls: list[tuple[str, Awaitable[HedgeFillResult]]] = []
             if not primary_flat:
                 calls.append(
-                    self._execute(
-                        self.primary,
-                        self.config.primary_market,
-                        -primary_size,
-                        reduce_only=True,
+                    (
+                        "primary",
+                        self._execute(
+                            self.primary,
+                            self.config.primary_market,
+                            -primary_size,
+                            reduce_only=True,
+                        ),
                     )
                 )
             if not hedge_flat:
                 calls.append(
-                    self._execute(
-                        self.hedge,
-                        self.config.hedge_market,
-                        -hedge_size,
-                        reduce_only=True,
+                    (
+                        "hedge",
+                        self._execute(
+                            self.hedge,
+                            self.config.hedge_market,
+                            -hedge_size,
+                            reduce_only=True,
+                        ),
                     )
                 )
-            results = await asyncio.gather(*calls, return_exceptions=True)
-            for result in results:
+            results = await asyncio.gather(
+                *(call for _, call in calls),
+                return_exceptions=True,
+            )
+            labelled_results = list(zip((label for label, _ in calls), results))
+            primary_auth_error = next(
+                (
+                    result
+                    for label, result in labelled_results
+                    if label == "primary"
+                    and isinstance(result, Exception)
+                    and self._is_auth_error(result)
+                ),
+                None,
+            )
+            for _, result in labelled_results:
                 if isinstance(result, Exception):
                     self._warn(warnings, f"平仓执行失败，将按实际持仓重试：{result}")
+            if primary_auth_error is not None:
+                reloaded = await self._try_reload_primary(warnings)
+                if not reloaded:
+                    hedge_succeeded = any(
+                        label == "hedge" and not isinstance(result, Exception)
+                        for label, result in labelled_results
+                    )
+                    if hedge_succeeded:
+                        hedge_size = await self._restore_leg_position(
+                            self.hedge,
+                            self.config.hedge_market,
+                            hedge_size,
+                            limits.hedge_minimum,
+                            warnings,
+                            "对冲腿",
+                        )
+                    return primary_size, hedge_size
             primary_size, hedge_size = await self._read_positions()
 
         if self._is_neutral_pair(primary_size, hedge_size):
@@ -687,9 +797,47 @@ class TimedHedgedVolumeStrategy:
             hedge_target - hedge_before,
             reduce_only=False,
         )
+        primary_auth_error = (
+            outcomes[0]
+            if isinstance(outcomes[0], Exception)
+            and self._is_auth_error(outcomes[0])
+            else None
+        )
         for outcome in outcomes:
             if isinstance(outcome, Exception):
                 self._warn(warnings, f"同步开仓执行异常：{outcome}")
+
+        if primary_auth_error is not None:
+            reloaded = await self._try_reload_primary(warnings)
+            if not reloaded:
+                hedge_size = hedge_before
+                if not isinstance(outcomes[1], Exception):
+                    hedge_size = await self._restore_leg_position(
+                        self.hedge,
+                        self.config.hedge_market,
+                        hedge_before,
+                        limits.hedge_minimum,
+                        warnings,
+                        "对冲腿",
+                    )
+                flat = self._is_effectively_flat(
+                    primary_before,
+                    limits.primary_minimum,
+                ) and self._is_effectively_flat(
+                    hedge_size,
+                    limits.hedge_minimum,
+                )
+                if flat:
+                    self.state.current_notional_usd = None
+                    self._save_state()
+                return self._result(
+                    "auth_reload_failed"
+                    if flat
+                    else "convergence_failed",
+                    primary_before,
+                    hedge_size,
+                    warnings,
+                )
 
         primary_size, hedge_size = await self._read_positions()
         primary_flat = self._is_effectively_flat(
@@ -771,7 +919,13 @@ class TimedHedgedVolumeStrategy:
                 self.state.current_notional_usd = None
                 self._save_state()
             return self._result(
-                "open_failed_flat" if flat else "convergence_failed",
+                (
+                    "auth_reloaded"
+                    if flat and primary_auth_error is not None
+                    else "open_failed_flat"
+                    if flat
+                    else "convergence_failed"
+                ),
                 primary_size,
                 hedge_size,
                 warnings,
@@ -845,9 +999,25 @@ class TimedHedgedVolumeStrategy:
         """推进一次状态机；到期平仓与下一轮开仓分属相邻的无等待节拍。"""
         current_time = time.time() if now is None else float(now)
         warnings: list[str] = []
+        if self._primary_auth_interlock_active:
+            reloaded = await self._try_reload_primary(warnings)
+            return self._result(
+                "auth_reloaded" if reloaded else "auth_reload_failed",
+                None,
+                None,
+                warnings,
+            )
         try:
             primary_size, hedge_size = await self._read_positions()
         except Exception as exc:  # noqa: BLE001 持仓事实不完整时禁止任何交易
+            if self._is_auth_error(exc):
+                reloaded = await self._try_reload_primary(warnings)
+                return self._result(
+                    "auth_reloaded" if reloaded else "auth_reload_failed",
+                    None,
+                    None,
+                    warnings,
+                )
             self.hedge_interlock_active = True
             self.hedge_interlock_reason = f"两侧实际持仓读取失败：{exc}"
             self._warn(warnings, self.hedge_interlock_reason)
@@ -889,6 +1059,14 @@ class TimedHedgedVolumeStrategy:
                 return self._result("interlocked", primary_size, hedge_size, warnings)
             return await self._open_round(current_time, warnings, limits)
         except Exception as exc:  # noqa: BLE001 成交后事实未知时必须保持循环存活
+            if self._is_auth_error(exc):
+                reloaded = await self._try_reload_primary(warnings)
+                return self._result(
+                    "auth_reloaded" if reloaded else "auth_reload_failed",
+                    primary_size,
+                    hedge_size,
+                    warnings,
+                )
             self.hedge_interlock_active = True
             self.hedge_interlock_reason = f"策略执行后持仓事实未知：{exc}"
             self._warn(warnings, self.hedge_interlock_reason)

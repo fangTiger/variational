@@ -12,9 +12,11 @@ ensure_ssl_cert()
 
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
+import fcntl  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import time  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Callable  # noqa: E402
@@ -22,6 +24,11 @@ from typing import Callable  # noqa: E402
 from adapters.extended_client import ExtendedClient  # noqa: E402
 from adapters.hyperliquid_client import HyperliquidClient  # noqa: E402
 from adapters.lighter_client import LighterClient  # noqa: E402
+from adapters.variational_client import (  # noqa: E402
+    Session,
+    VariationalAuthError,
+    VariationalClient,
+)
 from infra.logger import get_logger  # noqa: E402
 from timed_volume.strategy import (  # noqa: E402
     RoundDirection,
@@ -40,13 +47,13 @@ _DEFAULT_HEARTBEAT = _ROOT / "data" / "timed_volume.jsonl"
 
 def build_parser() -> argparse.ArgumentParser:
     """构建定时定量策略命令行参数。"""
-    parser = argparse.ArgumentParser(description="Lighter 与 Extended 定时定量对冲刷量")
+    parser = argparse.ArgumentParser(description="跨交易所定时定量对冲刷量")
     parser.add_argument(
         "--live",
         action="store_true",
         help="真实连接并下单；默认只打印离线配置摘要",
     )
-    parser.add_argument("--market", default="BTC", help="Lighter 标的（默认 BTC）")
+    parser.add_argument("--market", default="BTC", help="主腿标的（默认 BTC）")
     parser.add_argument(
         "--hedge-market",
         default="BTC-USD",
@@ -119,6 +126,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Lighter L1 地址（默认读取 LIGHTER_RH_L1_ADDRESS）",
     )
     parser.add_argument(
+        "--primary-venue",
+        choices=("lighter", "variational"),
+        default="lighter",
+        help="主腿交易所（默认 lighter）",
+    )
+    parser.add_argument(
         "--account",
         default="X10_HEDGE",
         help="Extended 环境变量前缀（默认 X10_HEDGE，仅 --hedge-venue=extended 时生效）",
@@ -129,14 +142,218 @@ def build_parser() -> argparse.ArgumentParser:
         default="extended",
         help="对冲腿交易所（默认 extended）",
     )
+    parser.add_argument(
+        "--hedge-env-prefix",
+        default="HYPERLIQUID",
+        help="Hyperliquid 环境变量前缀（默认 HYPERLIQUID）",
+    )
     return parser
+
+
+def _build_primary_client(args: argparse.Namespace):
+    """按 --primary-venue 装配可交易主腿。"""
+    if args.primary_venue == "variational":
+        return VariationalClient(Session.from_env())
+    if not str(args.lighter_address or "").strip():
+        raise RuntimeError("拒绝启动：缺少 Lighter L1 地址")
+    api_private_key = os.environ.get("LIGHTER_API_PRIVATE_KEY")
+    if not api_private_key:
+        raise RuntimeError("拒绝启动：缺少 LIGHTER_API_PRIVATE_KEY")
+    return LighterClient(
+        l1_address=args.lighter_address,
+        trading_enabled=True,
+        api_private_key=api_private_key,
+        api_key_index=int(os.environ.get("LIGHTER_API_KEY_INDEX", "255")),
+    )
 
 
 def _build_hedge_client(args: argparse.Namespace):
     """按 --hedge-venue 装配对冲腿；两者都以显式交易开关构造。"""
     if args.hedge_venue == "hyperliquid":
-        return HyperliquidClient.from_env(trading_enabled=True)
+        return HyperliquidClient.from_env(
+            prefix=args.hedge_env_prefix,
+            trading_enabled=True,
+        )
     return ExtendedClient.from_env(prefix=args.account)
+
+
+def _reload_variational_primary() -> VariationalClient:
+    """覆盖重读 .env 后重建 Variational 主腿。"""
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=True)
+    except ImportError:
+        pass
+    return VariationalClient(Session.from_env())
+
+
+def _primary_account_identity(args: argparse.Namespace) -> str | None:
+    """从离线配置解析主腿公开账户标识。"""
+    if args.primary_venue == "variational":
+        return os.environ.get("VARIATIONAL_WALLET_ADDRESS") or None
+    return str(args.lighter_address).strip() if args.lighter_address else None
+
+
+def _hedge_account_identity(args: argparse.Namespace) -> str | None:
+    """从离线配置解析对冲腿公开账户标识。"""
+    if args.hedge_venue == "hyperliquid":
+        return os.environ.get(f"{args.hedge_env_prefix}_ACCOUNT_ADDRESS") or None
+    public_key = os.environ.get(f"{args.account}_PUBLIC_KEY")
+    vault_id = os.environ.get(f"{args.account}_VAULT_ID")
+    return public_key or (f"vault:{vault_id}" if vault_id else None)
+
+
+def _mask_account(account: str | None) -> str:
+    """脱敏公开账户，仅保留首尾各四位。"""
+    normalized = str(account or "").strip()
+    if not normalized:
+        return "未配置"
+    if len(normalized) <= 8:
+        return "****"
+    return f"{normalized[:4]}…{normalized[-4:]}"
+
+
+def _validate_account_pair(
+    *,
+    primary_venue: str,
+    primary_account: str | None,
+    primary_market: str,
+    hedge_venue: str,
+    hedge_account: str | None,
+    hedge_market: str,
+) -> None:
+    """拒绝同平台、同账户、同市场的自我对冲配置。"""
+    if primary_venue.casefold() != hedge_venue.casefold():
+        return
+    if not primary_account or not hedge_account:
+        raise RuntimeError("拒绝启动：同平台双腿缺少账户标识，无法完成账户隔离校验")
+    same_account = primary_account.strip().casefold() == hedge_account.strip().casefold()
+    same_market = primary_market.strip().casefold() == hedge_market.strip().casefold()
+    if same_account and same_market:
+        raise RuntimeError(
+            "拒绝启动：主腿与对冲腿使用同一交易所账户的同一市场，"
+            "会造成持仓互相冲销；请改用独立账户凭据"
+        )
+
+
+def _validate_account_isolation(args: argparse.Namespace) -> None:
+    """使用命令行与环境变量完成联网前账户隔离校验。"""
+    _validate_account_pair(
+        primary_venue=args.primary_venue,
+        primary_account=_primary_account_identity(args),
+        primary_market=args.market,
+        hedge_venue=args.hedge_venue,
+        hedge_account=_hedge_account_identity(args),
+        hedge_market=args.hedge_market,
+    )
+
+
+def _state_lock_path(state_path: Path | str) -> Path:
+    """返回状态文件对应的进程锁路径。"""
+    path = Path(state_path)
+    return path.with_name(f"{path.name}.lock")
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """检查进程是否仍存在；权限不足时按存活处理。"""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+@dataclass
+class _StatePathLease:
+    """持有状态文件的进程级排他租约。"""
+
+    lock_path: Path
+    descriptor: int
+    owner_token: str
+
+    def release(self) -> None:
+        """仅释放当前实例持有的锁与锁文件。"""
+        if self.descriptor < 0:
+            return
+        try:
+            os.lseek(self.descriptor, 0, os.SEEK_SET)
+            raw = os.read(self.descriptor, 4096).decode("utf-8")
+            payload = json.loads(raw)
+            if payload.get("owner_token") == self.owner_token:
+                self.lock_path.unlink(missing_ok=True)
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError) as exc:
+            logger.error("状态文件锁清理失败：%s", exc)
+        finally:
+            try:
+                fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(self.descriptor)
+                self.descriptor = -1
+
+
+def _acquire_state_path_lease(state_path: Path | str) -> _StatePathLease:
+    """非阻塞占用状态路径，并记录持有者 PID 与启动时间。"""
+    lock_path = _state_lock_path(state_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                owner = json.loads(os.read(descriptor, 4096).decode("utf-8"))
+                owner_pid = int(owner.get("pid"))
+            except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+                owner_pid = -1
+            raise RuntimeError(
+                f"拒绝启动：状态文件 {Path(state_path)} 正在被 PID "
+                f"{owner_pid if owner_pid > 0 else '未知'} 的实例占用"
+            ) from exc
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        raw = os.read(descriptor, 4096)
+        if raw:
+            try:
+                existing = json.loads(raw.decode("utf-8"))
+                existing_pid = int(existing.get("pid"))
+            except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"拒绝启动：状态文件锁 {lock_path} 内容损坏，无法确认持有者"
+                ) from exc
+            if existing_pid != os.getpid() and _pid_is_alive(existing_pid):
+                raise RuntimeError(
+                    f"拒绝启动：状态文件 {Path(state_path)} 正在被 PID "
+                    f"{existing_pid} 的实例占用"
+                )
+
+        started_at = time.time()
+        owner_token = f"{os.getpid()}:{time.time_ns()}"
+        payload = {
+            "pid": os.getpid(),
+            "started_at": started_at,
+            "owner_token": owner_token,
+            "state_path": str(Path(state_path).resolve()),
+        }
+        encoded = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.write(descriptor, encoded)
+        os.fsync(descriptor)
+        return _StatePathLease(lock_path, descriptor, owner_token)
+    except Exception:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+        raise
 
 
 def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
@@ -170,6 +387,8 @@ def startup_summary(
     )
     lines = [
         "定时定量对冲配置",
+        f"主腿：{args.primary_venue}，账户：{_mask_account(_primary_account_identity(args))}",
+        f"对冲腿：{args.hedge_venue}，账户：{_mask_account(_hedge_account_identity(args))}",
         f"标的：{args.market} → {args.hedge_market}",
         f"周期：{args.cycle_hours:g} 小时",
         f"单边名义额区间：{args.notional_min}~{args.notional_max} USD",
@@ -252,6 +471,7 @@ async def run_loop(
             "execution_uncertain",
             "convergence_failed",
             "close_failed_neutral",
+            "auth_reload_failed",
         }
         hedge_tolerance = getattr(
             strategy,
@@ -275,22 +495,26 @@ async def run(args: argparse.Namespace) -> None:
     if not args.live:
         print(startup_summary(args, TimedVolumeState()))
         return
-    if not str(args.lighter_address or "").strip():
-        raise RuntimeError("拒绝启动：缺少 Lighter L1 地址")
-    api_private_key = os.environ.get("LIGHTER_API_PRIVATE_KEY")
-    if not api_private_key:
-        raise RuntimeError("拒绝启动：缺少 LIGHTER_API_PRIVATE_KEY")
-
-    primary = LighterClient(
-        l1_address=args.lighter_address,
-        trading_enabled=True,
-        api_private_key=api_private_key,
-        api_key_index=int(os.environ.get("LIGHTER_API_KEY_INDEX", "255")),
-    )
-    hedge = _build_hedge_client(args)
+    _validate_account_isolation(args)
+    state_lease = _acquire_state_path_lease(config.state_path)
+    primary = None
+    hedge = None
     try:
+        primary = _build_primary_client(args)
+        hedge = _build_hedge_client(args)
         await asyncio.gather(primary.connect(), hedge.connect())
-        strategy = TimedHedgedVolumeStrategy(primary, hedge, config)
+        strategy_kwargs = {}
+        if args.primary_venue == "variational":
+            strategy_kwargs = {
+                "auth_error_types": (VariationalAuthError,),
+                "on_auth_error": _reload_variational_primary,
+            }
+        strategy = TimedHedgedVolumeStrategy(
+            primary,
+            hedge,
+            config,
+            **strategy_kwargs,
+        )
         summary = startup_summary(args, strategy.state)
         print(summary)
         logger.info("定时定量对冲启动\n%s", summary)
@@ -300,14 +524,16 @@ async def run(args: argparse.Namespace) -> None:
             heartbeat_path=args.heartbeat_path,
         )
     finally:
-        results = await asyncio.gather(
-            primary.close(),
-            hedge.close(),
-            return_exceptions=True,
-        )
+        close_calls = [
+            client.close()
+            for client in (primary, hedge)
+            if client is not None
+        ]
+        results = await asyncio.gather(*close_calls, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):
                 logger.error("关闭交易客户端失败：%s", result)
+        state_lease.release()
 
 
 def main() -> None:

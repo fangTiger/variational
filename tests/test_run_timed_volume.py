@@ -5,8 +5,11 @@ from __future__ import annotations
 import importlib
 import asyncio
 import json
+import sys
 from decimal import Decimal
 from types import SimpleNamespace
+
+import pytest
 
 from timed_volume.strategy import (
     RoundDirection,
@@ -32,11 +35,168 @@ def test_parser_defaults_match_two_hour_randomized_notional_plan() -> None:
     assert args.notional_max == 2300
     assert args.initial_direction == "long"
     assert args.maker_timeout == 300.0
+    assert args.primary_venue == "lighter"
+    assert args.hedge_env_prefix == "HYPERLIQUID"
     assert config.cycle_seconds == 7200.0
     assert config.notional_min_usd == 2000
     assert config.notional_max_usd == 2300
     assert config.initial_direction is RoundDirection.LONG
     assert config.maker_timeout_s == 300.0
+
+
+def test_build_primary_client_supports_variational(monkeypatch) -> None:
+    """4.1：显式选择 Variational 时用环境会话构造主腿。"""
+    cli = _cli()
+    session = object()
+    captured = {}
+
+    class FakeSession:
+        @classmethod
+        def from_env(cls):
+            return session
+
+    class FakeVariational:
+        def __init__(self, received_session):
+            captured["session"] = received_session
+
+    monkeypatch.setattr(cli, "Session", FakeSession)
+    monkeypatch.setattr(cli, "VariationalClient", FakeVariational)
+    args = cli.build_parser().parse_args(["--primary-venue", "variational"])
+
+    client = cli._build_primary_client(args)
+
+    assert isinstance(client, FakeVariational)
+    assert captured["session"] is session
+
+
+def test_build_hyperliquid_hedge_uses_selected_env_prefix(monkeypatch) -> None:
+    """4.2：Hyperliquid 对冲腿必须读取显式的第二账户前缀。"""
+    cli = _cli()
+    captured = {}
+
+    class FakeHyperliquid:
+        @classmethod
+        def from_env(cls, prefix, *, trading_enabled):
+            captured["prefix"] = prefix
+            captured["trading_enabled"] = trading_enabled
+            return object()
+
+    monkeypatch.setattr(cli, "HyperliquidClient", FakeHyperliquid)
+    args = cli.build_parser().parse_args(
+        [
+            "--hedge-venue",
+            "hyperliquid",
+            "--hedge-env-prefix",
+            "HYPERLIQUID_VAR",
+        ]
+    )
+
+    cli._build_hedge_client(args)
+
+    assert captured == {
+        "prefix": "HYPERLIQUID_VAR",
+        "trading_enabled": True,
+    }
+
+
+def test_same_venue_account_and_market_are_rejected() -> None:
+    """4.3：同平台、同账户、同市场的双腿配置必须失败关闭。"""
+    cli = _cli()
+
+    with pytest.raises(RuntimeError, match="同一交易所账户.*同一市场"):
+        cli._validate_account_pair(
+            primary_venue="hyperliquid",
+            primary_account="0xABC",
+            primary_market="BTC",
+            hedge_venue="hyperliquid",
+            hedge_account="0xabc",
+            hedge_market="btc",
+        )
+
+
+def test_cross_venue_same_account_text_is_allowed() -> None:
+    """4.3：跨平台账户文本相同不代表共用交易账户。"""
+    cli = _cli()
+
+    cli._validate_account_pair(
+        primary_venue="variational",
+        primary_account="0xabc",
+        primary_market="BTC",
+        hedge_venue="hyperliquid",
+        hedge_account="0xabc",
+        hedge_market="BTC",
+    )
+
+
+def test_running_process_state_lock_rejects_second_instance(tmp_path) -> None:
+    """4.4：同一状态文件被存活进程占用时，第二实例必须拒绝启动。"""
+    cli = _cli()
+    state_path = tmp_path / "state.json"
+    first = cli._acquire_state_path_lease(state_path)
+    try:
+        with pytest.raises(RuntimeError, match="状态文件.*正在被 PID"):
+            cli._acquire_state_path_lease(state_path)
+    finally:
+        first.release()
+
+    second = cli._acquire_state_path_lease(state_path)
+    second.release()
+
+
+def test_stale_state_lock_is_reclaimed(tmp_path) -> None:
+    """4.4：已退出进程遗留的锁不得永久阻塞状态文件。"""
+    cli = _cli()
+    state_path = tmp_path / "state.json"
+    lock_path = cli._state_lock_path(state_path)
+    lock_path.write_text(
+        json.dumps({"pid": 99999999, "started_at": 1.0}),
+        encoding="utf-8",
+    )
+
+    lease = cli._acquire_state_path_lease(state_path)
+
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["pid"] != 99999999
+    lease.release()
+
+
+def test_dry_run_summary_masks_accounts_and_prints_instance_boundaries(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """4.5：离线摘要打印两腿、脱敏账户、状态路径、金额与周期。"""
+    cli = _cli()
+    monkeypatch.setenv("VARIATIONAL_WALLET_ADDRESS", "0x1234567890abcdef")
+    monkeypatch.setenv(
+        "HYPERLIQUID_VAR_ACCOUNT_ADDRESS",
+        "0xfedcba0987654321",
+    )
+    state_path = tmp_path / "var-state.json"
+    args = cli.build_parser().parse_args(
+        [
+            "--primary-venue",
+            "variational",
+            "--hedge-venue",
+            "hyperliquid",
+            "--hedge-env-prefix",
+            "HYPERLIQUID_VAR",
+            "--state-path",
+            str(state_path),
+            "--notional-min",
+            "2100",
+            "--notional-max",
+            "2200",
+            "--cycle-hours",
+            "3",
+        ]
+    )
+
+    summary = cli.startup_summary(args, TimedVolumeState())
+
+    assert "主腿：variational，账户：0x12…cdef" in summary
+    assert "对冲腿：hyperliquid，账户：0xfe…4321" in summary
+    assert f"轮次状态：{state_path}" in summary
+    assert "单边名义额区间：2100~2200 USD" in summary
+    assert "周期：3 小时" in summary
 
 
 def test_startup_summary_contains_parameters_and_current_round() -> None:
@@ -252,10 +412,11 @@ def test_live_run_connects_both_clients_and_closes_them(monkeypatch, tmp_path) -
             self.closed = True
 
     class FakeStrategy:
-        def __init__(self, primary, hedge, config):
+        def __init__(self, primary, hedge, config, **kwargs):
             captured["primary"] = primary
             captured["hedge"] = hedge
             captured["config"] = config
+            captured["strategy_kwargs"] = kwargs
             self.state = TimedVolumeState()
 
     async def fake_run_loop(strategy, **kwargs):
@@ -288,6 +449,106 @@ def test_live_run_connects_both_clients_and_closes_them(monkeypatch, tmp_path) -
     assert captured["primary"].closed is True
     assert captured["extended"].closed is True
     assert captured["loop_kwargs"]["poll_interval"] == 30.0
+    assert captured["strategy_kwargs"] == {}
+
+
+def test_variational_live_run_wires_auth_reload_and_avoids_lighter_credentials(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """3.5/4.1：Variational 实盘装配认证自愈，且不依赖 Lighter 密钥。"""
+    cli = _cli()
+    captured = {"dotenv_overrides": []}
+
+    class FakeSession:
+        calls = 0
+
+        @classmethod
+        def from_env(cls):
+            cls.calls += 1
+            return SimpleNamespace(wallet_address="0xvariational")
+
+    class FakeVariational:
+        def __init__(self, session):
+            self.session = session
+            self.connected = False
+            self.closed = False
+
+        async def connect(self):
+            self.connected = True
+
+        async def close(self):
+            self.closed = True
+
+    class FakeHyperliquid:
+        def __init__(self):
+            self.connected = False
+            self.closed = False
+
+        @classmethod
+        def from_env(cls, prefix, *, trading_enabled):
+            captured["hedge_prefix"] = prefix
+            captured["hedge_trading_enabled"] = trading_enabled
+            return cls()
+
+        async def connect(self):
+            self.connected = True
+
+        async def close(self):
+            self.closed = True
+
+    class FakeStrategy:
+        def __init__(self, primary, hedge, config, **kwargs):
+            captured["strategy_primary"] = primary
+            captured["strategy_hedge"] = hedge
+            captured["strategy_kwargs"] = kwargs
+            self.state = TimedVolumeState()
+
+    async def fake_run_loop(strategy, **kwargs):
+        captured["loop_strategy"] = strategy
+        captured["loop_kwargs"] = kwargs
+
+    fake_dotenv = SimpleNamespace(
+        load_dotenv=lambda *, override=False: captured["dotenv_overrides"].append(
+            override
+        )
+    )
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    monkeypatch.setattr(cli, "Session", FakeSession)
+    monkeypatch.setattr(cli, "VariationalClient", FakeVariational)
+    monkeypatch.setattr(cli, "HyperliquidClient", FakeHyperliquid)
+    monkeypatch.setattr(cli, "TimedHedgedVolumeStrategy", FakeStrategy)
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+    monkeypatch.delenv("LIGHTER_API_PRIVATE_KEY", raising=False)
+    monkeypatch.setenv("VARIATIONAL_WALLET_ADDRESS", "0xvariational")
+    monkeypatch.setenv("HYPERLIQUID_VAR_ACCOUNT_ADDRESS", "0xhyperliquid")
+    args = cli.build_parser().parse_args(
+        [
+            "--live",
+            "--primary-venue",
+            "variational",
+            "--hedge-venue",
+            "hyperliquid",
+            "--hedge-env-prefix",
+            "HYPERLIQUID_VAR",
+            "--state-path",
+            str(tmp_path / "state.json"),
+            "--heartbeat-path",
+            str(tmp_path / "heartbeat.jsonl"),
+        ]
+    )
+
+    asyncio.run(cli.run(args))
+
+    kwargs = captured["strategy_kwargs"]
+    assert kwargs["auth_error_types"] == (cli.VariationalAuthError,)
+    replacement = kwargs["on_auth_error"]()
+    assert isinstance(replacement, FakeVariational)
+    assert captured["dotenv_overrides"] == [True]
+    assert FakeSession.calls == 2
+    assert captured["hedge_prefix"] == "HYPERLIQUID_VAR"
+    assert captured["strategy_primary"].connected is True
+    assert captured["strategy_hedge"].connected is True
 
 
 def test_run_loop_uses_emergency_retry_for_unknown_or_naked_state(

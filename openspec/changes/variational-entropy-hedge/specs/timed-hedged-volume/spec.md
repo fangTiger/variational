@@ -59,3 +59,23 @@
 - **WHEN** 通过 `--hedge-env-prefix HYPERLIQUID_VAR` 指定第二套凭据
 - **THEN** 系统 SHALL 从该前缀读取账户地址、代理私钥与 builder 配置
 - **AND** 两套策略的持仓读数 SHALL 互不干扰
+
+### Requirement: 运行实例隔离
+系统 SHALL 阻止两个仍在运行的定时定量策略共用同一个状态文件。
+
+#### Scenario: 状态文件已被运行中实例占用
+- **WHEN** 新实例指定的 `--state-path` 已由存活进程持有
+- **THEN** 系统 SHALL 在连接交易客户端前拒绝启动
+- **AND** 错误 SHALL 包含状态路径与持有者 PID
+
+#### Scenario: 前一实例已退出
+- **WHEN** 锁文件存在但对应实例已经退出
+- **THEN** 新实例 SHALL 能够接管该状态路径
+
+### Requirement: 离线实例摘要
+系统 SHALL 在 dry-run 摘要中打印两腿交易所、脱敏账户标识、状态文件路径、
+名义额区间与周期,供操作人员在实盘前核对实例隔离。
+
+#### Scenario: 账户标识脱敏
+- **WHEN** dry-run 能从参数或环境变量解析到账户标识
+- **THEN** 摘要 SHALL 仅显示账户标识首尾各四位

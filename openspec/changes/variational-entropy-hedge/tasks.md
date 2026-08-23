@@ -11,19 +11,20 @@
 - [x] 2.4 验证两腿模型不同时仍并发提交(不得退化为串行)
 
 ## 3. 认证自愈
-- [ ] 3.1 先写失败测试:主腿抛认证异常时,当前实现会让整轮崩溃
-- [ ] 3.2 `timed_volume` 增加 `auth_error_types` 与 `on_auth_error` 钩子
-- [ ] 3.3 重载失败时置互锁 + 告警,不得继续开仓
-- [ ] 3.4 测试:一腿成交后另一腿认证失效 → 必须回滚,不留单边仓
+- [x] 3.1 先写失败测试:主腿抛认证异常时,当前实现会让整轮崩溃
+- [x] 3.2 `timed_volume` 增加 `auth_error_types` 与 `on_auth_error` 钩子
+- [x] 3.3 重载失败时置互锁 + 告警,不得继续开仓
+- [x] 3.4 测试:一腿成交后另一腿认证失效 → 必须回滚,不留单边仓
 
 ## 4. 账户隔离
-- [ ] 4.1 `tools/run_timed_volume.py` 增加 `--primary-venue {lighter,variational}`
-- [ ] 4.2 增加 `--hedge-env-prefix`,默认 `HYPERLIQUID`
-- [ ] 4.3 启动校验:两腿账户地址不得相同(跨平台时天然不同,同平台必须拦)
-- [ ] 4.4 状态文件与日志按实例名隔离,避免两套策略互相覆写 `state.json`
+- [x] 4.1 `tools/run_timed_volume.py` 增加 `--primary-venue {lighter,variational}`
+- [x] 4.2 增加 `--hedge-env-prefix`,默认 `HYPERLIQUID`
+- [x] 4.3 启动校验:同平台、同账户且同市场时拒绝启动
+- [x] 4.4 状态文件增加 PID 与启动时间租约,拒绝运行中实例共用路径
+- [x] 4.5 dry-run 摘要打印两腿交易所、脱敏账户、状态路径、名义额区间与周期
 
 ## 5. 验证
-- [ ] 5.1 全量单测通过,且现有 Lighter×Entropy 路径行为零变化
-- [ ] 5.2 dry-run 打印两腿配置摘要,人工核对账户不同
+- [x] 5.1 全量单测通过,且现有 Lighter×Entropy 路径行为零变化
+- [x] 5.2 dry-run 打印两腿配置摘要,人工核对账户隔离配置
 - [ ] 5.3 小额实盘:单轮开仓 → 确认两侧净敞口 ≈ 0 → 平仓
 - [ ] 5.4 确认 Variational 成交计入积分、Entropy 成交带 `builderFee`
