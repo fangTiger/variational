@@ -20,19 +20,21 @@ def _cli():
     return importlib.import_module("tools.run_timed_volume")
 
 
-def test_parser_defaults_match_two_hour_two_thousand_plan() -> None:
-    """入口默认值就是已批准的 2 小时、2000 美元、首轮做多方案。"""
+def test_parser_defaults_match_two_hour_randomized_notional_plan() -> None:
+    """入口默认值就是已批准的 2 小时、2000~2300 美元方案。"""
     cli = _cli()
 
     args = cli.build_parser().parse_args([])
     config = cli.build_config(args)
 
     assert args.cycle_hours == 2.0
-    assert args.notional == Decimal("2000")
+    assert args.notional_min == 2000
+    assert args.notional_max == 2300
     assert args.initial_direction == "long"
     assert args.maker_timeout == 300.0
     assert config.cycle_seconds == 7200.0
-    assert config.notional_usd == Decimal("2000")
+    assert config.notional_min_usd == 2000
+    assert config.notional_max_usd == 2300
     assert config.initial_direction is RoundDirection.LONG
     assert config.maker_timeout_s == 300.0
 
@@ -44,8 +46,10 @@ def test_startup_summary_contains_parameters_and_current_round() -> None:
         [
             "--cycle-hours",
             "2",
-            "--notional",
-            "2000",
+            "--notional-min",
+            "2050",
+            "--notional-max",
+            "2250",
             "--initial-direction",
             "short",
             "--maker-timeout",
@@ -56,6 +60,7 @@ def test_startup_summary_contains_parameters_and_current_round() -> None:
         round_index=5,
         last_direction=RoundDirection.LONG,
         current_direction=RoundDirection.SHORT,
+        current_notional_usd=2179,
         opened_at=1000.0,
         due_at=8200.0,
     )
@@ -63,7 +68,8 @@ def test_startup_summary_contains_parameters_and_current_round() -> None:
     summary = cli.startup_summary(args, state)
 
     assert "周期：2 小时" in summary
-    assert "单边名义额：2000 USD" in summary
+    assert "单边名义额区间：2050~2250 USD" in summary
+    assert "当前轮名义额：2179 USD" in summary
     assert "初始方向：short" in summary
     assert "maker 优先等待：420 秒" in summary
     assert "当前轮次：5" in summary
@@ -84,6 +90,7 @@ def test_heartbeat_contains_round_direction_due_net_and_interlock() -> None:
         net_exposure=Decimal("0.01"),
         hedge_available=False,
         interlock_reason="Extended 侧不可用",
+        notional_usd=2179,
         warnings=("测试告警",),
     )
 
@@ -101,6 +108,7 @@ def test_heartbeat_contains_round_direction_due_net_and_interlock() -> None:
         "hedge_available": False,
         "hedge_interlock_active": True,
         "hedge_interlock_reason": "Extended 侧不可用",
+        "notional_usd": 2179,
         "warnings": ["测试告警"],
     }
 

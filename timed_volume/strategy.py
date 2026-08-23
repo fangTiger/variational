@@ -1,6 +1,6 @@
 """独立的定时定量双边对冲策略。
 
-本模块只使用固定时间与固定名义额语义，不依赖网格调度、网格库存或网格状态。
+本模块只使用固定时间与每轮名义额区间语义，不依赖网格调度、网格库存或网格状态。
 所有补单与回滚决策均在重读两侧实际持仓后计算，绝不相信委托量等于成交量。
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal
@@ -43,7 +44,8 @@ class TimedVolumeConfig:
 
     primary_market: str = "BTC"
     hedge_market: str = "BTC-USD"
-    notional_usd: Decimal = Decimal("2000")
+    notional_min_usd: int = 2000
+    notional_max_usd: int = 2300
     cycle_seconds: float = 7200.0
     initial_direction: RoundDirection = RoundDirection.LONG
     maker_timeout_s: float = 300.0
@@ -54,13 +56,22 @@ class TimedVolumeConfig:
 
     def __post_init__(self) -> None:
         """归一化配置并拒绝无法安全运行的数值。"""
-        self.notional_usd = Decimal(str(self.notional_usd))
+        self.notional_min_usd = self._normalize_notional_bound(
+            self.notional_min_usd,
+            "名义额下限",
+        )
+        self.notional_max_usd = self._normalize_notional_bound(
+            self.notional_max_usd,
+            "名义额上限",
+        )
         self.position_tolerance = Decimal(str(self.position_tolerance))
         self.state_path = Path(self.state_path)
         if not isinstance(self.initial_direction, RoundDirection):
             self.initial_direction = RoundDirection(str(self.initial_direction))
-        if self.notional_usd <= 0:
-            raise ValueError("单边名义额必须大于零")
+        if self.notional_min_usd <= 0 or self.notional_max_usd <= 0:
+            raise ValueError("单边名义额区间上下限必须大于零")
+        if self.notional_min_usd > self.notional_max_usd:
+            raise ValueError("单边名义额下限不得大于上限")
         if self.cycle_seconds <= 0:
             raise ValueError("轮次周期必须大于零")
         if self.maker_timeout_s < 0 or self.maker_poll_s < 0:
@@ -69,6 +80,17 @@ class TimedVolumeConfig:
             raise ValueError("持仓容差不得为负")
         if self.convergence_attempts <= 0:
             raise ValueError("收敛尝试次数必须大于零")
+
+    @staticmethod
+    def _normalize_notional_bound(value: object, label: str) -> int:
+        """把名义额边界归一化为整数美元，拒绝小数与非有限值。"""
+        try:
+            decimal_value = Decimal(str(value))
+        except (ArithmeticError, ValueError) as exc:
+            raise ValueError(f"{label}必须为整数美元") from exc
+        if not decimal_value.is_finite() or decimal_value != decimal_value.to_integral_value():
+            raise ValueError(f"{label}必须为整数美元")
+        return int(decimal_value)
 
 
 @dataclass
@@ -80,6 +102,7 @@ class TimedVolumeState:
     current_direction: RoundDirection | None = None
     opened_at: float | None = None
     due_at: float | None = None
+    current_notional_usd: int | None = None
 
     @property
     def is_open(self) -> bool:
@@ -101,10 +124,12 @@ class TimedVolumeResult:
     hedge_available: bool
     interlock_reason: str
     warnings: tuple[str, ...] = ()
+    notional_usd: int | None = None
 
 
 TradeExecutor = Callable[..., Awaitable[HedgeFillResult]]
 AvailabilityCheck = Callable[[], bool | Awaitable[bool]]
+RandomInt = Callable[[int, int], int]
 
 
 @dataclass(frozen=True)
@@ -116,7 +141,7 @@ class _OrderLimits:
 
 
 class TimedHedgedVolumeStrategy:
-    """用固定周期驱动 Lighter 与 Extended 在容差内反向开平仓。"""
+    """用固定周期与逐轮金额驱动两侧在容差内反向开平仓。"""
 
     def __init__(
         self,
@@ -126,12 +151,14 @@ class TimedHedgedVolumeStrategy:
         *,
         trade_executor: TradeExecutor | None = None,
         hedge_available: AvailabilityCheck | None = None,
+        random_int: RandomInt | None = None,
     ) -> None:
         self.primary = primary
         self.hedge = hedge
         self.config = config
         self._trade_executor = trade_executor or maker_first_hedge
         self._availability_check = hedge_available
+        self._random_int = random_int or random.randint
         self.state = self._load_state()
         self.hedge_interlock_active = False
         self.hedge_interlock_reason = "尚未判定"
@@ -154,10 +181,22 @@ class TimedHedgedVolumeStrategy:
         try:
             last_raw = raw.get("last_direction")
             current_raw = raw.get("current_direction")
+            current_notional_raw = raw.get("current_notional_usd")
+            current_notional = (
+                TimedVolumeConfig._normalize_notional_bound(
+                    current_notional_raw,
+                    "当前轮名义额",
+                )
+                if current_notional_raw is not None
+                else None
+            )
+            if current_notional is not None and current_notional <= 0:
+                raise ValueError("当前轮名义额必须大于零")
             return TimedVolumeState(
                 round_index=max(0, int(raw.get("round_index", 0))),
                 last_direction=RoundDirection(last_raw) if last_raw else None,
                 current_direction=RoundDirection(current_raw) if current_raw else None,
+                current_notional_usd=current_notional,
                 opened_at=(
                     float(raw["opened_at"])
                     if raw.get("opened_at") is not None
@@ -358,12 +397,13 @@ class TimedHedgedVolumeStrategy:
     async def _target_quantities(
         self,
         limits: _OrderLimits,
+        notional_usd: int,
     ) -> tuple[Decimal, Decimal]:
-        """按 Lighter 中间价计算并保留两侧各自可下单的舍入数量。"""
+        """按该轮金额和 Lighter 中间价计算两侧各自的舍入数量。"""
         quote = await self.primary.get_market_price(self.config.primary_market)
         if quote is None or Decimal(str(quote.mid)) <= 0:
-            raise RuntimeError("Lighter 盘口不可用，无法计算固定名义额数量")
-        raw = self.config.notional_usd / Decimal(str(quote.mid))
+            raise RuntimeError("Lighter 盘口不可用，无法计算该轮名义额数量")
+        raw = Decimal(notional_usd) / Decimal(str(quote.mid))
         primary_qty, hedge_qty = await asyncio.gather(
             self.primary.round_amount(self.config.primary_market, raw),
             self.hedge.round_amount(self.config.hedge_market, raw),
@@ -375,6 +415,24 @@ class TimedHedgedVolumeStrategy:
         if not hedge_qty.is_finite() or hedge_qty < limits.hedge_minimum:
             raise RuntimeError("配置名义额换算后的 Extended 数量低于最小下单量")
         return primary_qty, hedge_qty
+
+    def _current_or_sampled_notional(self) -> int:
+        """返回已持久化轮次金额；新轮次仅取值一次并立即落盘。"""
+        if self.state.current_notional_usd is not None:
+            return self.state.current_notional_usd
+        sampled = self._random_int(
+            self.config.notional_min_usd,
+            self.config.notional_max_usd,
+        )
+        normalized = TimedVolumeConfig._normalize_notional_bound(
+            sampled,
+            "随机名义额",
+        )
+        if not self.config.notional_min_usd <= normalized <= self.config.notional_max_usd:
+            raise ValueError("随机名义额必须落在配置闭区间内")
+        self.state.current_notional_usd = normalized
+        self._save_state()
+        return normalized
 
     def _warn(self, warnings: list[str], message: str) -> None:
         """记录中文告警并同步写入本轮结果。"""
@@ -498,6 +556,7 @@ class TimedHedgedVolumeStrategy:
                 )
                 self.state.last_direction = self.state.current_direction
                 self.state.current_direction = None
+                self.state.current_notional_usd = None
                 self.state.opened_at = None
                 self.state.due_at = None
                 self._save_state()
@@ -594,6 +653,7 @@ class TimedHedgedVolumeStrategy:
         ):
             self.state.last_direction = self.state.current_direction or self.state.last_direction
             self.state.current_direction = None
+            self.state.current_notional_usd = None
             self.state.opened_at = None
             self.state.due_at = None
             self._save_state()
@@ -611,7 +671,11 @@ class TimedHedgedVolumeStrategy:
             if self.state.last_direction is None
             else self.state.last_direction.opposite()
         )
-        primary_quantity, hedge_quantity = await self._target_quantities(limits)
+        notional_usd = self._current_or_sampled_notional()
+        primary_quantity, hedge_quantity = await self._target_quantities(
+            limits,
+            notional_usd,
+        )
         primary_target = direction.sign * primary_quantity
         hedge_target = -direction.sign * hedge_quantity
         primary_before, hedge_before = await self._read_positions()
@@ -700,6 +764,9 @@ class TimedHedgedVolumeStrategy:
             )
             if not flat:
                 self._warn(warnings, "开仓失败后的回滚未能归零，保持中性并等待重试")
+            else:
+                self.state.current_notional_usd = None
+                self._save_state()
             return self._result(
                 "open_failed_flat" if flat else "convergence_failed",
                 primary_size,
@@ -731,6 +798,7 @@ class TimedHedgedVolumeStrategy:
         if flat:
             self.state.last_direction = self.state.current_direction
             self.state.current_direction = None
+            self.state.current_notional_usd = None
             self.state.opened_at = None
             self.state.due_at = None
             self._save_state()
@@ -766,6 +834,7 @@ class TimedHedgedVolumeStrategy:
             net_exposure=net,
             hedge_available=not self.hedge_interlock_active,
             interlock_reason=self.hedge_interlock_reason,
+            notional_usd=self.state.current_notional_usd,
             warnings=tuple(warnings),
         )
 

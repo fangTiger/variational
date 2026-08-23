@@ -53,10 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Extended 标的（默认 BTC-USD）",
     )
     parser.add_argument(
-        "--notional",
-        type=Decimal,
-        default=Decimal("2000"),
-        help="每轮单边名义额 USD（默认 2000）",
+        "--notional-min",
+        type=int,
+        default=2000,
+        help="每轮单边名义额下限 USD（默认 2000）",
+    )
+    parser.add_argument(
+        "--notional-max",
+        type=int,
+        default=2300,
+        help="每轮单边名义额上限 USD（默认 2300）",
     )
     parser.add_argument(
         "--cycle-hours",
@@ -138,7 +144,8 @@ def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
     return TimedVolumeConfig(
         primary_market=args.market,
         hedge_market=args.hedge_market,
-        notional_usd=args.notional,
+        notional_min_usd=args.notional_min,
+        notional_max_usd=args.notional_max,
         cycle_seconds=args.cycle_hours * 3600.0,
         initial_direction=RoundDirection(args.initial_direction),
         maker_timeout_s=args.maker_timeout,
@@ -156,17 +163,23 @@ def startup_summary(
     current_direction = (
         state.current_direction.value if state.current_direction is not None else "无"
     )
+    current_notional = (
+        f"{state.current_notional_usd} USD"
+        if state.current_notional_usd is not None
+        else "无"
+    )
     lines = [
         "定时定量对冲配置",
         f"标的：{args.market} → {args.hedge_market}",
         f"周期：{args.cycle_hours:g} 小时",
-        f"单边名义额：{args.notional} USD",
+        f"单边名义额区间：{args.notional_min}~{args.notional_max} USD",
         f"初始方向：{args.initial_direction}",
         f"maker 优先等待：{args.maker_timeout:g} 秒",
         f"轮次状态：{args.state_path}",
         f"独立心跳：{args.heartbeat_path}",
         f"当前轮次：{state.round_index}",
         f"当前方向：{current_direction}",
+        f"当前轮名义额：{current_notional}",
         f"到期时刻：{state.due_at}",
         f"dry_run：{not args.live}",
     ]
@@ -195,6 +208,7 @@ def heartbeat_payload(
         "hedge_available": result.hedge_available,
         "hedge_interlock_active": not result.hedge_available,
         "hedge_interlock_reason": result.interlock_reason,
+        "notional_usd": result.notional_usd,
         "warnings": list(result.warnings),
     }
 

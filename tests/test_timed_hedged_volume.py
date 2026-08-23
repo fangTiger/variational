@@ -265,7 +265,8 @@ def _build_strategy(
     config = api.TimedVolumeConfig(
         primary_market="BTC",
         hedge_market="BTC-USD",
-        notional_usd=Decimal("2000"),
+        notional_min_usd=2000,
+        notional_max_usd=2000,
         cycle_seconds=7200.0,
         initial_direction=api.RoundDirection(initial_direction),
         maker_timeout_s=maker_timeout_s,
