@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from decimal import Decimal
+from pathlib import Path
 
 from tools import hedge_panel
 
@@ -162,6 +163,71 @@ def test_page_contains_no_automatic_refresh_code(tmp_path) -> None:
 
     assert 'meta http-equiv="refresh"' not in html
     assert "setInterval" not in html
+    assert "WebSocket" not in html
+    assert "fetch(" not in html
+
+
+def test_panel_source_keeps_zero_credential_boundary() -> None:
+    """面板只能读本地心跳，不得引入交易所连接或凭据加载能力。"""
+    source = Path(hedge_panel.__file__).read_text(encoding="utf-8").casefold()
+
+    for forbidden in ("getenv", "load_dotenv", "httpx", "requests", "私钥"):
+        assert forbidden not in source
+
+
+def test_each_leg_and_pair_render_signed_pnl_with_entries(tmp_path) -> None:
+    """单腿盈亏需分色，卡片内本对合计必须更醒目并解释正确口径。"""
+    instance = _write_instance(
+        tmp_path,
+        name="pnl",
+        heartbeat=_heartbeat(
+            primary_pnl="4.33",
+            hedge_pnl="-5.57",
+            primary_entry="77299.3",
+            hedge_entry="77301.1",
+            pair_pnl="-1.24",
+        ),
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert 'class="leg-pnl mono pnl-positive">+$4.33</' in html
+    assert 'class="leg-pnl mono pnl-negative">-$5.57</' in html
+    assert "入场 77299.3" in html
+    assert "入场 77301.1" in html
+    assert "本对盈亏" in html
+    assert 'class="pair-pnl-value mono pnl-negative">-$1.24</' in html
+    assert "两腿盈亏相互抵消，本对合计才是真实损益" in html
+
+
+def test_missing_pnl_renders_dashes_without_crashing(tmp_path) -> None:
+    """旧心跳没有盈亏字段时，单腿、卡片和总览均安全显示破折号。"""
+    instance = _write_instance(tmp_path, name="old", heartbeat=_heartbeat())
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert html.count('class="leg-pnl mono pnl-missing">—</') == 2
+    assert 'class="pair-pnl-value mono pnl-missing">—</' in html
+    assert "两对合计盈亏" in html
+
+
+def test_overview_sums_two_pair_pnls(tmp_path) -> None:
+    """顶部总览使用两张卡片的本对盈亏之和，不能汇总单腿数字。"""
+    first = _write_instance(
+        tmp_path,
+        name="first_pnl",
+        heartbeat=_heartbeat(pair_pnl="1.25"),
+    )
+    second = _write_instance(
+        tmp_path,
+        name="second_pnl",
+        heartbeat=_heartbeat(pair_pnl="-0.50"),
+    )
+
+    html = hedge_panel.build_page(instances=(first, second), now=NOW)
+
+    assert "两对合计盈亏" in html
+    assert 'class="mono pnl-positive">+$0.75</strong>' in html
 
 
 

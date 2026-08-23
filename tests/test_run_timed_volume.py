@@ -252,6 +252,11 @@ def test_heartbeat_contains_round_direction_due_net_and_interlock() -> None:
         interlock_reason="Extended 侧不可用",
         notional_usd=2179,
         warnings=("测试告警",),
+        primary_pnl=Decimal("4.330000000000000001"),
+        hedge_pnl=Decimal("-5.570000000000000002"),
+        primary_entry=Decimal("77299.300000000000000001"),
+        hedge_entry=Decimal("77301.1"),
+        pair_pnl=Decimal("-1.240000000000000001"),
     )
 
     payload = cli.heartbeat_payload(result, now=1234.5)
@@ -265,6 +270,11 @@ def test_heartbeat_contains_round_direction_due_net_and_interlock() -> None:
         "primary_size": "0.5",
         "hedge_size": "-0.49",
         "net_exposure": "0.01",
+        "primary_pnl": "4.330000000000000001",
+        "hedge_pnl": "-5.570000000000000002",
+        "primary_entry": "77299.300000000000000001",
+        "hedge_entry": "77301.1",
+        "pair_pnl": "-1.240000000000000001",
         "hedge_available": False,
         "hedge_interlock_active": True,
         "hedge_interlock_reason": "Extended 侧不可用",

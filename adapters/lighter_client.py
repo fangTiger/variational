@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
+from adapters.base import ExchangeAdapter, MarketPrice, Position, PositionPnl, Side
 from adapters.lighter_order import LighterOrder, filter_grid_orders
 from adapters.lighter_scale import from_base_amount, to_base_amount, to_price
 from adapters.order_ref import ClientOrderIndexAllocator, OrderRef
@@ -190,6 +190,31 @@ class LighterClient(ExchangeAdapter):
                 raise ValueError(f"Lighter {market} 非零仓位 sign 必须为 1 或 -1")
             return Position(market=market, signed_size=sign * size, raw=raw)
         return Position(market=market, signed_size=Decimal(0))
+
+    async def get_position_pnl(self, market: str) -> PositionPnl | None:
+        """从账户持仓读取未实现盈亏、入场价与仓位价值。"""
+        account_index = self._require_account_index()
+        data = await self._get_json(
+            "/api/v1/account",
+            params={"by": "index", "value": str(account_index)},
+        )
+        self._raise_api_error(data, context="账户详情查询")
+
+        target = market.upper()
+        for raw in self._extract_positions(data):
+            if str(raw.get("symbol", "")).upper() != target:
+                continue
+
+            def optional_decimal(field: str) -> Decimal | None:
+                value = raw.get(field)
+                return Decimal(str(value)) if value not in (None, "") else None
+
+            return PositionPnl(
+                unrealized_pnl=optional_decimal("unrealized_pnl"),
+                entry_price=optional_decimal("avg_entry_price"),
+                position_value=optional_decimal("position_value"),
+            )
+        return None
 
     async def get_collateral(self) -> Decimal:
         """账户抵押品总额。仅供监控汇总，不参与任何交易决策。"""

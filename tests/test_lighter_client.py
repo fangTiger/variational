@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from adapters.base import Side
+from adapters.base import PositionPnl, Side
 from adapters.lighter_client import LighterClient
 from adapters.order_ref import OrderRef
 
@@ -161,6 +161,49 @@ def test_success_code_200_parses_short_position(monkeypatch) -> None:
     position = _run_and_close(client, client.get_position("BTC"))
 
     assert position.signed_size == Decimal("-0.00020")
+
+
+def test_get_position_pnl_reads_signed_exchange_fields(monkeypatch) -> None:
+    """未实现盈亏直接采用交易所最终符号，不得再乘持仓方向。"""
+    client = _make_client(
+        monkeypatch,
+        lambda _request: httpx.Response(
+            200,
+            json=_account_response(
+                positions=[
+                    _real_position(
+                        sign=-1,
+                        unrealized_pnl="4.330000",
+                        avg_entry_price="77299.3",
+                        position_value="1680.25",
+                    )
+                ]
+            ),
+        ),
+    )
+    client.account_index = REAL_ACCOUNT_INDEX
+
+    snapshot = _run_and_close(client, client.get_position_pnl("btc"))
+
+    assert snapshot == PositionPnl(
+        unrealized_pnl=Decimal("4.330000"),
+        entry_price=Decimal("77299.3"),
+        position_value=Decimal("1680.25"),
+    )
+
+
+def test_get_position_pnl_returns_none_when_market_is_absent(monkeypatch) -> None:
+    """账户响应没有目标市场时表示无该仓位盈亏。"""
+    client = _make_client(
+        monkeypatch,
+        lambda _request: httpx.Response(
+            200,
+            json=_account_response(positions=[]),
+        ),
+    )
+    client.account_index = REAL_ACCOUNT_INDEX
+
+    assert _run_and_close(client, client.get_position_pnl("BTC")) is None
 
 
 def test_sign_one_produces_positive_signed_size(monkeypatch) -> None:

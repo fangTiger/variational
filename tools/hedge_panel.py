@@ -217,6 +217,27 @@ def exposure_class(value: object) -> str:
     return "exposure-bad"
 
 
+def _pnl_class(value: object) -> str:
+    """按盈亏正负返回绿、红或中性样式。"""
+    pnl = _to_decimal(value)
+    if pnl is None:
+        return "pnl-missing"
+    if pnl > 0:
+        return "pnl-positive"
+    if pnl < 0:
+        return "pnl-negative"
+    return "pnl-flat"
+
+
+def _money_text(value: object) -> str:
+    """把盈亏格式化为带显式正负号的美元金额。"""
+    pnl = _to_decimal(value)
+    if pnl is None:
+        return "—"
+    sign = "-" if pnl < 0 else "+"
+    return f"{sign}${abs(pnl):,.2f}"
+
+
 def _field(data: dict, primary: str, *fallbacks: str) -> object:
     """返回首个存在且非空的字段。"""
     for key in (primary, *fallbacks):
@@ -268,39 +289,62 @@ def _render_leg(
     exchange: object,
     size: object,
     notional: object,
+    pnl: object,
+    entry: object,
 ) -> str:
-    """渲染单腿持仓：方向、数量与折合美元。
+    """渲染单腿持仓：方向、数量、折合美元、盈亏与入场价。
 
     只显示数量的话看不出这条腿到底是多还是空、值多少钱，
     对冲是否成立要靠心算两个带符号小数，实际用起来很吃力。
     """
     parsed = _to_decimal(size)
     if parsed is None:
-        return (
-            f'    <div class="leg">\n'
-            f"      <span>{_text(role)} · {_text(exchange)}</span>\n"
-            f'      <strong class="mono">—</strong>\n'
-            f"    </div>"
-        )
-
-    if parsed > 0:
+        side, side_class, position_text = "", "leg-flat", "—"
+    elif parsed > 0:
         side, side_class = "多", "leg-long"
+        position_text = f"{side} {_decimal_text(size)}"
     elif parsed < 0:
         side, side_class = "空", "leg-short"
+        position_text = f"{side} {_decimal_text(size)}"
     else:
         side, side_class = "空仓", "leg-flat"
+        position_text = f"{side} {_decimal_text(size)}"
 
     # 名义额是策略给这一轮定的单边美元数，两腿共用，用它折算即可，
     # 避免面板进程为了取价而去连交易所。
     value = _to_decimal(notional)
-    usd = f"≈ {'-' if parsed < 0 else ''}${value:,.0f}" if value is not None and parsed != 0 else ""
+    usd = (
+        f"≈ {'-' if parsed < 0 else ''}${value:,.0f}"
+        if value is not None and parsed not in (None, 0)
+        else ""
+    )
+    pnl_class = _pnl_class(pnl)
+    entry_value = _to_decimal(entry)
+    entry_html = (
+        f'      <small class="leg-entry mono">入场 {_text(_decimal_text(entry_value))}</small>\n'
+        if entry_value is not None
+        else ""
+    )
 
     return (
         f'    <div class="leg">\n'
         f"      <span>{_text(role)} · {_text(exchange)}</span>\n"
-        f'      <strong class="mono {side_class}">{_text(side)} {_text(_decimal_text(size))}</strong>\n'
+        f'      <strong class="mono {side_class}">{_text(position_text)}</strong>\n'
         f'      <em class="leg-usd">{_text(usd)}</em>\n'
+        f'      <div class="leg-pnl-row"><span>未实现盈亏</span><em class="leg-pnl mono {pnl_class}">{_text(_money_text(pnl))}</em></div>\n'
+        f"{entry_html}"
         f"    </div>"
+    )
+
+
+def _render_pair_pnl(value: object) -> str:
+    """渲染比单腿更醒目的本对合计盈亏。"""
+    return (
+        '  <section class="pair-pnl-block">\n'
+        "    <span>本对盈亏</span>\n"
+        f'    <strong class="pair-pnl-value mono {_pnl_class(value)}">{_text(_money_text(value))}</strong>\n'
+        "    <small>两腿盈亏相互抵消，本对合计才是真实损益</small>\n"
+        "  </section>"
     )
 
 
@@ -405,9 +449,10 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
   </section>
 
   <section class="legs" aria-label="两腿持仓">
-{_render_leg("主腿", snapshot.config.primary_exchange, data.get("primary_size"), notional)}
-{_render_leg("对冲腿", snapshot.config.hedge_exchange, data.get("hedge_size"), notional)}
+{_render_leg("主腿", snapshot.config.primary_exchange, data.get("primary_size"), notional, data.get("primary_pnl"), data.get("primary_entry"))}
+{_render_leg("对冲腿", snapshot.config.hedge_exchange, data.get("hedge_size"), notional, data.get("hedge_pnl"), data.get("hedge_entry"))}
   </section>
+  {_render_pair_pnl(data.get("pair_pnl"))}
   {_render_offset(data.get("primary_size"), data.get("hedge_size"))}
 
   {interlock_html}
@@ -434,6 +479,16 @@ def build_page(
     total_exposure = sum(exposures, Decimal("0")) if exposures else None
     total_text = _decimal_text(total_exposure)
     total_class = exposure_class(total_exposure)
+    pair_pnls = [
+        parsed
+        for snapshot in snapshots
+        if (parsed := _to_decimal(snapshot.data.get("pair_pnl"))) is not None
+    ]
+    total_pair_pnl = (
+        sum(pair_pnls, Decimal("0"))
+        if snapshots and len(pair_pnls) == len(snapshots)
+        else None
+    )
     any_interlocked = any(
         _truthy(snapshot.data.get("hedge_interlock_active")) for snapshot in snapshots
     )
@@ -477,7 +532,7 @@ def build_page(
       .manual-note { margin-top: 5px; color: var(--blue); font-size: 13px; }
       .overview {
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 12px;
         margin: 18px 0;
       }
@@ -552,6 +607,28 @@ def build_page(
       .leg-short { color: var(--red); }
       .leg-flat { color: var(--muted); }
       .leg-usd { display: block; margin-top: 3px; font-style: normal; font-size: 12px; color: var(--muted); }
+      .leg-pnl-row { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
+      .leg-pnl-row span { margin: 0; }
+      .leg-pnl { font-style: normal; font-size: 16px; font-weight: 800; }
+      .leg-entry { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
+      .pnl-positive { color: var(--green); }
+      .pnl-negative { color: var(--red); }
+      .pnl-flat { color: var(--text); }
+      .pnl-missing { color: var(--muted); }
+      .pair-pnl-block {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        align-items: center;
+        gap: 2px 14px;
+        margin-top: 12px;
+        padding: 14px 16px;
+        background: linear-gradient(135deg, rgba(99, 168, 255, 0.14), rgba(23, 33, 45, 0.95));
+        border: 1px solid rgba(99, 168, 255, 0.52);
+        border-radius: 9px;
+      }
+      .pair-pnl-block > span { color: var(--text); font-size: 15px; font-weight: 800; }
+      .pair-pnl-value { justify-self: end; font-size: clamp(27px, 4vw, 38px); line-height: 1; }
+      .pair-pnl-block small { grid-column: 1 / -1; margin-top: 5px; color: var(--muted); }
       .offset { margin: 9px 0 0; font-size: 13px; }
       .offset-ok { color: var(--green); }
       .offset-bad { color: var(--red); font-weight: 600; }
@@ -574,6 +651,7 @@ def build_page(
       .warnings li + li { margin-top: 5px; }
       @media (max-width: 820px) {
         .cards { grid-template-columns: 1fr; }
+        .overview { grid-template-columns: 1fr; }
       }
       @media (max-width: 520px) {
         .shell { width: min(100% - 20px, 1180px); padding-top: 18px; }
@@ -603,6 +681,10 @@ def build_page(
       <div class="summary-item">
         <span>两个实例净敞口合计</span>
         <strong class="mono {total_class}">{_text(total_text)}</strong>
+      </div>
+      <div class="summary-item">
+        <span>两对合计盈亏</span>
+        <strong class="mono {_pnl_class(total_pair_pnl)}">{_text(_money_text(total_pair_pnl))}</strong>
       </div>
       <div class="summary-item">
         <span>互锁总览</span>

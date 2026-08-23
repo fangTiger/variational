@@ -48,6 +48,15 @@ class Position:
         return self.signed_size == 0
 
 
+@dataclass(frozen=True)
+class PositionPnl:
+    """单个市场的盈亏快照；字段取不到时为 None。"""
+
+    unrealized_pnl: Decimal | None
+    entry_price: Decimal | None
+    position_value: Decimal | None
+
+
 class ExchangeAdapter(ABC):
     """交易所适配器抽象基类（异步）。
 
@@ -97,6 +106,11 @@ class ExchangeAdapter(ABC):
 
     async def get_free_margin_ratio(self) -> Decimal | None:
         """可用保证金 / 权益（0~1）。用于自动降险；无法获取返回 None。"""
+        return None
+
+    async def get_position_pnl(self, market: str) -> PositionPnl | None:
+        """返回单市场盈亏快照；不支持该能力时返回 None。"""
+        del market
         return None
 
     async def get_liquidation_info(self, market: str) -> tuple[Decimal, Decimal] | None:

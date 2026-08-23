@@ -35,7 +35,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils.constants import MAINNET_API_URL
 
-from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
+from adapters.base import ExchangeAdapter, MarketPrice, Position, PositionPnl, Side
 from infra.logger import get_logger
 
 logger = get_logger("hyperliquid_client")
@@ -489,6 +489,30 @@ class HyperliquidClient(ExchangeAdapter):
             if position.market == target:
                 return Position(market=market, signed_size=position.signed_size, raw=position.raw)
         return Position(market=market, signed_size=Decimal(0))
+
+    async def get_position_pnl(self, market: str) -> PositionPnl | None:
+        """从账户清算状态读取指定永续市场的盈亏快照。"""
+        target = (await self._market(market)).coin
+        state = await self._user_state()
+        for raw in state["assetPositions"]:
+            if not isinstance(raw, dict) or not isinstance(raw.get("position"), dict):
+                raise ValueError(f"Hyperliquid 持仓结构无效：{raw!r}")
+            position = raw["position"]
+            if str(position.get("coin", "")).upper() != target.upper():
+                continue
+
+            def optional_decimal(field: str, label: str) -> Decimal | None:
+                value = position.get(field)
+                if value in (None, ""):
+                    return None
+                return _decimal(value, context=label)
+
+            return PositionPnl(
+                unrealized_pnl=optional_decimal("unrealizedPnl", "持仓未实现盈亏"),
+                entry_price=optional_decimal("entryPx", "持仓入场价"),
+                position_value=optional_decimal("positionValue", "持仓价值"),
+            )
+        return None
 
     async def get_balance(self) -> HyperliquidBalance:
         """返回全平口径权益：Spot USDC 加全部持仓未实现盈亏。"""

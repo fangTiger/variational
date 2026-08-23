@@ -11,12 +11,13 @@ import json
 import logging
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from adapters.base import PositionPnl
 from engine.hedge_engine import HedgeFillResult, maker_first_hedge
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,11 @@ class TimedVolumeResult:
     interlock_reason: str
     warnings: tuple[str, ...] = ()
     notional_usd: int | None = None
+    primary_pnl: Decimal | None = None
+    hedge_pnl: Decimal | None = None
+    primary_entry: Decimal | None = None
+    hedge_entry: Decimal | None = None
+    pair_pnl: Decimal | None = None
 
 
 TradeExecutor = Callable[..., Awaitable[HedgeFillResult]]
@@ -995,7 +1001,7 @@ class TimedHedgedVolumeStrategy:
             warnings=tuple(warnings),
         )
 
-    async def run_once(self, *, now: float | None = None) -> TimedVolumeResult:
+    async def _run_trading_once(self, *, now: float | None = None) -> TimedVolumeResult:
         """推进一次状态机；到期平仓与下一轮开仓分属相邻的无等待节拍。"""
         current_time = time.time() if now is None else float(now)
         warnings: list[str] = []
@@ -1071,3 +1077,57 @@ class TimedHedgedVolumeStrategy:
             self.hedge_interlock_reason = f"策略执行后持仓事实未知：{exc}"
             self._warn(warnings, self.hedge_interlock_reason)
             return self._result("execution_uncertain", None, None, warnings)
+
+    @staticmethod
+    async def _read_display_pnl(adapter, market: str) -> PositionPnl | None:
+        """读取单腿展示快照；旧测试桩和旧适配器可没有这项能力。"""
+        reader = getattr(adapter, "get_position_pnl", None)
+        if reader is None:
+            return None
+        snapshot = await reader(market)
+        return snapshot if isinstance(snapshot, PositionPnl) else None
+
+    async def _attach_display_pnl(
+        self,
+        result: TimedVolumeResult,
+    ) -> TimedVolumeResult:
+        """附加两腿盈亏；任何失败都只降级展示，不改变策略结果。"""
+        snapshots = await asyncio.gather(
+            self._read_display_pnl(self.primary, self.config.primary_market),
+            self._read_display_pnl(self.hedge, self.config.hedge_market),
+            return_exceptions=True,
+        )
+
+        normalized: list[PositionPnl | None] = []
+        for role, snapshot in zip(("主腿", "对冲腿"), snapshots, strict=True):
+            if isinstance(snapshot, BaseException):
+                logger.warning("%s盈亏读取失败，仅影响面板展示：%s", role, snapshot)
+                normalized.append(None)
+            else:
+                normalized.append(snapshot)
+
+        primary, hedge = normalized
+        primary_pnl = primary.unrealized_pnl if primary is not None else None
+        hedge_pnl = hedge.unrealized_pnl if hedge is not None else None
+        pair_pnl = (
+            primary_pnl + hedge_pnl
+            if primary_pnl is not None and hedge_pnl is not None
+            else None
+        )
+        return replace(
+            result,
+            primary_pnl=primary_pnl,
+            hedge_pnl=hedge_pnl,
+            primary_entry=primary.entry_price if primary is not None else None,
+            hedge_entry=hedge.entry_price if hedge is not None else None,
+            pair_pnl=pair_pnl,
+        )
+
+    async def run_once(self, *, now: float | None = None) -> TimedVolumeResult:
+        """先完成交易状态机，再以完全隔离的只读查询补充面板数据。"""
+        result = await self._run_trading_once(now=now)
+        try:
+            return await self._attach_display_pnl(result)
+        except Exception as exc:  # noqa: BLE001 展示数据不得改变任何交易结果
+            logger.warning("盈亏快照整理失败，仅影响面板展示：%s", exc)
+            return result

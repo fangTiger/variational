@@ -10,7 +10,7 @@ from unittest.mock import create_autospec
 
 import pytest
 
-from adapters.base import ExchangeAdapter, Side
+from adapters.base import ExchangeAdapter, PositionPnl, Side
 
 
 ACCOUNT_ADDRESS = "0x1111111111111111111111111111111111111111"
@@ -647,6 +647,29 @@ def test_positions_keep_exchange_signed_sizes() -> None:
 
     assert btc.signed_size == Decimal("0.002")
     assert eth.signed_size == Decimal("-0.5")
+
+
+def test_get_position_pnl_reads_clearinghouse_position_fields() -> None:
+    """盈亏快照从 clearinghouseState 的 position 字段逐项映射。"""
+    raw = _position("BTC", "-0.002", "70000", unrealized_pnl="-5.57")
+    raw["position"]["entryPx"] = "77299.3"
+    raw["position"]["positionValue"] = "1681.125"
+    client = _client(info=FakeInfo(state=_user_state([raw])))
+
+    snapshot = asyncio.run(client.get_position_pnl("BTC"))
+
+    assert snapshot == PositionPnl(
+        unrealized_pnl=Decimal("-5.57"),
+        entry_price=Decimal("77299.3"),
+        position_value=Decimal("1681.125"),
+    )
+
+
+def test_get_position_pnl_returns_none_for_absent_hyperliquid_market() -> None:
+    """账户未持有目标市场时不制造零值快照。"""
+    client = _client(info=FakeInfo(state=_user_state([])))
+
+    assert asyncio.run(client.get_position_pnl("BTC")) is None
 
 
 def test_account_wide_positions_are_not_filtered_by_market() -> None:

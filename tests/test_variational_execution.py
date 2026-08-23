@@ -12,7 +12,7 @@ from decimal import Decimal
 
 import pytest
 
-from adapters.base import ExchangeAdapter, Side
+from adapters.base import ExchangeAdapter, PositionPnl, Side
 from adapters.variational_client import VariationalClient
 
 
@@ -60,6 +60,34 @@ def test_execution_model_defaults_to_orderbook_and_variational_declares_rfq() ->
     """旧适配器默认走订单簿，Variational 明确声明 RFQ。"""
     assert ExchangeAdapter.execution_model == "orderbook"
     assert VariationalClient.execution_model == "rfq"
+
+
+def test_get_position_pnl_uses_upnl_entry_and_mark_value() -> None:
+    """Variational 名义价值由绝对数量乘标记价计算，空头不能得到负价值。"""
+    client = object.__new__(VariationalClient)
+
+    async def get_positions():
+        return [
+            {
+                "position_info": {
+                    "instrument": {"underlying": "BTC"},
+                    "qty": "-0.021761",
+                    "avg_entry_price": "77299.3",
+                },
+                "upnl": "4.33",
+                "price_info": {"underlying_price": "77199.25"},
+            }
+        ]
+
+    client.get_positions = get_positions
+
+    snapshot = asyncio.run(client.get_position_pnl("BTC"))
+
+    assert snapshot == PositionPnl(
+        unrealized_pnl=Decimal("4.33"),
+        entry_price=Decimal("77299.3"),
+        position_value=Decimal("0.021761") * Decimal("77199.25"),
+    )
 
 
 def test_get_min_order_size_uses_quote_quantity_limits() -> None:

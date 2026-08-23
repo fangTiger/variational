@@ -21,7 +21,7 @@ from typing import Any
 # curl_cffi 提供 Chrome TLS 指纹伪装，用于绕过 Cloudflare 的 TLS 指纹检测。
 from curl_cffi.requests import AsyncSession
 
-from adapters.base import ExchangeAdapter, MarketPrice, Position, Side
+from adapters.base import ExchangeAdapter, MarketPrice, Position, PositionPnl, Side
 
 BASE_URL = "https://omni.variational.io/api"
 DEFAULT_TIMEOUT = 30.0
@@ -400,6 +400,37 @@ class VariationalClient(ExchangeAdapter):
                 qty = Decimal(str(info.get("qty", info.get("size", "0"))))
                 return Position(market=underlying, signed_size=qty, raw=p)
         return Position(market=underlying, signed_size=Decimal(0))
+
+    async def get_position_pnl(self, market: str) -> PositionPnl | None:
+        """读取指定标的盈亏，并用绝对数量与标记价计算仓位价值。"""
+        data = await self.get_positions()
+        items = data if isinstance(data, list) else (data or {}).get("positions", [])
+        for position in items:
+            info = position.get("position_info", position)
+            if not self._position_matches_underlying(info, market):
+                continue
+
+            def optional_decimal(value: object) -> Decimal | None:
+                return Decimal(str(value)) if value not in (None, "") else None
+
+            quantity = optional_decimal(info.get("qty", info.get("size")))
+            price_info = position.get("price_info")
+            mark_price = optional_decimal(
+                price_info.get("underlying_price")
+                if isinstance(price_info, dict)
+                else None
+            )
+            position_value = (
+                abs(quantity) * mark_price
+                if quantity is not None and mark_price is not None
+                else None
+            )
+            return PositionPnl(
+                unrealized_pnl=optional_decimal(position.get("upnl")),
+                entry_price=optional_decimal(info.get("avg_entry_price")),
+                position_value=position_value,
+            )
+        return None
 
     async def get_market_price(self, market: str) -> MarketPrice:
         """获取买一/卖一价（用一次极小询价拿 bid/ask）。"""

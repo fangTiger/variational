@@ -8,11 +8,12 @@ TypeError；更糟的是假对象若照抄错误签名，测试会全绿而生�
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 
 import pytest
 
-from adapters.base import ExchangeAdapter
+from adapters.base import ExchangeAdapter, PositionPnl
 from adapters.extended_client import ExtendedClient
 from adapters.lighter_client import LighterClient
 from adapters.variational_client import VariationalClient
@@ -41,6 +42,18 @@ def test_base_declares_cancel_order():
     assert hasattr(ExchangeAdapter, "cancel_order")
     params = list(inspect.signature(ExchangeAdapter.cancel_order).parameters)
     assert params[:3] == ["self", "market", "order_id"]
+
+
+def test_position_pnl_is_optional_adapter_capability() -> None:
+    """旧适配器不实现盈亏查询时应安全降级，而不是被迫补齐抽象方法。"""
+    snapshot = PositionPnl(
+        unrealized_pnl=None,
+        entry_price=None,
+        position_value=None,
+    )
+
+    assert snapshot.unrealized_pnl is None
+    assert asyncio.run(ExchangeAdapter.get_position_pnl(object(), "BTC")) is None
 
 
 @pytest.mark.parametrize("cls", [ExtendedClient, LighterClient])

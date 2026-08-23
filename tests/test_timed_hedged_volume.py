@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from adapters.base import MarketPrice, Position, Side
+from adapters.base import MarketPrice, Position, PositionPnl, Side
 from adapters.extended_client import ExtendedClient
 from adapters.lighter_client import LighterClient
 from adapters.variational_client import VariationalClient
@@ -548,6 +548,74 @@ def test_open_is_delta_neutral_and_close_is_flat(tmp_path) -> None:
     assert closed.net_exposure == 0
     assert lighter.position == 0
     assert extended.position == 0
+
+
+def test_pnl_read_failure_does_not_block_open_or_activate_interlock(tmp_path) -> None:
+    """展示用盈亏查询失败时仍须正常开仓，并在心跳里写入空值。"""
+
+    class PnlFailingLighter(_LighterAdapter):
+        async def get_position_pnl(self, market: str):
+            del market
+            raise RuntimeError("展示接口暂时不可用")
+
+    executor = _ScriptedExecutor()
+    _, strategy, lighter, extended = _build_strategy(
+        tmp_path,
+        lighter=PnlFailingLighter("lighter"),
+        executor=executor,
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+    payload = importlib.import_module("tools.run_timed_volume").heartbeat_payload(
+        result,
+        now=1.0,
+    )
+
+    assert result.action == "opened"
+    assert result.hedge_available is True
+    assert lighter.position == -extended.position != 0
+    assert payload["primary_pnl"] is None
+    assert payload["hedge_pnl"] is None
+    assert payload["primary_entry"] is None
+    assert payload["hedge_entry"] is None
+    assert payload["pair_pnl"] is None
+
+
+def test_position_pnl_snapshots_are_combined_without_float_conversion(tmp_path) -> None:
+    """两腿快照保留 Decimal 精度，且本对盈亏只做十进制加法。"""
+
+    class PnlLighter(_LighterAdapter):
+        async def get_position_pnl(self, market: str):
+            del market
+            return PositionPnl(
+                unrealized_pnl=Decimal("4.330000000000000001"),
+                entry_price=Decimal("77299.300000000000000001"),
+                position_value=Decimal("1680.25"),
+            )
+
+    class PnlExtended(_ExtendedAdapter):
+        async def get_position_pnl(self, market: str):
+            del market
+            return PositionPnl(
+                unrealized_pnl=Decimal("-5.570000000000000002"),
+                entry_price=Decimal("77301.1"),
+                position_value=Decimal("1680.30"),
+            )
+
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=PnlLighter("lighter"),
+        extended=PnlExtended("extended"),
+        executor=_ScriptedExecutor(),
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.primary_pnl == Decimal("4.330000000000000001")
+    assert result.hedge_pnl == Decimal("-5.570000000000000002")
+    assert result.primary_entry == Decimal("77299.300000000000000001")
+    assert result.hedge_entry == Decimal("77301.1")
+    assert result.pair_pnl == Decimal("-1.240000000000000001")
 
 
 def test_lighter_opened_but_extended_failed_rolls_back_lighter(
