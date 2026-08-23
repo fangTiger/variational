@@ -15,7 +15,8 @@ from adapters.base import ExchangeAdapter, Side
 
 ACCOUNT_ADDRESS = "0x1111111111111111111111111111111111111111"
 AGENT_PRIVATE_KEY = "0x" + "22" * 32
-ENTROPY_BUILDER_ADDRESS = "0xcD254d2A328f7f67C7c6FEf930A4757516F7b601"
+# 测试用占位地址，真实 builder 地址由 .env 注入
+ENTROPY_BUILDER_ADDRESS = "0x3333333333333333333333333333333333333333"
 
 
 def _meta_and_contexts(mark_price: str = "62500") -> list:

@@ -1,10 +1,14 @@
-# Variational / Extended 交易机器人
+# 多交易所永续对冲机器人
 
-BTC 永续合约的**中性网格策略**实盘系统，跑在 [Extended](https://extended.exchange)（Starknet 上的永续 DEX）。单机 macOS + launchd 守护，全部用限价 maker 单（Extended maker 费为 0）。
+BTC 永续合约的实盘系统，单机 macOS + launchd/独立进程守护。
 
-仓库里还有一套早期的 Variational 跨所对冲积分 bot（`tools/run_hedge_bot.py`），已停用，保留作参考。
+**当前主体是「定时定量跨所对冲刷量」**：在 Lighter 按固定周期开仓，同时在
+Hyperliquid 建立等量反向仓，使净方向敞口恒为零；目标是产生成交量赚取积分，
+而非赚取价差。仓库里同时保留网格、旧对冲等多套系统的完整代码与历史。
 
-> **风险提示**：这是拿真钱跑的实盘交易系统。策略的盈利能力**尚未被验证**——见下方「当前状态」。任何人在自己账户上运行前，请先用 `dry_run` 模式观察，并从最小金额开始。
+> **风险提示**：这是拿真钱跑的实盘交易系统。**中性对冲消除的是方向风险，
+> 不是交易成本**——手续费、滑点与跨所基差是确定的持续支出。任何人在自己账户上
+> 运行前，请先用默认的 dry-run 模式观察，并从最小金额开始。
 
 ---
 
@@ -23,15 +27,37 @@ python3.11 -m venv .venv
 
 ### 2. 配置
 
-在项目根目录创建 `.env`，填入 Extended 的 API 凭据（网格账户用 `X10_GRID_` 前缀）：
+在项目根目录创建 `.env`。当前主体策略需要 **Lighter + Hyperliquid** 两套凭据：
 
 ```bash
-X10_GRID_CLIENT_CONFIG_NAME=MAINNET     # 或 TESTNET
-X10_GRID_API_KEY=...                    # Extended 网页端 API 管理页生成
+# ---- Lighter（主腿，开仓侧）----
+LIGHTER_RH_L1_ADDRESS=0x...             # Robinhood Wallet 地址
+LIGHTER_API_PRIVATE_KEY=...             # Lighter API 私钥
+LIGHTER_API_KEY_INDEX=255
+
+# ---- Hyperliquid（对冲腿）----
+HYPERLIQUID_ACCOUNT_ADDRESS=0x...       # 主钱包地址（不是私钥）
+HYPERLIQUID_AGENT_PRIVATE_KEY=0x...     # API 代理钱包私钥，只能交易不能提现
+HYPERLIQUID_BUILDER_ADDRESS=0x...       # 第三方前端的 builder code 地址
+HYPERLIQUID_BUILDER_FEE_TENTHS_BPS=1    # ⚠️ 不能为 0，见下方说明
+
+# ---- Extended（网格用，当前已停用）----
+X10_GRID_CLIENT_CONFIG_NAME=MAINNET
+X10_GRID_API_KEY=...
 X10_GRID_PUBLIC_KEY=...
 X10_GRID_PRIVATE_KEY=...
 X10_GRID_VAULT_ID=...
 ```
+
+关于 Hyperliquid 的三个要点：
+
+- **用 API 代理钱包（agent wallet）**，主钱包私钥不必落地。代理钱包只能交易、
+  不能提现，因此放进 `.env` 是安全的。它的地址与登录地址不同，属正常现象。
+- **是统一账户**：Spot 余额可直接作为永续保证金，**不需要 Spot→Perps 划转**。
+  另外 agent wallet 只能交易，**做不了资金划转**（`usd_class_transfer` 会被拒）。
+- **`HYPERLIQUID_BUILDER_FEE_TENTHS_BPS` 绝不能填 0**。协议层面 `f=0` 等价于
+  「无 builder」（撤销 builder 授权的方式正是把费率设为 0），交易将**完全不归属**。
+  实测对照：`f=0` 的成交记录无 `builderFee` 字段，`f=1` 才有。
 
 `.env` 已在 `.gitignore` 中，不会入库。
 
@@ -47,16 +73,63 @@ X10_GRID_VAULT_ID=...
 
 ## 启动方式
 
-### 先分清楚：这个仓库有四套系统
+### 先分清楚：这个仓库有五套系统
 
 | 系统 | 入口 | 交易所 | 状态 |
 |---|---|---|---|
-| **BTC 中性网格** | `tools/run_grid.py` | **Extended** | ✅ 实盘运行中，是本项目主体 |
-| 跨所对冲刷积分 | `tools/run_hedge_bot.py` | Variational + Extended | ⛔ 已停用，保留作参考 |
-| Lighter RH 积分对冲 | `tools/run_lighter_hedge.py` | Lighter RH + Extended | ⛔ 已停用（做市改为不对冲），代码保留 |
-| **Lighter 做市** | `tools/run_lighter_mm.py` | **Lighter** | ✅ 实盘运行中，launchd 常驻（`com.variational.lighter-mm`） |
+| **定时定量对冲刷量** | `tools/run_timed_volume.py` | **Lighter + Hyperliquid** | ✅ **实盘运行中，当前主体** |
+| BTC 中性网格 | `tools/run_grid.py` | Extended | ⛔ 已停用（2026-08-19 事故后），代码与风控保留 |
+| Lighter 做市（网格式） | `tools/run_lighter_mm.py` | Lighter | ⛔ 已停用，被定时定量策略取代 |
+| Lighter RH 积分对冲 | `tools/run_lighter_hedge.py` | Lighter + Extended | ⛔ 已停用，代码保留 |
+| 早期跨所对冲刷积分 | `tools/run_hedge_bot.py` | Variational + Extended | ⛔ 已停用，保留作参考 |
 
-涉及 Extended 的系统按用途使用账户前缀：网格用 `X10_GRID_`，旧对冲用 `X10_`，Lighter RH 对冲用 `X10_HEDGE_`；三者不得复用 vault。Lighter 做市在 Lighter 下单，仅使用 `X10_HEDGE_` 读取 Extended K 线。
+**为什么主体从网格换成了定时定量**（两条实测结论）：
+
+1. **网格频率不可控**——成交由价格波动决定、不由时间决定。实测 54.8~102 笔/小时，
+   要降到「2 小时一次」需把格距放到 10% 以上，届时可能几天不成交。
+2. **网格的对冲滞后损失是主要成本**——库存持续变化，对冲腿永远在追一个已经变了的
+   目标。实测**成本率 0.144%**（成本 ÷ 成交额），是 Extended taker 费的 6.4 倍。
+   定时定量则是开仓与对冲**同步下单**，实测成本率低一个数量级。
+
+**账户前缀约定**：涉及 Extended 的系统按用途使用前缀——网格用 `X10_GRID_`，
+旧对冲用 `X10_`，Lighter RH 对冲用 `X10_HEDGE_`。⚠️ 实测 `X10_` 与 `X10_GRID_`
+指向**同一个 vault**，并非三个独立账户——上线前务必核对 vault id。
+
+### 定时定量对冲刷量（当前主体）
+
+默认 dry-run，只打印配置摘要；**必须显式 `--live` 才会连接交易所下单**。
+
+```bash
+PYTHONPATH=. .venv/bin/python -m tools.run_timed_volume --live \
+    --hedge-venue hyperliquid --hedge-market BTC \
+    --notional-min <名义额下限> --notional-max <名义额上限> \
+    --cycle-hours 2 --initial-direction long \
+    --maker-timeout 300 --poll-interval 30
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--hedge-venue` | 对冲腿交易所：`hyperliquid` 或 `extended` |
+| `--notional-min/max` | 每轮单边名义额区间，**每轮在区间内随机取整数**以打散规律性。<br>取值应让对冲腿权益能覆盖，别照抄示例 |
+| `--cycle-hours` | 持仓周期。到期平仓后立即反向开下一轮 |
+| `--initial-direction` | 无历史记录时的首轮方向，之后逐轮交替 |
+| `--maker-timeout` | maker 优先等待秒数，超时才转市价。**这是最主要的成本杠杆** |
+
+**关于 `--maker-timeout`**：盘口实测 15 秒的 maker 成交率仅 **10.8%**，
+300 秒可达 **68.5%**（实盘更是达到 83%）。定时策略不赶时间，设长有明显收益。
+
+**后台常驻**：macOS **没有 `setsid`**，直接 `nohup &` 起的进程会被调用方的
+超时信号连带杀掉（已实际发生过）。需要用 Python 的 `start_new_session=True`
+另起会话，参考 `launch.py` 的做法。
+
+```bash
+tail -f logs/timed_volume.log                      # 主日志
+tail -1 data/timed_volume.jsonl | python3 -m json.tool   # 心跳快照
+cat data/timed_volume/state.json                   # 当前轮次状态
+```
+
+**判断运行是否健康，只看两个字段**：`net_exposure` 接近 0、
+`hedge_interlock_active` 为 `false`。
 
 ### Lighter RH 对冲启动
 
@@ -232,7 +305,28 @@ PYTHONPATH=. .venv/bin/python -m tools.go_dark
 
 ## 它是怎么工作的
 
-网格策略不预测方向，只做一件事：在当前价上下按固定间距挂满限价单，价格波动时**低买高卖**，每完成一对买卖叫一个**闭环**，赚的就是格距那点价差。
+### 定时定量对冲（当前主体）
+
+不预测方向，也不赚价差。每轮固定动作：
+
+```
+T=0h    Lighter 开仓 $N          ┐ 同步下单
+        Hyperliquid 反向 $N      ┘ → 净敞口 ≈ 0
+T=2h    两侧同步平仓              → 归零，下一轮方向取反
+```
+
+**收益来自成交量对应的积分，不来自价差**——闭环利润被对冲抵消是预期结果，
+不是 bug。唯一的支出是手续费、滑点与跨所基差。
+
+安全上只有一条铁律：**任何时刻不得留下单边裸仓**。所以
+
+- 一侧成交、另一侧超时未成 → **回滚已成交的那一侧**
+- 任一侧部分成交 → 按**两侧实际持仓差**补齐，绝不按委托量推断
+- 对冲腿心跳超时 → 互锁触发，**停止开新仓**但仍允许平仓
+
+### 网格（已停用，代码保留）
+
+网格在当前价上下按固定间距挂满限价单，价格波动时**低买高卖**，每完成一对买卖叫一个**闭环**，赚的就是格距那点价差。
 
 ```
 价格 ↑
@@ -255,8 +349,13 @@ PYTHONPATH=. .venv/bin/python -m tools.go_dark
 | `grid/regime.py` | 市况判定（ADX / ATR / Donchian），纯函数 |
 | `grid/band.py` | 有界通道：价格越出固定区间时冻结加仓侧 |
 | `grid/risk.py` | 距强平距离与硬止损判定，纯函数 |
+| `timed_volume/strategy.py` | **定时定量对冲策略**：轮次调度、方向交替、随机名义额、双边收敛 |
+| `engine/hedge_engine.py` | maker-first 对冲执行：限价挂单 → 超时降级吃单，按实际持仓差补齐 |
 | `adapters/extended_client.py` | Extended 交易所适配器（下单/撤单/查仓/TPSL） |
-| `tools/run_grid.py` | 守护进程入口 |
+| `adapters/lighter_client.py` | Lighter 交易所适配器 |
+| `adapters/hyperliquid_client.py` | Hyperliquid 适配器，含 Builder Code 归属（Entropy） |
+| `tools/run_timed_volume.py` | **定时定量对冲入口**（当前主体） |
+| `tools/run_grid.py` | 网格守护进程入口 |
 | `tools/grid_monitor.py` | 每小时权益快照 → `data/grid_monitor.jsonl` |
 | `tools/pnl_attribution.py` | 导入成交、配对闭环、校验残差 → `data/attribution.json` |
 | `tools/alert_check.py` | 异常主动告警（macOS 通知） |
@@ -264,13 +363,32 @@ PYTHONPATH=. .venv/bin/python -m tools.go_dark
 
 ---
 
-## 风控：三层，各管一段
+## 风控
+
+### 定时定量策略的保护
+
+| 层 | 作用 |
+|---|---|
+| **单边收敛** | 一侧成交另一侧没成交 → 回滚，**绝不留裸仓**。所有补单按实际持仓差计算 |
+| **对冲存活互锁** | 对冲心跳超时 → 停止开新仓，但仍允许平仓与撤单 |
+| **对冲容差** | 净敞口小于两侧最小下单量中较大者即视为已对冲，避免跨所精度差造成死循环 |
+| **轮次状态持久化** | 重启后沿用原轮次与金额；与实际持仓不符时**以实际持仓为准** |
+
+⚠️ **互锁必须是方向性门控，不能是全局冻结**。2026-08-10 的教训：全局冻结挡住了
+新挂单却挡不住盘口上已有的单继续成交，而成交后的翻单被冻结阻止，
+库存被打成满额裸多头卡死 10.5 小时。
+
+### 网格的三层风控（已停用系统，逻辑保留）
 
 | 层 | 参数 | 作用 |
 |---|---|---|
 | 整仓 TPSL | `max_equity_loss_pct=0.10` | 交易所侧的止损单，单次止损浮亏 ≈ **权益 10%**，与持仓大小无关 |
 | 硬止损 | `--hard-stop-dist 0.12` | 距强平价 12% 时全平 |
 | 净值回撤熔断 | `--max-drawdown 0.12` | 自历史峰值回撤 12% → 全平停机，**需人工复位** |
+
+外加 2026-08-19 事故后新增的三项：**启动时风控完整性自检**（依赖能力缺失即
+拒绝启动）、**权益比例库存上限**（`min(权益×比例, 绝对硬顶)`）、
+**交易时段窗口**。
 
 **为什么要第三层**：前两层都是「每腿」保护——止损棘轮在仓位翻向时重置，而网格库存频繁穿零，连续阴跌里每腿各亏 10% 会复利，三腿就是 −27%。熔断是唯一盯着累计净值的约束。
 
@@ -342,7 +460,7 @@ nohup .venv/bin/python -m tools.grid_panel --port 8787 &        # 网页面板
 
 **1. 不要启用任何形式的全局方向冻结**（ADX 熔断 / Donchian 突破急停）
 
-已经三次被实盘证伪。最严重的一次（2026-08-10）：ADX 熔断触发后，冻结只挡住**新挂单**，挡不住盘口上已有的买单继续成交，而成交后的卖出翻单被冻结阻止——网格退化成**单向抄底**，库存被打成 $1687 的裸多头卡死 10.5 小时。
+已经三次被实盘证伪。最严重的一次（2026-08-10）：ADX 熔断触发后，冻结只挡住**新挂单**，挡不住盘口上已有的买单继续成交，而成交后的卖出翻单被冻结阻止——网格退化成**单向抄底**，库存被打成满额裸多头卡死 10.5 小时。
 
 根本原因：全局方向冻结与「成交后必须翻单闭环」的网格语义天然冲突。趋势风险应由**库存上限 + 格距**承担。所以 `--adx-off` / `--adx-resume` 默认都是 999（禁用）。
 
@@ -362,11 +480,44 @@ aiohttp 连接池会老化，曾导致持续 "Connection reset by peer"。重启
 
 ## 当前状态与已知限制
 
-- **策略盈利能力尚未验证**。账面收益里，网格闭环利润与持仓方向性盈亏混在一起，目前无法区分。收益归因数据层正在实施中（设计见 `docs/superpowers/specs/2026-08-11-*.md`，计划见 `docs/superpowers/plans/2026-08-13-*.md`）
-- 归因上线后进入 **4 周验证期**，判据事先定死：闭环年化 < 15%、或净值年化 ≤ 0、或最大回撤 ≥ 12% —— 任一条满足即停
-- 这是**卖波动率 / 做空 gamma** 结构：赚小额高频、赔在尾部。4 周只能证伪不能证实
-- **单点故障**：全部跑在一台 Mac 上，断电或断网即全停（交易所侧只剩 TPSL 兜底）
-- 网络质量对结果影响很大：单请求超过 5 秒是常态（约 3%），HTTP 超时已放宽到 25 秒
+### 定时定量对冲（运行中）
+
+实测表现（10.5 小时连续样本，比例口径；绝对金额见本地私有记录）：
+
+| 指标 | 实测 |
+|---|---|
+| 对冲精度 | 净敞口 / 单边名义额 **< 0.06%**，全程未出现单边裸仓 |
+| 成本率 | 约 **0.02~0.03%**（成本 ÷ 成交额；网格 + 对冲方案为 0.144%） |
+| 成本构成 | 手续费约 47%、滑点与跨所基差约 55%、资金费小幅为正 |
+| maker 成交率 | **83%**（300 秒超时；15 秒仅 10.8%） |
+| 方向交替 | 全程无一轮失序 |
+
+**这个亏损是刷量的门票钱，不是策略失败**——方向盈亏已被对冲抹平，
+剩下的是跨所交易的固有摩擦，压不到零。
+
+已知问题：
+
+- **`position_read_failed` 约占轮询 4%**（局部时段可达 69%）。根因是 Lighter
+  客户端的**瞬时 `ConnectError` / 超时**（API 本身正常，`curl` 可达，数十秒自愈）。
+  策略处理正确——读不到持仓就既不开仓也不平仓，保守跳过。但**日志里异常详情为空**
+  （`TimeoutError` 的 `str()` 就是空字符串），排查困难，且尚未加重试。
+- **Entropy 归属只验证到链上这一环**。成交记录已确认带 `builderFee`，
+  但其界面是否统计仍待确认——若它依赖自家后端（`api.entropy.trade`）记账，
+  绕过前端直连 Hyperliquid 可能仍不计入。
+
+### 网格（已停用）
+
+2026-08-19 BTC 单日涨 8.5%，Lighter 侧因三层风控 flag **一个都没传**而满仓扛空
+（库存打满并越过上限，达 105%），Extended 侧靠 `--trend-aware` 主动止损离场。
+事故后补齐了风控自检、权益比例上限、交易时段窗口，但主体已换成定时定量策略。
+
+网格是**卖波动率 / 做空 gamma** 结构：赚小额高频、赔在尾部。三次实测均为
+「闭环持续赚钱、方向腿赚得更多地亏回去」。
+
+### 通用
+
+- **单点故障**：全部跑在一台 Mac 上，断电或断网即全停
+- 网络质量对结果影响很大：单请求超过 5 秒是常态，两个交易所都出现过瞬时连接故障
 
 ---
 

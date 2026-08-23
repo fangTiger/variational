@@ -4,8 +4,8 @@
 
 `run_lighter_hedge.py:274` 硬拒绝 `X10_GRID` 前缀，且拒绝任何与
 `X10_GRID_VAULT_ID` 相同 vault 的账户。实测 `.env` 中
-`X10_VAULT_ID = X10_GRID_VAULT_ID = 396762`，因此三个 Extended 账户里只有
-`X10_HEDGE`（vault 398961）合法——而它余额为 **$0**，`X10_GRID` 有 **$840.10**。
+`X10_VAULT_ID` 与 `X10_GRID_VAULT_ID` **指向同一个 vault**，因此三个 Extended
+账户里只有 `X10_HEDGE` 合法——而它余额为空，资金全在 `X10_GRID` 上。
 
 该保护当初防的是「Extended 同时跑网格与对冲，两个策略仓位搅在一起」。但在
 当前架构下 **Extended 不再跑网格、只做纯对冲腿**，前提已不成立：账户上不会有

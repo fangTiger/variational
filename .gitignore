@@ -22,5 +22,9 @@ secrets/
 *.session
 cookies.json
 
+# 账户细节：实盘金额、权益、持仓、vault/钱包地址
+# README 是公开的，任何带具体金额或账户标识的记录都放这里
+docs/private/
+
 # 运行数据快照（整目录忽略：原先按后缀列举会漏掉 .bak-* 等备份）
 data/
