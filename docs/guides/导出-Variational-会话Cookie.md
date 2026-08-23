@@ -20,6 +20,15 @@
 
 `vr-token` 是有效期 **7 天**的 JWT；到期需重新登录导出。
 
+⚠️ **UA 也要一起更新**。`cf_clearance` 绑定的是「IP + 浏览器 UA」，
+Chrome 自动升级大版本后（如 149 → 151），旧的 `VARIATIONAL_USER_AGENT`
+会和浏览器对不上，Cookie 再新也会被 Cloudflare 拦。
+重新导出 Cookie 时**顺手核对 `.env` 里的 UA 与 cURL 里的是否一致**。
+
+⚠️ **换钱包要同时改 `VARIATIONAL_WALLET_ADDRESS`**。Cookie 里的
+`vr-token-0x...` 后缀带着钱包地址，若与 `.env` 中配置的地址不是同一个，
+说明浏览器登录的账户已经换了，两边必须一起更新。
+
 ---
 
 ## 一、安全须知（先读）
@@ -51,8 +60,14 @@
 
 ### 方法 B：从 Network 请求头抓取（最可靠）
 
+⚠️ **必须挑一条「需要登录才能返回数据」的请求**。`/api/banner`、`/api/config`
+这类公开接口浏览器不会附带 Cookie，复制出来的 cURL 里**没有 `Cookie:` 头**，
+拿来是没用的。认准这几个：`/api/positions`、`/api/portfolio`、
+`/api/points/summary`、`/api/open_orders`。
+
 1. `F12` → **Network（网络）** 标签，勾选保留日志。
-2. 在页面点一下刷新持仓，找到任意一条发往 `/api/...` 的请求。
+2. 停在**交易页**（不是 leaderboard），点一下刷新持仓，
+   在请求列表里筛 `positions` 或 `portfolio`。
 3. 右键该请求 → **Copy → Copy as cURL**。
 4. 把复制的 cURL 整段发给 bot/我，里面包含完整的 `Cookie:` 头和 `vr-connected-address` 头，
    我可以直接解析出会话（这是最省事、最不易出错的方式）。
@@ -89,10 +104,10 @@ bot 的 `adapters/variational_client.py` 会读取它，注入 httpx 客户端�
 
 ## 五、验证是否有效
 
-导出后，bot 会先打只读接口自检（不下任何单）：
+导出后，用只读自检确认（不下任何单）：
 
 ```bash
-python -m tools.check_variational_session   # 阶段二会提供
+PYTHONPATH=. .venv/bin/python -m tools.check_variational_session
 ```
 
 看到能正常返回你的 `/positions` 与 `/points/summary`，即表示会话有效。
