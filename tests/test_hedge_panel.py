@@ -163,3 +163,54 @@ def test_page_contains_no_automatic_refresh_code(tmp_path) -> None:
     assert 'meta http-equiv="refresh"' not in html
     assert "setInterval" not in html
 
+
+
+def test_same_direction_legs_are_flagged(tmp_path) -> None:
+    """两腿方向相同意味着对冲已失效，必须显式警示。
+
+    这是最危险的状态：净敞口会翻倍而不是抵消。若页面只列出两个带符号
+    小数、由人去心算符号，值班时极容易看漏。
+    """
+    instance = _write_instance(
+        tmp_path,
+        name="same",
+        heartbeat=_heartbeat(primary_size="0.02", hedge_size="0.02"),
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert "未形成对冲" in html
+    assert "offset-bad" in html
+
+
+def test_opposite_direction_legs_are_confirmed(tmp_path) -> None:
+    """方向相反时给出对冲成立的明确结论。"""
+    instance = _write_instance(
+        tmp_path,
+        name="hedged",
+        heartbeat=_heartbeat(primary_size="0.02", hedge_size="-0.02"),
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert "对冲成立" in html
+    assert "offset-ok" in html
+
+
+def test_each_leg_shows_side_and_usd_value(tmp_path) -> None:
+    """每条腿都要标出多空方向与折合美元，而不只是一个带符号小数。"""
+    instance = _write_instance(
+        tmp_path,
+        name="legs",
+        heartbeat=_heartbeat(
+            primary_size="-0.021761",
+            hedge_size="0.02176",
+            notional_usd=1680,
+        ),
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert "leg-short" in html and "leg-long" in html
+    assert "-$1,680" in html
+    assert "$1,680" in html

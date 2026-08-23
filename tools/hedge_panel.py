@@ -263,6 +263,61 @@ def _freshness(heartbeat: dict, now: Decimal) -> tuple[str, str, bool]:
     return _local_time(timestamp), f"{seconds} 秒前", age > STALE_AFTER_SECONDS
 
 
+def _render_leg(
+    role: str,
+    exchange: object,
+    size: object,
+    notional: object,
+) -> str:
+    """渲染单腿持仓：方向、数量与折合美元。
+
+    只显示数量的话看不出这条腿到底是多还是空、值多少钱，
+    对冲是否成立要靠心算两个带符号小数，实际用起来很吃力。
+    """
+    parsed = _to_decimal(size)
+    if parsed is None:
+        return (
+            f'    <div class="leg">\n'
+            f"      <span>{_text(role)} · {_text(exchange)}</span>\n"
+            f'      <strong class="mono">—</strong>\n'
+            f"    </div>"
+        )
+
+    if parsed > 0:
+        side, side_class = "多", "leg-long"
+    elif parsed < 0:
+        side, side_class = "空", "leg-short"
+    else:
+        side, side_class = "空仓", "leg-flat"
+
+    # 名义额是策略给这一轮定的单边美元数，两腿共用，用它折算即可，
+    # 避免面板进程为了取价而去连交易所。
+    value = _to_decimal(notional)
+    usd = f"≈ {'-' if parsed < 0 else ''}${value:,.0f}" if value is not None and parsed != 0 else ""
+
+    return (
+        f'    <div class="leg">\n'
+        f"      <span>{_text(role)} · {_text(exchange)}</span>\n"
+        f'      <strong class="mono {side_class}">{_text(side)} {_text(_decimal_text(size))}</strong>\n'
+        f'      <em class="leg-usd">{_text(usd)}</em>\n'
+        f"    </div>"
+    )
+
+
+def _render_offset(primary: object, hedge: object) -> str:
+    """渲染两腿是否互相抵消的一句话结论。"""
+    a, b = _to_decimal(primary), _to_decimal(hedge)
+    if a is None or b is None:
+        return ""
+    if a == 0 and b == 0:
+        return '  <p class="offset offset-flat">两腿均为空仓</p>'
+    if (a > 0) == (b > 0):
+        return (
+            '  <p class="offset offset-bad">⚠ 两腿方向相同，未形成对冲</p>'
+        )
+    return '  <p class="offset offset-ok">两腿方向相反，对冲成立</p>'
+
+
 def _render_warnings(value: object) -> str:
     """仅在存在告警时渲染告警列表。"""
     if isinstance(value, (list, tuple)):
@@ -350,15 +405,10 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
   </section>
 
   <section class="legs" aria-label="两腿持仓">
-    <div class="leg">
-      <span>主腿 · {_text(snapshot.config.primary_exchange)}</span>
-      <strong class="mono">{_text(_decimal_text(data.get("primary_size")))}</strong>
-    </div>
-    <div class="leg">
-      <span>对冲腿 · {_text(snapshot.config.hedge_exchange)}</span>
-      <strong class="mono">{_text(_decimal_text(data.get("hedge_size")))}</strong>
-    </div>
+{_render_leg("主腿", snapshot.config.primary_exchange, data.get("primary_size"), notional)}
+{_render_leg("对冲腿", snapshot.config.hedge_exchange, data.get("hedge_size"), notional)}
   </section>
+  {_render_offset(data.get("primary_size"), data.get("hedge_size"))}
 
   {interlock_html}
   {_render_warnings(data.get("warnings"))}
@@ -498,6 +548,14 @@ def build_page(
       .facts span, .leg span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 12px; }
       .facts strong, .leg strong { overflow-wrap: anywhere; }
       .legs { margin-top: 9px; }
+      .leg-long { color: var(--green); }
+      .leg-short { color: var(--red); }
+      .leg-flat { color: var(--muted); }
+      .leg-usd { display: block; margin-top: 3px; font-style: normal; font-size: 12px; color: var(--muted); }
+      .offset { margin: 9px 0 0; font-size: 13px; }
+      .offset-ok { color: var(--green); }
+      .offset-bad { color: var(--red); font-weight: 600; }
+      .offset-flat { color: var(--muted); }
       .leg strong { font-size: 21px; }
       .interlock-note, .interlock-alert {
         display: flex;
