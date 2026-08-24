@@ -156,10 +156,9 @@ def read_last_jsonl(path: Path | str) -> dict:
 
 
 def read_portfolio_equity_summary(path: Path | str) -> PortfolioEquitySummary:
-    """读取有效组合权益快照，并以 Decimal 计算首末差值。"""
-    first: tuple[Decimal, Decimal] | None = None
-    latest: tuple[Decimal, Decimal] | None = None
-    snapshot_count = 0
+    """按最新快照 schema 读取组合权益，并以 Decimal 计算首末差值。"""
+    by_schema: dict[int, list[object]] = {}
+    latest_schema: int | None = None
     try:
         stream = Path(path).open("r", encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -178,18 +177,23 @@ def read_portfolio_equity_summary(path: Path | str) -> PortfolioEquitySummary:
                     continue
                 timestamp = _to_decimal(payload.get("ts"))
                 total_equity = _to_decimal(payload.get("total_equity"))
-                if timestamp is None or total_equity is None:
+                schema = _portfolio_equity_schema(payload.get("schema"))
+                if timestamp is None or total_equity is None or schema is None:
                     continue
                 snapshot = (timestamp, total_equity)
-                if first is None:
-                    first = snapshot
-                latest = snapshot
-                snapshot_count += 1
+                state = by_schema.setdefault(schema, [snapshot, snapshot, 0])
+                state[1] = snapshot
+                state[2] = int(state[2]) + 1
+                latest_schema = schema
         except (OSError, UnicodeDecodeError):
             return PortfolioEquitySummary()
 
-    if first is None or latest is None:
+    if latest_schema is None:
         return PortfolioEquitySummary()
+    first, latest, raw_count = by_schema[latest_schema]
+    if not isinstance(first, tuple) or not isinstance(latest, tuple):
+        return PortfolioEquitySummary()
+    snapshot_count = int(raw_count)
     cumulative_pnl = latest[1] - first[1] if snapshot_count >= 2 else None
     return PortfolioEquitySummary(
         cumulative_pnl=cumulative_pnl,
@@ -198,6 +202,18 @@ def read_portfolio_equity_summary(path: Path | str) -> PortfolioEquitySummary:
         latest_equity=latest[1],
         snapshot_count=snapshot_count,
     )
+
+
+def _portfolio_equity_schema(value: object) -> int | None:
+    """解析权益快照版本；旧记录缺少字段时按 schema 1 处理。"""
+    if value is None:
+        return 1
+    if isinstance(value, bool):
+        return None
+    parsed = _to_decimal(value)
+    if parsed is None or parsed <= 0 or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
 
 
 def read_portfolio_volume_summary(path: Path | str) -> PortfolioVolumeSummary:

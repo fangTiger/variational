@@ -25,7 +25,7 @@ DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "portfolio_equity.jsonl"
 DEFAULT_VOLUME_OUTPUT = PROJECT_ROOT / "data" / "portfolio_volume.jsonl"
 DEFAULT_INTERVAL_SECONDS = 900.0
 
-EquityReader = Callable[[], Awaitable[Decimal]]
+EquityReader = Callable[[tuple[str, ...]], Awaitable[Decimal]]
 VolumeReader = Callable[[Decimal, str], Awaitable[Decimal]]
 HyperliquidPageReader = Callable[[int], Awaitable[object]]
 VariationalPageReader = Callable[[int | None, int | None], Awaitable[object]]
@@ -93,6 +93,24 @@ def _symbol(value: object, *, label: str) -> str:
     if not symbol or "|" in symbol:
         raise ValueError(f"{label} 无效")
     return symbol
+
+
+def strategy_symbols_by_source(
+    instances: Sequence[VolumeInstanceConfig] = DEFAULT_VOLUME_INSTANCES,
+) -> dict[str, tuple[str, ...]]:
+    """从成交量实例配置推导每个账户应纳入权益统计的币种。"""
+    collected: dict[str, set[str]] = {}
+    for config in instances:
+        symbol = _symbol(config.symbol, label=f"实例 {config.key} 币种")
+        for source in (config.primary_source, config.hedge_source):
+            normalized_source = source.strip()
+            if not normalized_source:
+                raise ValueError(f"实例 {config.key} 的账户来源为空")
+            collected.setdefault(normalized_source, set()).add(symbol)
+    return {
+        source: tuple(sorted(symbols))
+        for source, symbols in sorted(collected.items())
+    }
 
 
 def _integer(value: object, *, label: str, minimum: int = 0) -> int:
@@ -328,39 +346,142 @@ async def read_variational_volume(
         )
 
 
-async def read_lighter_equity(client: Any) -> Decimal:
-    """读取 Lighter 的 ``total_asset_value`` 权益口径。"""
-    balance = await client.get_balance()
-    return _decimal(getattr(balance, "equity", None), label="Lighter 账户权益")
+async def read_lighter_equity(
+    client: Any,
+    symbols: Sequence[str],
+) -> Decimal:
+    """读取 Lighter 抵押品，并只叠加策略币种的未实现盈亏。"""
+    targets = {_symbol(symbol, label="Lighter 策略币种") for symbol in symbols}
+    account_index = client._require_account_index()
+    data = await client._get_json(
+        "/api/v1/account",
+        params={"by": "index", "value": str(account_index)},
+    )
+    if not isinstance(data, Mapping):
+        raise ValueError("Lighter 账户详情响应不是对象")
+    client._raise_api_error(data, context="账户详情查询")
+    accounts = data.get("accounts")
+    if (
+        not isinstance(accounts, list)
+        or not accounts
+        or not isinstance(accounts[0], Mapping)
+    ):
+        raise ValueError("Lighter 账户详情响应缺少 accounts")
+    account = accounts[0]
+    collateral = _decimal(account.get("collateral"), label="Lighter 抵押品")
+    positions = account.get("positions")
+    if not isinstance(positions, list):
+        raise ValueError("Lighter 账户详情响应缺少 positions 数组")
+
+    unrealized_pnl = Decimal("0")
+    for index, position in enumerate(positions):
+        if not isinstance(position, Mapping):
+            raise ValueError(f"Lighter 第 {index + 1} 条持仓不是对象")
+        symbol = _symbol(
+            position.get("symbol"),
+            label=f"Lighter 第 {index + 1} 条持仓币种",
+        )
+        if symbol not in targets:
+            continue
+        unrealized_pnl += _decimal(
+            position.get("unrealized_pnl"),
+            label=f"Lighter {symbol} 未实现盈亏",
+        )
+    return collateral + unrealized_pnl
 
 
-async def read_variational_equity(client: Any) -> Decimal:
-    """读取 Variational 的 ``balance + upnl`` 权益口径。"""
-    balance = await client.get_balance()
-    cash = _decimal(getattr(balance, "balance", None), label="Variational 余额")
-    upnl = _decimal(getattr(balance, "upnl", None), label="Variational 未实现盈亏")
-    return cash + upnl
+async def read_variational_equity(
+    client: Any,
+    symbols: Sequence[str],
+) -> Decimal:
+    """读取 Variational 余额，并只叠加策略币种的未实现盈亏。"""
+    targets = {_symbol(symbol, label="Variational 策略币种") for symbol in symbols}
+    portfolio = await client.raw("/portfolio")
+    if not isinstance(portfolio, Mapping):
+        raise ValueError("Variational portfolio 响应不是对象")
+    cash = _decimal(portfolio.get("balance"), label="Variational 余额")
+
+    payload = await client.get_positions()
+    positions = payload if isinstance(payload, list) else (
+        payload.get("positions") if isinstance(payload, Mapping) else None
+    )
+    if not isinstance(positions, list):
+        raise ValueError("Variational positions 响应缺少持仓数组")
+    unrealized_pnl = Decimal("0")
+    for index, position in enumerate(positions):
+        if not isinstance(position, Mapping):
+            raise ValueError(f"Variational 第 {index + 1} 条持仓不是对象")
+        position_info = position.get("position_info")
+        if not isinstance(position_info, Mapping):
+            raise ValueError(f"Variational 第 {index + 1} 条持仓缺少 position_info")
+        instrument = position_info.get("instrument")
+        if not isinstance(instrument, Mapping):
+            raise ValueError(f"Variational 第 {index + 1} 条持仓缺少 instrument")
+        symbol = _symbol(
+            instrument.get("underlying"),
+            label=f"Variational 第 {index + 1} 条持仓币种",
+        )
+        if symbol not in targets:
+            continue
+        unrealized_pnl += _decimal(
+            position.get("upnl"),
+            label=f"Variational {symbol} 未实现盈亏",
+        )
+    return cash + unrealized_pnl
 
 
-async def read_hyperliquid_equity(client: Any) -> Decimal:
-    """读取 Hyperliquid 的 Spot USDC 加全部未实现盈亏。
+async def read_hyperliquid_equity(
+    client: Any,
+    symbols: Sequence[str],
+) -> Decimal:
+    """读取 Hyperliquid Spot USDC，并只叠加策略币种的未实现盈亏。
 
-    ``marginSummary.accountValue`` 是统一账户占用的诊断值，不能与 Spot
-    USDC 相加；这里故意只使用余额对象中的两个明确分项。
+    此处直接读取持仓分项，完全不读取 ``marginSummary.accountValue``。
     """
-    balance = await client.get_balance()
-    spot = _decimal(
-        getattr(balance, "spot_usdc_total", None),
-        label="Hyperliquid Spot USDC",
-    )
-    upnl = _decimal(
-        getattr(balance, "unrealized_pnl_total", None),
-        label="Hyperliquid 未实现盈亏",
-    )
-    return spot + upnl
+    targets = {_symbol(symbol, label="Hyperliquid 策略币种") for symbol in symbols}
+    state = await client._user_state()
+    if not isinstance(state, Mapping) or not isinstance(
+        state.get("assetPositions"), list
+    ):
+        raise ValueError("Hyperliquid 账户状态缺少 assetPositions 数组")
+
+    unrealized_pnl = Decimal("0")
+    for index, raw_position in enumerate(state["assetPositions"]):
+        if not isinstance(raw_position, Mapping) or not isinstance(
+            raw_position.get("position"), Mapping
+        ):
+            raise ValueError(f"Hyperliquid 第 {index + 1} 条持仓结构无效")
+        position = raw_position["position"]
+        symbol = _symbol(
+            position.get("coin"),
+            label=f"Hyperliquid 第 {index + 1} 条持仓币种",
+        )
+        if symbol not in targets:
+            continue
+        unrealized_pnl += _decimal(
+            position.get("unrealizedPnl"),
+            label=f"Hyperliquid {symbol} 未实现盈亏",
+        )
+
+    spot_state = await client._spot_user_state()
+    if not isinstance(spot_state, Mapping) or not isinstance(
+        spot_state.get("balances"), list
+    ):
+        raise ValueError("Hyperliquid Spot 账户状态缺少 balances 数组")
+    spot = Decimal("0")
+    for index, balance in enumerate(spot_state["balances"]):
+        if not isinstance(balance, Mapping):
+            raise ValueError(f"Hyperliquid Spot 第 {index + 1} 条余额不是对象")
+        if balance.get("coin") != "USDC":
+            continue
+        spot += _decimal(
+            balance.get("total"),
+            label="Hyperliquid Spot USDC",
+        )
+    return spot + unrealized_pnl
 
 
-async def _read_lighter_from_env() -> Decimal:
+async def _read_lighter_from_env(symbols: tuple[str, ...]) -> Decimal:
     """用只读 Lighter 客户端采集默认实盘账户。"""
     from adapters.lighter_client import LighterClient
 
@@ -370,18 +491,18 @@ async def _read_lighter_from_env() -> Decimal:
     client = LighterClient(l1_address=address)
     try:
         await client.connect()
-        return await read_lighter_equity(client)
+        return await read_lighter_equity(client, symbols)
     finally:
         await client.close()
 
 
-async def _read_variational_from_env() -> Decimal:
+async def _read_variational_from_env(symbols: tuple[str, ...]) -> Decimal:
     """用只读 Variational 客户端采集默认实盘账户。"""
     from adapters.variational_client import Session, VariationalClient
 
     client = VariationalClient(Session.from_env())
     try:
-        return await read_variational_equity(client)
+        return await read_variational_equity(client, symbols)
     finally:
         await client.close()
 
@@ -416,13 +537,13 @@ async def _read_variational_volume_from_env(
 def _hyperliquid_reader(prefix: str) -> EquityReader:
     """为指定环境变量前缀创建只读 Hyperliquid 采集函数。"""
 
-    async def read() -> Decimal:
+    async def read(symbols: tuple[str, ...]) -> Decimal:
         from adapters.hyperliquid_client import HyperliquidClient
 
         client = HyperliquidClient.from_env(prefix=prefix, trading_enabled=False)
         try:
             await client.connect()
-            return await read_hyperliquid_equity(client)
+            return await read_hyperliquid_equity(client, symbols)
         finally:
             await client.close()
 
@@ -490,12 +611,18 @@ def build_default_volume_readers(
 async def collect_snapshot(
     readers: Mapping[str, EquityReader],
     *,
+    instances: Sequence[VolumeInstanceConfig] = DEFAULT_VOLUME_INSTANCES,
     timestamp: float | None = None,
 ) -> dict[str, object]:
     """并发采集账户；失败账户只写错误标注，不阻断其他账户。"""
 
+    symbols_by_source = strategy_symbols_by_source(instances)
+
     async def read_one(name: str, reader: EquityReader) -> Decimal:
-        return _decimal(await reader(), label=f"{name} 账户权益")
+        symbols = symbols_by_source.get(name)
+        if not symbols:
+            raise ValueError(f"{name} 没有对应的策略币种配置")
+        return _decimal(await reader(symbols), label=f"{name} 账户权益")
 
     names = tuple(readers)
     results = await asyncio.gather(
@@ -513,8 +640,13 @@ async def collect_snapshot(
         total += result
 
     snapshot: dict[str, object] = {
+        "schema": 2,
         "ts": time.time() if timestamp is None else timestamp,
         "accounts": accounts,
+        "symbols": {
+            name: list(symbols_by_source.get(name, ()))
+            for name in names
+        },
         "total_equity": _decimal_text(total),
     }
     if errors:
@@ -644,10 +776,15 @@ async def record_once(
     readers: Mapping[str, EquityReader],
     output: Path | str,
     *,
+    instances: Sequence[VolumeInstanceConfig] = DEFAULT_VOLUME_INSTANCES,
     timestamp: float | None = None,
 ) -> dict[str, object]:
     """采集并落盘一次；账户失败由快照自身承载，不向外抛出。"""
-    snapshot = await collect_snapshot(readers, timestamp=timestamp)
+    snapshot = await collect_snapshot(
+        readers,
+        instances=instances,
+        timestamp=timestamp,
+    )
     append_snapshot(output, snapshot)
     return snapshot
 

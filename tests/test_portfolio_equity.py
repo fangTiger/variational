@@ -10,43 +10,142 @@ from decimal import Decimal
 from tools import portfolio_equity
 
 
-@dataclass(frozen=True)
-class FakeHyperliquidBalance:
-    """模拟 Hyperliquid 余额分项。"""
+class FakeHyperliquidClient:
+    """返回固定清算状态和 Spot 状态的只读客户端。"""
 
-    equity: Decimal
-    spot_usdc_total: Decimal
-    unrealized_pnl_total: Decimal
-    perps_account_value: Decimal
+    async def _user_state(self) -> dict:
+        """返回同时含策略仓位和人工仓位的清算状态。"""
+        return {
+            "marginSummary": {"accountValue": "62.00"},
+            "assetPositions": [
+                {"position": {"coin": "BTC", "unrealizedPnl": "-5.00"}},
+                {"position": {"coin": "SOL", "unrealizedPnl": "17.25"}},
+            ],
+        }
 
-
-class FakeBalanceClient:
-    """返回固定余额对象的只读客户端。"""
-
-    def __init__(self, balance: object) -> None:
-        self.balance = balance
-
-    async def get_balance(self) -> object:
-        """返回测试余额。"""
-        return self.balance
+    async def _spot_user_state(self) -> dict:
+        """返回 Spot USDC 余额。"""
+        return {"balances": [{"coin": "USDC", "total": "557.34"}]}
 
 
-def test_hyperliquid_equity_is_spot_plus_unrealized_not_account_value() -> None:
-    """Hyperliquid 权益绝不能把统一账户 accountValue 再加到 Spot 上。"""
-    balance = FakeHyperliquidBalance(
-        equity=Decimal("552.34"),
-        spot_usdc_total=Decimal("557.34"),
-        unrealized_pnl_total=Decimal("-5.00"),
-        perps_account_value=Decimal("62.00"),
-    )
+class FakeLighterClient:
+    """返回固定账户详情的只读 Lighter 客户端。"""
 
+    def _require_account_index(self) -> int:
+        """返回测试账户索引。"""
+        return 7
+
+    async def _get_json(self, path: str, *, params: dict) -> dict:
+        """返回抵押品及全部持仓。"""
+        assert path == "/api/v1/account"
+        assert params == {"by": "index", "value": "7"}
+        return {
+            "accounts": [
+                {
+                    "collateral": "579.037583",
+                    "total_asset_value": "546.757606",
+                    "positions": [
+                        {"symbol": "BTC", "unrealized_pnl": "3.285513"},
+                        {"symbol": "SOL", "unrealized_pnl": "-35.565490"},
+                    ],
+                }
+            ]
+        }
+
+    def _raise_api_error(self, data: dict, *, context: str) -> None:
+        """测试响应固定成功。"""
+        assert context == "账户详情查询"
+
+
+class FakeVariationalClient:
+    """返回固定余额及持仓的只读 Variational 客户端。"""
+
+    async def raw(self, path: str) -> dict:
+        """返回不含筛选逻辑的账户余额。"""
+        assert path == "/portfolio"
+        return {"balance": "552.340000000000000001", "upnl": "95"}
+
+    async def get_positions(self) -> list[dict]:
+        """返回策略 BTC 仓位和人工 SOL 仓位。"""
+        return [
+            {
+                "position_info": {"instrument": {"underlying": "BTC"}},
+                "upnl": "-5.000000000000000002",
+            },
+            {
+                "position_info": {"instrument": {"underlying": "SOL"}},
+                "upnl": "100",
+            },
+        ]
+
+
+def test_hyperliquid_equity_filters_manual_symbol_and_ignores_account_value() -> None:
+    """Hyperliquid 只把 BTC 浮盈亏加到 Spot，且绝不使用 accountValue。"""
     equity = asyncio.run(
-        portfolio_equity.read_hyperliquid_equity(FakeBalanceClient(balance))
+        portfolio_equity.read_hyperliquid_equity(
+            FakeHyperliquidClient(),
+            ("BTC",),
+        )
     )
 
+    assert isinstance(equity, Decimal)
     assert equity == Decimal("552.34")
-    assert equity == balance.spot_usdc_total + balance.unrealized_pnl_total
-    assert equity != balance.spot_usdc_total + balance.perps_account_value
+    assert equity != Decimal("557.34") + Decimal("62.00")
+    assert equity != Decimal("557.34") + Decimal("-5.00") + Decimal("17.25")
+
+
+def test_lighter_equity_uses_collateral_plus_filtered_unrealized_pnl() -> None:
+    """Lighter 排除人工 SOL，结果必须不同于抵押品加全量浮盈亏。"""
+    equity = asyncio.run(
+        portfolio_equity.read_lighter_equity(FakeLighterClient(), ("BTC",))
+    )
+
+    assert isinstance(equity, Decimal)
+    assert equity == Decimal("579.037583") + Decimal("3.285513")
+    assert equity != (
+        Decimal("579.037583")
+        + Decimal("3.285513")
+        + Decimal("-35.565490")
+    )
+
+
+def test_variational_equity_excludes_manual_symbol_without_float_conversion() -> None:
+    """Variational 只累计策略 BTC 的浮盈亏，并保持 Decimal 精度。"""
+    equity = asyncio.run(
+        portfolio_equity.read_variational_equity(
+            FakeVariationalClient(),
+            ("BTC",),
+        )
+    )
+
+    assert isinstance(equity, Decimal)
+    assert equity == Decimal("547.339999999999999999")
+
+
+def test_strategy_symbols_are_derived_from_volume_instance_configs() -> None:
+    """账户币种集合必须随成交量实例配置变化，不维护第二份固定表。"""
+    instances = (
+        portfolio_equity.VolumeInstanceConfig(
+            key="first",
+            heartbeat_path=portfolio_equity.PROJECT_ROOT / "first.jsonl",
+            symbol="doge",
+            primary_source="lighter",
+            hedge_source="hyperliquid",
+        ),
+        portfolio_equity.VolumeInstanceConfig(
+            key="second",
+            heartbeat_path=portfolio_equity.PROJECT_ROOT / "second.jsonl",
+            symbol="eth",
+            primary_source="variational",
+            hedge_source="lighter",
+        ),
+    )
+
+    assert portfolio_equity.strategy_symbols_by_source(instances) == {
+        "hyperliquid": ("DOGE",),
+        "lighter": ("DOGE", "ETH"),
+        "variational": ("ETH",),
+    }
 
 
 def test_failed_account_is_skipped_annotated_and_record_is_still_written(
@@ -54,13 +153,16 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
 ) -> None:
     """单个账户读取失败时仍写部分记录，且单次进程正常返回。"""
 
-    async def lighter_reader() -> Decimal:
+    async def lighter_reader(symbols: tuple[str, ...]) -> Decimal:
+        assert symbols == ("BTC", "ETH")
         return Decimal("561.49")
 
-    async def variational_reader() -> Decimal:
+    async def variational_reader(symbols: tuple[str, ...]) -> Decimal:
+        assert symbols == ("BTC", "ETH")
         raise RuntimeError("临时不可用")
 
-    async def hyperliquid_reader() -> Decimal:
+    async def hyperliquid_reader(symbols: tuple[str, ...]) -> Decimal:
+        assert symbols == ("BTC",)
         return Decimal("572.20")
 
     output = tmp_path / "portfolio_equity.jsonl"
@@ -78,6 +180,12 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
 
     written = json.loads(output.read_text(encoding="utf-8"))
     assert snapshot == written
+    assert written["schema"] == 2
+    assert written["symbols"] == {
+        "lighter": ["BTC", "ETH"],
+        "variational": ["BTC", "ETH"],
+        "hyperliquid": ["BTC"],
+    }
     assert written["accounts"] == {
         "lighter": "561.49",
         "hyperliquid": "572.20",

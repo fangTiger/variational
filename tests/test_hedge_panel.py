@@ -265,6 +265,35 @@ def test_portfolio_cumulative_pnl_uses_first_and_last_with_decimal(tmp_path) -> 
     assert "cumulative-pnl-block" not in html
 
 
+def test_portfolio_cumulative_pnl_uses_only_latest_snapshot_schema(tmp_path) -> None:
+    """新旧权益口径混合时，只从最新 schema 的首条开始累计。"""
+    portfolio_path = _write_portfolio_equity(
+        tmp_path,
+        [
+            {"schema": 1, "ts": "1000.1", "total_equity": "900.00"},
+            {"schema": 1, "ts": "1001.1", "total_equity": "950.00"},
+            {
+                "schema": 2,
+                "ts": "1002.1",
+                "total_equity": "1000.000000000000000001",
+            },
+            {
+                "schema": 2,
+                "ts": "1003.1",
+                "total_equity": "1001.230000000000000003",
+            },
+        ],
+    )
+
+    summary = hedge_panel.read_portfolio_equity_summary(portfolio_path)
+
+    assert summary.snapshot_count == 2
+    assert summary.started_at == Decimal("1002.1")
+    assert summary.first_equity == Decimal("1000.000000000000000001")
+    assert summary.latest_equity == Decimal("1001.230000000000000003")
+    assert summary.cumulative_pnl == Decimal("1.230000000000000002")
+
+
 def test_fewer_than_two_portfolio_snapshots_show_accumulating(tmp_path) -> None:
     """组合权益快照不足两条时不得伪装成零收益。"""
     instance = _write_instance(tmp_path, name="accumulating", heartbeat=_heartbeat())
