@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PORTFOLIO_EQUITY_PATH = PROJECT_ROOT / "data" / "portfolio_equity.jsonl"
+DEFAULT_PORTFOLIO_VOLUME_PATH = PROJECT_ROOT / "data" / "portfolio_volume.jsonl"
 STALE_AFTER_SECONDS = Decimal("120")
 GOOD_EXPOSURE_LIMIT = Decimal("0.0001")
 WARN_EXPOSURE_LIMIT = Decimal("0.001")
@@ -53,6 +54,19 @@ class PortfolioEquitySummary:
     def ready(self) -> bool:
         """至少两条有效组合快照才形成可解释的累计盈亏。"""
         return self.snapshot_count >= 2 and self.cumulative_pnl is not None
+
+
+@dataclass(frozen=True)
+class PortfolioVolumeSummary:
+    """组合最新一条累计成交量快照的按币种统计。"""
+
+    totals_by_symbol: dict[str, Decimal] | None = None
+    estimated_symbols: frozenset[str] = frozenset()
+
+    @property
+    def ready(self) -> bool:
+        """至少存在一个有效币种金额时才展示累计成交量。"""
+        return bool(self.totals_by_symbol)
 
 
 @dataclass(frozen=True)
@@ -184,6 +198,66 @@ def read_portfolio_equity_summary(path: Path | str) -> PortfolioEquitySummary:
         latest_equity=latest[1],
         snapshot_count=snapshot_count,
     )
+
+
+def read_portfolio_volume_summary(path: Path | str) -> PortfolioVolumeSummary:
+    """从最近的有效本地快照读取按币种累计成交量和推算标记。"""
+    for line in _read_recent_jsonl_lines(
+        path,
+        max_lines=PREVIOUS_READING_MAX_LINES,
+    ):
+        try:
+            payload = _load_json(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_totals = payload.get("totals_by_symbol")
+        if not isinstance(raw_totals, dict) or not raw_totals:
+            continue
+
+        totals: dict[str, Decimal] = {}
+        valid = True
+        for raw_symbol, raw_amount in raw_totals.items():
+            if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+                valid = False
+                break
+            symbol = raw_symbol.strip().upper()
+            amount = _to_decimal(raw_amount)
+            if amount is None or amount < 0:
+                valid = False
+                break
+            totals[symbol] = amount
+        if not valid or not totals:
+            continue
+
+        estimated_symbols: set[str] = set()
+        raw_instances = payload.get("instances")
+        if isinstance(raw_instances, dict):
+            for raw_instance in raw_instances.values():
+                if not isinstance(raw_instance, dict):
+                    continue
+                raw_symbol = raw_instance.get("symbol")
+                if not isinstance(raw_symbol, str):
+                    continue
+                symbol = raw_symbol.strip().upper()
+                if symbol not in totals:
+                    continue
+                raw_estimated = raw_instance.get("estimated")
+                if not isinstance(raw_estimated, list):
+                    continue
+                for leg in raw_estimated:
+                    if leg not in {"primary", "hedge"}:
+                        continue
+                    amount = _to_decimal(raw_instance.get(leg))
+                    if amount is not None and amount >= 0:
+                        estimated_symbols.add(symbol)
+                        break
+        return PortfolioVolumeSummary(
+            totals_by_symbol=totals,
+            estimated_symbols=frozenset(estimated_symbols),
+        )
+    return PortfolioVolumeSummary()
 
 
 def _read_recent_jsonl_lines(path: Path | str, *, max_lines: int) -> list[str]:
@@ -639,6 +713,39 @@ def _render_portfolio_pnl(summary: PortfolioEquitySummary) -> str:
     )
 
 
+def _render_portfolio_volume(summary: PortfolioVolumeSummary) -> str:
+    """把按币种累计成交量渲染为仅次于累计盈亏的醒目指标。"""
+    if not summary.ready or summary.totals_by_symbol is None:
+        return (
+            '  <section class="portfolio-volume-block" aria-label="组合累计成交量">\n'
+            "    <span>累计成交量</span>\n"
+            '    <strong class="portfolio-volume-value mono volume-missing">统计中…</strong>\n'
+            "    <small>等待首条累计成交量快照</small>\n"
+            "  </section>"
+        )
+
+    parts: list[str] = []
+    for symbol in sorted(summary.totals_by_symbol):
+        amount = summary.totals_by_symbol[symbol]
+        approximate = "≈" if symbol in summary.estimated_symbols else ""
+        parts.append(f"{symbol} {approximate}${amount:,.0f}")
+    total = sum(summary.totals_by_symbol.values(), Decimal("0"))
+    total_approximate = "≈" if summary.estimated_symbols else ""
+    hint = (
+        "≈ 表示含 Lighter 对手腿推算值"
+        if summary.estimated_symbols
+        else "全部金额均来自交易所成交记录"
+    )
+    return (
+        '  <section class="portfolio-volume-block" aria-label="组合累计成交量">\n'
+        "    <span>累计成交量</span>\n"
+        f'    <strong class="portfolio-volume-value mono">{_text(" · ".join(parts))}</strong>\n'
+        f'    <b class="portfolio-volume-total mono">合计 {total_approximate}${total:,.0f}</b>\n'
+        f"    <small>{_text(hint)}</small>\n"
+        "  </section>"
+    )
+
+
 def _render_offset(primary: object, hedge: object) -> str:
     """渲染两腿是否互相抵消的一句话结论。"""
     a, b = _to_decimal(primary), _to_decimal(hedge)
@@ -788,6 +895,7 @@ def build_page(
     *,
     instances: Iterable[InstanceConfig] = DEFAULT_INSTANCES,
     portfolio_equity_path: Path | str = DEFAULT_PORTFOLIO_EQUITY_PATH,
+    portfolio_volume_path: Path | str = DEFAULT_PORTFOLIO_VOLUME_PATH,
     now: Decimal | int | str | None = None,
 ) -> str:
     """采集全部实例并渲染自包含深色 HTML。"""
@@ -840,6 +948,7 @@ def build_page(
         else None
     )
     portfolio_summary = read_portfolio_equity_summary(portfolio_equity_path)
+    portfolio_volume_summary = read_portfolio_volume_summary(portfolio_volume_path)
     any_interlocked = any(
         _truthy(snapshot.data.get("hedge_interlock_active")) for snapshot in snapshots
     )
@@ -847,6 +956,7 @@ def build_page(
     interlock_summary = "有互锁" if any_interlocked else "无互锁"
     cards = "".join(_render_instance(snapshot, current) for snapshot in snapshots)
     portfolio_pnl = _render_portfolio_pnl(portfolio_summary)
+    portfolio_volume = _render_portfolio_volume(portfolio_volume_summary)
     rendered_at = datetime.fromtimestamp(int(current)).strftime("%Y-%m-%d %H:%M:%S")
 
     css = """
@@ -902,6 +1012,23 @@ def build_page(
         letter-spacing: -0.045em;
       }
       .portfolio-pnl-block small { color: var(--muted); font-size: 13px; }
+      .portfolio-volume-block {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        gap: 5px 18px;
+        margin: 12px 0;
+        padding: 16px 18px;
+        background: linear-gradient(135deg, rgba(66, 211, 146, 0.11), rgba(17, 24, 33, 0.98));
+        border: 1px solid rgba(66, 211, 146, 0.48);
+        border-radius: 11px;
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+      }
+      .portfolio-volume-block > span { font-size: 16px; font-weight: 800; }
+      .portfolio-volume-value { font-size: clamp(22px, 3.3vw, 36px); text-align: center; }
+      .portfolio-volume-total { font-size: clamp(18px, 2.3vw, 28px); color: var(--green); }
+      .portfolio-volume-block small { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
+      .volume-missing { color: var(--muted); }
       .overview {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1079,6 +1206,9 @@ def build_page(
       @media (max-width: 520px) {
         .shell { width: min(100% - 20px, 1180px); padding-top: 18px; }
         .overview, .facts, .legs { grid-template-columns: 1fr; }
+        .portfolio-volume-block { grid-template-columns: 1fr; }
+        .portfolio-volume-value { text-align: left; }
+        .portfolio-volume-block small { grid-column: auto; }
         .card-top, .title-row { flex-direction: column; }
         .status { white-space: normal; }
         .instance-card { padding: 14px; }
@@ -1101,6 +1231,7 @@ def build_page(
       <p class="manual-note">本页不会自动刷新，请按 F5 获取最新数据。</p>
     </header>
     {portfolio_pnl}
+    {portfolio_volume}
     <section class="overview" aria-label="总览">
       <div class="{exposure_summary_class}">
         <span>{len(snapshots)} 个实例净敞口合计</span>
@@ -1129,12 +1260,14 @@ def render_html(
     instances: Iterable[InstanceConfig] = DEFAULT_INSTANCES,
     *,
     portfolio_equity_path: Path | str = DEFAULT_PORTFOLIO_EQUITY_PATH,
+    portfolio_volume_path: Path | str = DEFAULT_PORTFOLIO_VOLUME_PATH,
     now: Decimal | int | str | None = None,
 ) -> str:
     """提供与其他本地面板一致的 HTML 渲染入口。"""
     return build_page(
         instances=instances,
         portfolio_equity_path=portfolio_equity_path,
+        portfolio_volume_path=portfolio_volume_path,
         now=now,
     )
 
@@ -1144,6 +1277,7 @@ class HedgePanelHandler(http.server.BaseHTTPRequestHandler):
 
     instances = DEFAULT_INSTANCES
     portfolio_equity_path = DEFAULT_PORTFOLIO_EQUITY_PATH
+    portfolio_volume_path = DEFAULT_PORTFOLIO_VOLUME_PATH
 
     def do_GET(self) -> None:
         """只响应面板首页。"""
@@ -1153,6 +1287,7 @@ class HedgePanelHandler(http.server.BaseHTTPRequestHandler):
         body = build_page(
             instances=self.instances,
             portfolio_equity_path=self.portfolio_equity_path,
+            portfolio_volume_path=self.portfolio_volume_path,
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")

@@ -55,6 +55,16 @@ def _write_portfolio_equity(tmp_path, rows: list[dict]) -> Path:
     return path
 
 
+def _write_portfolio_volume(tmp_path, rows: list[dict]) -> Path:
+    """写入组合累计成交量测试数据并返回路径。"""
+    path = tmp_path / "portfolio_volume.jsonl"
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _heartbeat(**overrides) -> dict:
     """生成一条完整心跳。"""
     data = {
@@ -278,6 +288,82 @@ def test_fewer_than_two_portfolio_snapshots_show_accumulating(tmp_path) -> None:
     assert html.count("累计中…") == 1
     assert "+$0.00" not in html
     assert "portfolio-pnl-value mono pnl-missing" in html
+
+
+def test_portfolio_volume_marks_estimated_symbols_with_approximately(tmp_path) -> None:
+    """累计成交量含 Lighter 推算腿时必须显示约等号，不能伪装实测。"""
+    instance = _write_instance(tmp_path, name="volume", heartbeat=_heartbeat())
+    volume_path = _write_portfolio_volume(
+        tmp_path,
+        [
+            {
+                "ts": 1787590000.0,
+                "instances": {
+                    "lighter_entropy": {
+                        "symbol": "BTC",
+                        "since": 1787383380.0,
+                        "primary": "155866.12",
+                        "hedge": "155866.12",
+                        "estimated": ["primary"],
+                    },
+                    "variational_entropy": {
+                        "symbol": "BTC",
+                        "since": 1787475540.0,
+                        "primary": "24480.00",
+                        "hedge": "22683.40",
+                        "estimated": [],
+                    },
+                    "lighter_variational_eth": {
+                        "symbol": "ETH",
+                        "since": 1787578800.0,
+                        "primary": "1936.00",
+                        "hedge": "1936.00",
+                        "estimated": ["primary"],
+                    },
+                },
+                "totals_by_symbol": {
+                    "BTC": "358895.64",
+                    "ETH": "3872.00",
+                },
+            }
+        ],
+    )
+
+    summary = hedge_panel.read_portfolio_volume_summary(volume_path)
+    html = hedge_panel.build_page(
+        instances=(instance,),
+        portfolio_volume_path=volume_path,
+        now=NOW,
+    )
+
+    assert summary.totals_by_symbol == {
+        "BTC": Decimal("358895.64"),
+        "ETH": Decimal("3872.00"),
+    }
+    assert summary.estimated_symbols == frozenset({"BTC", "ETH"})
+    assert "累计成交量" in html
+    assert "BTC ≈$358,896 · ETH ≈$3,872" in html
+    assert "合计 ≈$362,768" in html
+    assert "≈ 表示含 Lighter 对手腿推算值" in html
+
+
+def test_missing_portfolio_volume_shows_collecting_instead_of_zero(tmp_path) -> None:
+    """累计成交量数据缺失时显示统计中，不能伪装为零。"""
+    instance = _write_instance(
+        tmp_path,
+        name="volume_missing",
+        heartbeat=_heartbeat(),
+    )
+
+    html = hedge_panel.build_page(
+        instances=(instance,),
+        portfolio_volume_path=tmp_path / "missing_volume.jsonl",
+        now=NOW,
+    )
+
+    assert "累计成交量" in html
+    assert "统计中…" in html
+    assert "合计 $0" not in html
 
 
 def test_each_leg_and_pair_render_signed_pnl_with_entries(tmp_path) -> None:
