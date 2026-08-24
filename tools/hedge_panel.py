@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_PORTFOLIO_EQUITY_PATH = PROJECT_ROOT / "data" / "portfolio_equity.jsonl"
 STALE_AFTER_SECONDS = Decimal("120")
 GOOD_EXPOSURE_LIMIT = Decimal("0.0001")
 WARN_EXPOSURE_LIMIT = Decimal("0.001")
@@ -39,6 +40,22 @@ class InstanceConfig:
 
 
 @dataclass(frozen=True)
+class PortfolioEquitySummary:
+    """整个账户组合从首条到末条权益快照的统计。"""
+
+    cumulative_pnl: Decimal | None = None
+    started_at: Decimal | None = None
+    first_equity: Decimal | None = None
+    latest_equity: Decimal | None = None
+    snapshot_count: int = 0
+
+    @property
+    def ready(self) -> bool:
+        """至少两条有效组合快照才形成可解释的累计盈亏。"""
+        return self.snapshot_count >= 2 and self.cumulative_pnl is not None
+
+
+@dataclass(frozen=True)
 class PreviousReading:
     """心跳历史中的一条有效字段读数。"""
 
@@ -56,6 +73,9 @@ class InstanceSnapshot:
     pid: int | None
     running: bool
     previous_readings: dict[str, PreviousReading]
+    #: 首条心跳时间戳，用于算已运行天数。取心跳而非进程启动时间，
+    #: 这样重启不会把计数清零。
+    first_seen_ts: Decimal | None = None
 
     @property
     def data(self) -> dict:
@@ -119,6 +139,51 @@ def read_last_jsonl(path: Path | str) -> dict:
             return {}
         return value if isinstance(value, dict) else {}
     return {}
+
+
+def read_portfolio_equity_summary(path: Path | str) -> PortfolioEquitySummary:
+    """读取有效组合权益快照，并以 Decimal 计算首末差值。"""
+    first: tuple[Decimal, Decimal] | None = None
+    latest: tuple[Decimal, Decimal] | None = None
+    snapshot_count = 0
+    try:
+        stream = Path(path).open("r", encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return PortfolioEquitySummary()
+
+    with stream:
+        try:
+            for line in stream:
+                if not line.strip():
+                    continue
+                try:
+                    payload = _load_json(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                timestamp = _to_decimal(payload.get("ts"))
+                total_equity = _to_decimal(payload.get("total_equity"))
+                if timestamp is None or total_equity is None:
+                    continue
+                snapshot = (timestamp, total_equity)
+                if first is None:
+                    first = snapshot
+                latest = snapshot
+                snapshot_count += 1
+        except (OSError, UnicodeDecodeError):
+            return PortfolioEquitySummary()
+
+    if first is None or latest is None:
+        return PortfolioEquitySummary()
+    cumulative_pnl = latest[1] - first[1] if snapshot_count >= 2 else None
+    return PortfolioEquitySummary(
+        cumulative_pnl=cumulative_pnl,
+        started_at=first[0],
+        first_equity=first[1],
+        latest_equity=latest[1],
+        snapshot_count=snapshot_count,
+    )
 
 
 def _read_recent_jsonl_lines(path: Path | str, *, max_lines: int) -> list[str]:
@@ -205,7 +270,49 @@ def collect_instance(config: InstanceConfig) -> InstanceSnapshot:
             if needs_history
             else {}
         ),
+        first_seen_ts=read_first_heartbeat_ts(config.heartbeat_path),
     )
+
+
+def read_first_heartbeat_ts(path: Path | str) -> Decimal | None:
+    """读取心跳文件首行的时间戳；不可读或缺失时返回 None。
+
+    只读第一行，不加载整个文件——心跳是逐轮追加的，长期运行后会很大。
+    """
+    try:
+        with Path(path).open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                try:
+                    payload = _load_json(line)
+                except json.JSONDecodeError:
+                    return None
+                if not isinstance(payload, dict):
+                    return None
+                return _to_decimal(payload.get("ts"))
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def _run_days(first_ts: object, now: Decimal) -> Decimal | None:
+    """由首条心跳时间算出已运行天数。"""
+    start = _to_decimal(first_ts)
+    if start is None:
+        return None
+    elapsed = now - start
+    return elapsed / Decimal("86400") if elapsed >= 0 else None
+
+
+def _run_days_text(first_ts: object, now: Decimal) -> str:
+    """把运行时长渲染成中文，不足一天时用小时表示。"""
+    days = _run_days(first_ts, now)
+    if days is None:
+        return "—"
+    if days < 1:
+        return f"{days * 24:.1f} 小时"
+    return f"{days:.1f} 天"
 
 
 def _to_decimal(value: object) -> Decimal | None:
@@ -277,6 +384,17 @@ def _local_time(value: object) -> str:
         return "—"
 
 
+def _equity_start_time(value: object) -> str:
+    """把累计权益统计起点格式化为月日和时分。"""
+    timestamp = _to_decimal(value)
+    if timestamp is None:
+        return "—"
+    try:
+        return datetime.fromtimestamp(int(timestamp)).strftime("%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return "—"
+
+
 def _countdown(due_at: object, now: Decimal) -> str:
     """把到期时间转换为中文倒计时。"""
     due = _to_decimal(due_at)
@@ -328,6 +446,14 @@ def _money_text(value: object) -> str:
         return "—"
     sign = "-" if pnl < 0 else "+"
     return f"{sign}${abs(pnl):,.2f}"
+
+
+def _equity_text(value: object) -> str:
+    """把总权益格式化为不带盈亏符号的美元金额。"""
+    equity = _to_decimal(value)
+    if equity is None:
+        return "—"
+    return f"${equity:,.2f}"
 
 
 def _field(data: dict, primary: str, *fallbacks: str) -> object:
@@ -485,7 +611,30 @@ def _render_pair_pnl(value: object) -> str:
         '  <section class="pair-pnl-block">\n'
         "    <span>本对盈亏</span>\n"
         f'    <strong class="pair-pnl-value mono {_pnl_class(value)}">{_text(_money_text(value))}</strong>\n'
-        "    <small>两腿盈亏相互抵消，本对合计才是真实损益</small>\n"
+        "    <small>当前这一轮两腿未实现盈亏合计；两腿盈亏相互抵消，本对合计才是真实损益</small>\n"
+        "  </section>"
+    )
+
+
+def _render_portfolio_pnl(summary: PortfolioEquitySummary) -> str:
+    """把组合级累计盈亏渲染为页面最醒目的主指标。"""
+    if summary.ready:
+        value_text = _money_text(summary.cumulative_pnl)
+        value_class = _pnl_class(summary.cumulative_pnl)
+        hint = (
+            f"自 {_equity_start_time(summary.started_at)} 起 · 权益 "
+            f"{_equity_text(summary.first_equity)} → "
+            f"{_equity_text(summary.latest_equity)}"
+        )
+    else:
+        value_text = "累计中…"
+        value_class = "pnl-missing"
+        hint = "等待至少两条组合权益快照"
+    return (
+        '  <section class="portfolio-pnl-block" aria-label="组合累计盈亏">\n'
+        "    <span>累计盈亏</span>\n"
+        f'    <strong class="portfolio-pnl-value mono {value_class}">{_text(value_text)}</strong>\n'
+        f"    <small>{_text(hint)}</small>\n"
         "  </section>"
     )
 
@@ -541,9 +690,10 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
         else ""
     )
 
+    run_days = _run_days_text(snapshot.first_seen_ts, now)
     if snapshot.running:
         status_class = "status running"
-        status_text = f"运行中 · PID {snapshot.pid}"
+        status_text = f"运行中 · PID {snapshot.pid} · 已跑 {run_days}"
     elif snapshot.pid is not None:
         status_class = "status stopped"
         status_text = f"未运行 · PID {snapshot.pid} 已退出"
@@ -570,6 +720,11 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
         net_text = _decimal_text(net_exposure)
         net_class = exposure_class(net_exposure)
         net_hint = "绝对值越接近 0 越好"
+    net_status_class = (
+        "net-status net-status-danger"
+        if net_class == "exposure-bad"
+        else "net-status"
+    )
     interlock_reason = _field(data, "hedge_interlock_reason")
 
     if interlocked:
@@ -604,7 +759,7 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
     <div class="round">第 <span class="mono">{_text(round_index)}</span> 轮</div>
   </div>
 
-  <section class="net-block">
+  <section class="{net_status_class}">
     <span>净敞口</span>
     <strong class="net-value mono {net_class}">{_text(net_text)}</strong>
     <small class="{'previous-reading mono' if net_state == 'read-failed' else ''}">{_text(net_hint)}</small>
@@ -632,6 +787,7 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
 def build_page(
     *,
     instances: Iterable[InstanceConfig] = DEFAULT_INSTANCES,
+    portfolio_equity_path: Path | str = DEFAULT_PORTFOLIO_EQUITY_PATH,
     now: Decimal | int | str | None = None,
 ) -> str:
     """采集全部实例并渲染自包含深色 HTML。"""
@@ -640,14 +796,27 @@ def build_page(
         current = Decimal(str(time.time()))
     snapshots = tuple(collect_instance(config) for config in instances)
 
+    # 累计运行按「实例·天」求和：三个实例各跑一天，等于累计三天的刷量时长。
+    run_day_values = [
+        days
+        for snapshot in snapshots
+        if (days := _run_days(snapshot.first_seen_ts, current)) is not None
+    ]
+    total_run_days_text = (
+        f"{sum(run_day_values):.1f} 实例·天" if run_day_values else "—"
+    )
+
     exposures: list[Decimal] = []
     exposures_complete = bool(snapshots)
+    any_bad_exposure = False
     for snapshot in snapshots:
         parsed = _to_decimal(snapshot.data.get("net_exposure"))
         if _field_state(snapshot, "net_exposure", current) != "valid" or parsed is None:
             exposures_complete = False
-            break
+            continue
         exposures.append(parsed)
+        if exposure_class(parsed) == "exposure-bad":
+            any_bad_exposure = True
     total_exposure = (
         sum(exposures, Decimal("0"))
         if exposures_complete
@@ -655,6 +824,11 @@ def build_page(
     )
     total_text = _decimal_text(total_exposure)
     total_class = exposure_class(total_exposure)
+    exposure_summary_class = (
+        "exposure-summary exposure-summary-danger"
+        if any_bad_exposure
+        else "exposure-summary exposure-summary-normal"
+    )
     pair_pnls = [
         parsed
         for snapshot in snapshots
@@ -665,12 +839,14 @@ def build_page(
         if snapshots and len(pair_pnls) == len(snapshots)
         else None
     )
+    portfolio_summary = read_portfolio_equity_summary(portfolio_equity_path)
     any_interlocked = any(
         _truthy(snapshot.data.get("hedge_interlock_active")) for snapshot in snapshots
     )
     interlock_summary_class = "summary-danger" if any_interlocked else "summary-ok"
     interlock_summary = "有互锁" if any_interlocked else "无互锁"
     cards = "".join(_render_instance(snapshot, current) for snapshot in snapshots)
+    portfolio_pnl = _render_portfolio_pnl(portfolio_summary)
     rendered_at = datetime.fromtimestamp(int(current)).strftime("%Y-%m-%d %H:%M:%S")
 
     css = """
@@ -707,13 +883,32 @@ def build_page(
       h2 { margin-top: 4px; font-size: clamp(16px, 1.6vw, 20px); }
       .rendered-at { margin-top: 10px; color: var(--muted); }
       .manual-note { margin-top: 5px; color: var(--blue); font-size: 13px; }
+      .portfolio-pnl-block {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        margin: 16px 0 12px;
+        padding: 22px 18px 20px;
+        background: linear-gradient(135deg, rgba(99, 168, 255, 0.14), rgba(17, 24, 33, 0.98));
+        border: 1px solid rgba(99, 168, 255, 0.55);
+        border-radius: 12px;
+        box-shadow: 0 22px 60px rgba(0, 0, 0, 0.34);
+      }
+      .portfolio-pnl-block > span { color: var(--text); font-size: 17px; font-weight: 800; }
+      .portfolio-pnl-value {
+        margin: 8px 0 7px;
+        font-size: clamp(52px, 8vw, 86px);
+        line-height: 0.98;
+        letter-spacing: -0.045em;
+      }
+      .portfolio-pnl-block small { color: var(--muted); font-size: 13px; }
       .overview {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 10px;
         margin: 12px 0;
       }
-      .summary-item, .instance-card {
+      .summary-item, .exposure-summary, .instance-card {
         background: rgba(17, 24, 33, 0.96);
         border: 1px solid var(--line);
         border-radius: 10px;
@@ -724,6 +919,18 @@ def build_page(
       .summary-item strong { display: block; margin-top: 4px; font-size: 19px; }
       .summary-ok { color: var(--green); }
       .summary-danger { color: var(--red); }
+      .exposure-summary { padding: 10px 14px; }
+      .exposure-summary span, .exposure-summary strong { display: block; }
+      .exposure-summary-normal { color: var(--muted); font-size: 12px; }
+      .exposure-summary-normal strong { margin-top: 3px; color: var(--muted); font-size: 14px; font-weight: 600; }
+      .exposure-summary-danger {
+        color: var(--red);
+        border-color: var(--red);
+        background: rgba(255, 85, 115, 0.14);
+        box-shadow: 0 0 0 2px rgba(255, 85, 115, 0.14), 0 18px 48px rgba(0, 0, 0, 0.28);
+      }
+      .exposure-summary-danger span { font-size: 15px; font-weight: 800; }
+      .exposure-summary-danger strong { margin-top: 4px; color: var(--red); font-size: clamp(28px, 4vw, 42px); }
       /* 列数随宽度自适应：够宽就把所有实例排在同一行，不逼用户下拉。
          写死列数会在加第 N 对时突然折行——那正是这次要修的问题。 */
       .cards {
@@ -769,29 +976,43 @@ def build_page(
       }
       .eyebrow { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
       .round { color: var(--blue); }
-      .net-block {
+      .net-status {
         display: flex;
-        flex-direction: column;
+        flex-wrap: wrap;
         align-items: center;
+        gap: 5px 9px;
         margin: 12px 0 10px;
-        padding: 12px 10px;
+        padding: 7px 10px;
         background: var(--panel-2);
         border: 1px solid var(--line);
         border-radius: 9px;
+        color: var(--muted);
+        font-size: 12px;
       }
-      .net-block > span, .net-block small { color: var(--muted); }
+      .net-status > span::after { content: "："; }
+      .net-status small { margin-left: auto; color: var(--muted); }
       .net-value {
         max-width: 100%;
-        margin: 4px 0;
-        font-size: clamp(28px, 3.2vw, 40px);
-        line-height: 1.08;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.2;
         overflow-wrap: anywhere;
       }
       .exposure-good { color: var(--green); }
       .exposure-warn { color: var(--yellow); }
       .exposure-bad { color: var(--red); }
       .exposure-missing { color: var(--muted); }
-      .exposure-read-failed { color: var(--yellow); font-size: clamp(19px, 2.4vw, 27px); }
+      .net-status:not(.net-status-danger) .net-value { color: var(--muted); }
+      .net-status .exposure-read-failed { color: var(--yellow); }
+      .net-status-danger {
+        padding: 12px;
+        color: var(--red);
+        border-color: var(--red);
+        background: rgba(255, 85, 115, 0.15);
+      }
+      .net-status-danger > span { font-size: 15px; font-weight: 800; }
+      .net-status-danger .net-value { color: var(--red); font-size: clamp(28px, 3.2vw, 40px); }
+      .net-status-danger small { color: #ffc0cc; }
       .facts, .legs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
       .facts > div, .leg {
         min-width: 0;
@@ -829,7 +1050,7 @@ def build_page(
         border-radius: 9px;
       }
       .pair-pnl-block > span { color: var(--text); font-size: 15px; font-weight: 800; }
-      .pair-pnl-value { justify-self: end; font-size: clamp(27px, 4vw, 38px); line-height: 1; }
+      .pair-pnl-value { justify-self: end; font-size: clamp(23px, 3vw, 34px); line-height: 1; }
       .pair-pnl-block small { grid-column: 1 / -1; margin-top: 5px; color: var(--muted); }
       .offset { margin: 9px 0 0; font-size: 13px; }
       .offset-ok { color: var(--green); }
@@ -879,14 +1100,19 @@ def build_page(
       <p class="rendered-at">页面渲染时间：<span class="mono">{rendered_at}</span>（本地时间）</p>
       <p class="manual-note">本页不会自动刷新，请按 F5 获取最新数据。</p>
     </header>
+    {portfolio_pnl}
     <section class="overview" aria-label="总览">
-      <div class="summary-item">
+      <div class="{exposure_summary_class}">
         <span>{len(snapshots)} 个实例净敞口合计</span>
         <strong class="mono {total_class}">{_text(total_text)}</strong>
       </div>
       <div class="summary-item">
         <span>{len(snapshots)} 对合计盈亏</span>
         <strong class="mono {_pnl_class(total_pair_pnl)}">{_text(_money_text(total_pair_pnl))}</strong>
+      </div>
+      <div class="summary-item">
+        <span>累计运行</span>
+        <strong class="mono">{_text(total_run_days_text)}</strong>
       </div>
       <div class="summary-item">
         <span>互锁总览</span>
@@ -902,23 +1128,32 @@ def build_page(
 def render_html(
     instances: Iterable[InstanceConfig] = DEFAULT_INSTANCES,
     *,
+    portfolio_equity_path: Path | str = DEFAULT_PORTFOLIO_EQUITY_PATH,
     now: Decimal | int | str | None = None,
 ) -> str:
     """提供与其他本地面板一致的 HTML 渲染入口。"""
-    return build_page(instances=instances, now=now)
+    return build_page(
+        instances=instances,
+        portfolio_equity_path=portfolio_equity_path,
+        now=now,
+    )
 
 
 class HedgePanelHandler(http.server.BaseHTTPRequestHandler):
     """定时定量对冲面板 HTTP handler。"""
 
     instances = DEFAULT_INSTANCES
+    portfolio_equity_path = DEFAULT_PORTFOLIO_EQUITY_PATH
 
     def do_GET(self) -> None:
         """只响应面板首页。"""
         if urlsplit(self.path).path != "/":
             self.send_error(404)
             return
-        body = build_page(instances=self.instances).encode("utf-8")
+        body = build_page(
+            instances=self.instances,
+            portfolio_equity_path=self.portfolio_equity_path,
+        ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

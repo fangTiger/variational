@@ -62,6 +62,26 @@ def test_execution_model_defaults_to_orderbook_and_variational_declares_rfq() ->
     assert VariationalClient.execution_model == "rfq"
 
 
+def test_get_balance_reads_portfolio_balance_and_upnl_as_decimal() -> None:
+    """Variational 权益必须由 portfolio 的余额与未实现盈亏精确相加。"""
+    client = object.__new__(VariationalClient)
+
+    async def fake_get(path: str):
+        assert path == "/portfolio"
+        return {
+            "balance": "561.490000000000000001",
+            "upnl": "-1.230000000000000002",
+        }
+
+    client._get = fake_get
+
+    balance = asyncio.run(client.get_balance())
+
+    assert balance.balance == Decimal("561.490000000000000001")
+    assert balance.upnl == Decimal("-1.230000000000000002")
+    assert balance.equity == Decimal("560.259999999999999999")
+
+
 def test_get_position_pnl_uses_upnl_entry_and_mark_value() -> None:
     """Variational 名义价值由绝对数量乘标记价计算，空头不能得到负价值。"""
     client = object.__new__(VariationalClient)

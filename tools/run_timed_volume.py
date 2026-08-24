@@ -47,6 +47,14 @@ _DEFAULT_STATE = _ROOT / "data" / "timed_volume" / "state.json"
 _DEFAULT_HEARTBEAT = _ROOT / "data" / "timed_volume.jsonl"
 
 
+def _equity_path_from_heartbeat(path: Path | str) -> Path:
+    """把心跳路径转换为同目录的独立权益 JSONL 路径。"""
+    heartbeat = Path(path)
+    name = heartbeat.name
+    prefix = name[:-6] if name.lower().endswith(".jsonl") else name
+    return heartbeat.with_name(f"{prefix}_equity.jsonl")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建定时定量策略命令行参数。"""
     parser = argparse.ArgumentParser(description="跨交易所定时定量对冲刷量")
@@ -121,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--heartbeat-path",
         default=str(_DEFAULT_HEARTBEAT),
         help=f"独立 JSONL 心跳文件（默认 {_DEFAULT_HEARTBEAT}）",
+    )
+    parser.add_argument(
+        "--equity-path",
+        default=None,
+        help="独立权益 JSONL 文件（默认与心跳同目录并追加 _equity 后缀）",
     )
     parser.add_argument(
         "--lighter-address",
@@ -494,6 +507,7 @@ def _acquire_state_path_lease(
 
 def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
     """把命令行参数转换成策略配置。"""
+    equity_path = getattr(args, "equity_path", None)
     return TimedVolumeConfig(
         primary_market=args.market,
         hedge_market=args.hedge_market,
@@ -505,6 +519,11 @@ def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
         maker_poll_s=args.maker_poll,
         position_tolerance=args.position_tolerance,
         state_path=Path(args.state_path),
+        equity_path=(
+            Path(equity_path)
+            if equity_path is not None
+            else _equity_path_from_heartbeat(args.heartbeat_path)
+        ),
     )
 
 
@@ -521,6 +540,12 @@ def startup_summary(
         if state.current_notional_usd is not None
         else "无"
     )
+    equity_path = getattr(args, "equity_path", None)
+    effective_equity_path = (
+        Path(equity_path)
+        if equity_path is not None
+        else _equity_path_from_heartbeat(args.heartbeat_path)
+    )
     lines = [
         "定时定量对冲配置",
         f"主腿：{args.primary_venue}，账户：{_mask_account(_primary_account_identity(args))}",
@@ -532,6 +557,7 @@ def startup_summary(
         f"maker 优先等待：{args.maker_timeout:g} 秒",
         f"轮次状态：{args.state_path}",
         f"独立心跳：{args.heartbeat_path}",
+        f"权益快照：{effective_equity_path}",
         f"当前轮次：{state.round_index}",
         f"当前方向：{current_direction}",
         f"当前轮名义额：{current_notional}",

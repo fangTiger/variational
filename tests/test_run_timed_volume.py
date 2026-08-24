@@ -43,6 +43,33 @@ def test_parser_defaults_match_two_hour_randomized_notional_plan() -> None:
     assert config.notional_max_usd == 2300
     assert config.initial_direction is RoundDirection.LONG
     assert config.maker_timeout_s == 300.0
+    assert config.equity_path == cli._DEFAULT_HEARTBEAT.with_name(
+        "timed_volume_equity.jsonl"
+    )
+
+
+def test_equity_path_defaults_next_to_selected_heartbeat(tmp_path) -> None:
+    """未显式指定权益文件时，应跟随心跳目录和文件名前缀。"""
+    cli = _cli()
+    heartbeat_path = tmp_path / "instance_var.jsonl"
+    args = cli.build_parser().parse_args(
+        ["--heartbeat-path", str(heartbeat_path)]
+    )
+
+    config = cli.build_config(args)
+
+    assert config.equity_path == tmp_path / "instance_var_equity.jsonl"
+
+
+def test_explicit_equity_path_overrides_derived_default(tmp_path) -> None:
+    """显式 --equity-path 必须原样进入策略配置。"""
+    cli = _cli()
+    equity_path = tmp_path / "custom.jsonl"
+    args = cli.build_parser().parse_args(["--equity-path", str(equity_path)])
+
+    config = cli.build_config(args)
+
+    assert config.equity_path == equity_path
 
 
 def test_build_primary_client_supports_variational(monkeypatch) -> None:

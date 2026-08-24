@@ -45,6 +45,16 @@ def _write_instance(
     )
 
 
+def _write_portfolio_equity(tmp_path, rows: list[dict]) -> Path:
+    """写入组合级权益测试数据并返回路径。"""
+    path = tmp_path / "portfolio_equity.jsonl"
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _heartbeat(**overrides) -> dict:
     """生成一条完整心跳。"""
     data = {
@@ -135,6 +145,34 @@ def test_net_exposure_color_levels(tmp_path) -> None:
         assert f'class="net-value mono {expected_class}"' in html
 
 
+def test_net_exposure_is_compact_normally_and_prominent_when_any_instance_is_bad(
+    tmp_path,
+) -> None:
+    """正常净敞口只占灰色小行，任一实例超限时总览与实例行都放大标红。"""
+    normal = _write_instance(
+        tmp_path,
+        name="normal_exposure",
+        heartbeat=_heartbeat(net_exposure="0.000005"),
+    )
+    bad = _write_instance(
+        tmp_path,
+        name="bad_exposure",
+        heartbeat=_heartbeat(net_exposure="0.002"),
+    )
+
+    normal_html = hedge_panel.build_page(instances=(normal,), now=NOW)
+    bad_html = hedge_panel.build_page(instances=(normal, bad), now=NOW)
+
+    assert 'class="exposure-summary exposure-summary-normal"' in normal_html
+    assert 'class="net-status"' in normal_html
+    assert 'class="exposure-summary exposure-summary-danger"' not in normal_html
+    assert 'class="exposure-summary exposure-summary-danger"' in bad_html
+    assert 'class="net-status net-status-danger"' in bad_html
+    assert ".exposure-summary-normal {" in normal_html
+    assert ".exposure-summary-danger {" in normal_html
+    assert ".net-status-danger {" in normal_html
+
+
 def test_every_exposure_class_has_css_rule(tmp_path) -> None:
     """每个可能返回的配色 class 都必须有对应 CSS 规则。
 
@@ -173,6 +211,73 @@ def test_panel_source_keeps_zero_credential_boundary() -> None:
 
     for forbidden in ("getenv", "load_dotenv", "httpx", "requests", "私钥"):
         assert forbidden not in source
+
+
+def test_portfolio_cumulative_pnl_uses_first_and_last_with_decimal(tmp_path) -> None:
+    """组合累计盈亏必须用首末总权益的 Decimal 差值，不能经过 float。"""
+    instance = _write_instance(
+        tmp_path,
+        name="cumulative",
+        heartbeat=_heartbeat(pair_pnl="-1.24"),
+    )
+    portfolio_path = _write_portfolio_equity(
+        tmp_path,
+        [
+            {
+                "ts": "1787481600.1",
+                "accounts": {"lighter": "561.49", "variational": "552.34"},
+                "total_equity": "1113.830000000000000001",
+            },
+            {
+                "ts": "1787485200.2",
+                "accounts": {"lighter": "561.72", "variational": "552.34"},
+                "total_equity": "1114.060000000000000003",
+            },
+        ],
+    )
+
+    summary = hedge_panel.read_portfolio_equity_summary(portfolio_path)
+    html = hedge_panel.build_page(
+        instances=(instance,),
+        portfolio_equity_path=portfolio_path,
+        now=NOW,
+    )
+
+    assert summary.cumulative_pnl == Decimal("0.230000000000000002")
+    assert summary.first_equity == Decimal("1113.830000000000000001")
+    assert summary.latest_equity == Decimal("1114.060000000000000003")
+    assert "本对盈亏" in html
+    assert "累计盈亏" in html
+    assert "+$0.23" in html
+    assert "自 08-23 18:40 起 · 权益 $1,113.83 → $1,114.06" in html
+    assert 'class="portfolio-pnl-value mono pnl-positive">+$0.23</' in html
+    assert "全部实例累计盈亏" not in html
+    assert "cumulative-pnl-block" not in html
+
+
+def test_fewer_than_two_portfolio_snapshots_show_accumulating(tmp_path) -> None:
+    """组合权益快照不足两条时不得伪装成零收益。"""
+    instance = _write_instance(tmp_path, name="accumulating", heartbeat=_heartbeat())
+    portfolio_path = _write_portfolio_equity(
+        tmp_path,
+        [
+            {
+                "ts": "1787481600.1",
+                "accounts": {"lighter": "561.49"},
+                "total_equity": "561.49",
+            }
+        ],
+    )
+
+    html = hedge_panel.build_page(
+        instances=(instance,),
+        portfolio_equity_path=portfolio_path,
+        now=NOW,
+    )
+
+    assert html.count("累计中…") == 1
+    assert "+$0.00" not in html
+    assert "portfolio-pnl-value mono pnl-missing" in html
 
 
 def test_each_leg_and_pair_render_signed_pnl_with_entries(tmp_path) -> None:
@@ -496,6 +601,7 @@ def test_default_instances_cover_all_running_pairs() -> None:
     for attr in ("key", "heartbeat_path", "state_path", "lock_path"):
         values = [getattr(c, attr) for c in configs]
         assert len(set(values)) == len(values), f"{attr} 存在重复"
+    assert all(not hasattr(config, "equity_path") for config in configs)
 
 
 def test_cards_layout_adapts_to_instance_count(tmp_path) -> None:
@@ -510,3 +616,50 @@ def test_cards_layout_adapts_to_instance_count(tmp_path) -> None:
 
     assert "grid-template-columns: repeat(auto-fit, minmax(" in html
     assert "repeat(2, minmax(0, 1fr));\n        gap: 14px" not in html
+
+
+def test_run_days_come_from_first_heartbeat_not_process_start(tmp_path) -> None:
+    """已运行天数取首条心跳时间，重启进程不应把计数清零。
+
+    锁文件里的 started_at 每次重启都会刷新，用它算天数会一直显示很小的值，
+    看不出策略实际跑了多久。
+    """
+    instance = _write_instance(tmp_path, name="days", heartbeat=_heartbeat())
+    # 在最新心跳之前补一条三天前的首条心跳
+    old = _heartbeat(ts=str(NOW - Decimal("259200")))
+    latest = instance.heartbeat_path.read_text(encoding="utf-8")
+    instance.heartbeat_path.write_text(
+        json.dumps(old, ensure_ascii=False) + "\n" + latest, encoding="utf-8"
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert "已跑 3.0 天" in html
+    assert "3.0 实例·天" in html
+
+
+def test_run_days_show_hours_when_under_one_day(tmp_path) -> None:
+    """不足一天时用小时表示，避免显示 0.0 天让人以为没在跑。"""
+    instance = _write_instance(
+        tmp_path,
+        name="hours",
+        heartbeat=_heartbeat(ts=str(NOW - Decimal("7200"))),
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert "已跑 2.0 小时" in html
+
+
+def test_total_run_days_sum_across_instances(tmp_path) -> None:
+    """累计运行按实例·天求和，反映总刷量时长。"""
+    first = _write_instance(
+        tmp_path, name="a", heartbeat=_heartbeat(ts=str(NOW - Decimal("172800")))
+    )
+    second = _write_instance(
+        tmp_path, name="b", heartbeat=_heartbeat(ts=str(NOW - Decimal("86400")))
+    )
+
+    html = hedge_panel.build_page(instances=(first, second), now=NOW)
+
+    assert "3.0 实例·天" in html

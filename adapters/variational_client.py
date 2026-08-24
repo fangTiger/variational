@@ -66,6 +66,15 @@ class VariationalRequestError(Exception):
         self.data = data
 
 
+@dataclass(frozen=True)
+class VariationalBalance:
+    """供通用引擎读取的 Variational 权益及其组成。"""
+
+    equity: Decimal
+    balance: Decimal
+    upnl: Decimal
+
+
 @dataclass
 class Session:
     """一次登录会话所需的凭证。
@@ -197,6 +206,25 @@ class VariationalClient(ExchangeAdapter):
     async def get_positions(self) -> Any:
         """全部持仓（原始结构）。"""
         return await self._get("/positions")
+
+    async def get_balance(self) -> VariationalBalance:
+        """从 portfolio 返回余额、未实现盈亏与两者之和。"""
+        data = await self._get("/portfolio")
+        if not isinstance(data, dict):
+            raise ValueError("Variational portfolio 响应不是对象")
+        if data.get("balance") is None:
+            raise ValueError("Variational portfolio 缺少 balance")
+        if data.get("upnl") is None:
+            raise ValueError("Variational portfolio 缺少 upnl")
+        try:
+            balance = Decimal(str(data["balance"]))
+            upnl = Decimal(str(data["upnl"]))
+            equity = balance + upnl
+        except (ArithmeticError, ValueError) as exc:
+            raise ValueError("Variational portfolio 权益字段不是有效十进制数") from exc
+        if not balance.is_finite() or not upnl.is_finite() or not equity.is_finite():
+            raise ValueError("Variational portfolio 权益字段必须为有限数")
+        return VariationalBalance(equity=equity, balance=balance, upnl=upnl)
 
     async def get_funding(
         self, underlying: str = "BTC", instrument_type: str = "perpetual_future"

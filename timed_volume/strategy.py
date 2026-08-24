@@ -54,6 +54,7 @@ class TimedVolumeConfig:
     position_tolerance: Decimal = Decimal("0.000001")
     state_path: Path | str = Path("data/timed_volume/state.json")
     convergence_attempts: int = 3
+    equity_path: Path | str | None = None
 
     def __post_init__(self) -> None:
         """归一化配置并拒绝无法安全运行的数值。"""
@@ -67,6 +68,8 @@ class TimedVolumeConfig:
         )
         self.position_tolerance = Decimal(str(self.position_tolerance))
         self.state_path = Path(self.state_path)
+        if self.equity_path is not None:
+            self.equity_path = Path(self.equity_path)
         if not isinstance(self.initial_direction, RoundDirection):
             self.initial_direction = RoundDirection(str(self.initial_direction))
         if self.notional_min_usd <= 0 or self.notional_max_usd <= 0:
@@ -1201,9 +1204,60 @@ class TimedHedgedVolumeStrategy:
             pair_pnl=pair_pnl,
         )
 
+    @staticmethod
+    def _balance_equity(balance: object, role: str) -> Decimal:
+        """从适配器余额对象提取有限 Decimal 权益。"""
+        raw_equity = getattr(balance, "equity", None)
+        if raw_equity is None:
+            raise ValueError(f"{role}余额响应缺少 equity")
+        try:
+            equity = Decimal(str(raw_equity))
+        except (ArithmeticError, ValueError) as exc:
+            raise ValueError(f"{role}权益不是有效十进制数") from exc
+        if not equity.is_finite():
+            raise ValueError(f"{role}权益必须为有限数")
+        return equity
+
+    async def _record_equity_snapshot(
+        self,
+        result: TimedVolumeResult,
+        *,
+        now: float | None,
+    ) -> None:
+        """仅在平仓后两腿精确归零时追加展示用权益快照。"""
+        path = self.config.equity_path
+        if (
+            path is None
+            or result.action != "closed"
+            or result.primary_size != 0
+            or result.hedge_size != 0
+        ):
+            return
+
+        primary_balance, hedge_balance = await asyncio.gather(
+            self.primary.get_balance(),
+            self.hedge.get_balance(),
+        )
+        primary_equity = self._balance_equity(primary_balance, "主腿")
+        hedge_equity = self._balance_equity(hedge_balance, "对冲腿")
+        payload = {
+            "ts": time.time() if now is None else float(now),
+            "round_index": result.round_index,
+            "primary_equity": str(primary_equity),
+            "hedge_equity": str(hedge_equity),
+            "total_equity": str(primary_equity + hedge_equity),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
     async def run_once(self, *, now: float | None = None) -> TimedVolumeResult:
         """先完成交易状态机，再以完全隔离的只读查询补充面板数据。"""
         result = await self._run_trading_once(now=now)
+        try:
+            await self._record_equity_snapshot(result, now=now)
+        except Exception as exc:  # noqa: BLE001 权益记账不得改变任何交易结果
+            logger.warning("权益快照记录失败，仅影响累计盈亏展示：%s", exc)
         try:
             return await self._attach_display_pnl(result)
         except Exception as exc:  # noqa: BLE001 展示数据不得改变任何交易结果

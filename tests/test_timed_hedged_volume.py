@@ -34,6 +34,8 @@ class _AdapterCore:
         min_order_size: Decimal = Decimal("0.001"),
         rounded_amount: Decimal | None = None,
         min_order_size_error: Exception | None = None,
+        balance_equity: Decimal = Decimal("500"),
+        balance_error: Exception | None = None,
     ) -> None:
         self.name = name
         self.position = Decimal("0")
@@ -43,6 +45,9 @@ class _AdapterCore:
             Decimal(str(rounded_amount)) if rounded_amount is not None else None
         )
         self.min_order_size_error = min_order_size_error
+        self.balance_equity = Decimal(str(balance_equity))
+        self.balance_error = balance_error
+        self.balance_reads = 0
         self.events: list[tuple] = []
         self._orders: dict[str, SimpleNamespace] = {}
 
@@ -63,6 +68,13 @@ class _AdapterCore:
         if self.rounded_amount is not None:
             return self.rounded_amount
         return Decimal(str(amount)).quantize(Decimal("0.001"))
+
+    async def get_balance(self):
+        """返回测试权益，或按配置模拟展示接口失败。"""
+        self.balance_reads += 1
+        if self.balance_error is not None:
+            raise self.balance_error
+        return SimpleNamespace(equity=self.balance_equity)
 
     async def _place(
         self,
@@ -309,6 +321,7 @@ def _build_strategy(
     auth_error_types: tuple[type[Exception], ...] = (),
     on_auth_error=None,
     on_hedge_auth_error=None,
+    equity_path=None,
 ):
     api = _api()
     lighter = lighter or _LighterAdapter("lighter")
@@ -324,6 +337,7 @@ def _build_strategy(
         maker_poll_s=0.0,
         position_tolerance=position_tolerance,
         state_path=tmp_path / state_name,
+        equity_path=equity_path,
     )
     strategy = api.TimedHedgedVolumeStrategy(
         lighter,
@@ -336,6 +350,109 @@ def _build_strategy(
         on_hedge_auth_error=on_hedge_auth_error,
     )
     return api, strategy, lighter, extended
+
+
+def test_equity_read_failure_does_not_block_close_or_next_open(tmp_path) -> None:
+    """权益记账失败不得改变平仓结果、触发互锁或阻止下一轮。"""
+    equity_path = tmp_path / "equity.jsonl"
+    lighter = _LighterAdapter(
+        "lighter",
+        balance_error=RuntimeError("权益接口暂时不可用"),
+    )
+    executor = _ScriptedExecutor()
+    api, strategy, _, extended = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        executor=executor,
+        equity_path=equity_path,
+    )
+
+    opened = asyncio.run(strategy.run_once(now=0.0))
+    closed = asyncio.run(strategy.run_once(now=7200.0))
+    next_opened = asyncio.run(strategy.run_once(now=7200.0))
+
+    assert opened.action == "opened"
+    assert closed.action == "closed"
+    assert closed.hedge_available is True
+    assert strategy.hedge_interlock_active is False
+    assert not equity_path.exists()
+    assert next_opened.action == "opened"
+    assert next_opened.direction is api.RoundDirection.SHORT
+    assert lighter.position == -extended.position != 0
+
+
+def test_equity_snapshot_is_written_only_after_both_legs_are_exactly_flat(
+    tmp_path,
+) -> None:
+    """只有两腿实仓精确归零时才允许读取并写入权益。"""
+    equity_path = tmp_path / "equity.jsonl"
+    lighter = _LighterAdapter(
+        "lighter",
+        min_order_size=Decimal("0.00020"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        min_order_size=Decimal("0.00010"),
+        rounded_amount=Decimal("0.00100"),
+    )
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=_ScriptedExecutor(),
+        equity_path=equity_path,
+        position_tolerance=Decimal("0.00020"),
+    )
+    asyncio.run(strategy.run_once(now=0.0))
+
+    strategy._trade_executor = _ScriptedExecutor(
+        {
+            "lighter": [{"actual_delta": "-0.00095"}],
+            "extended": [{"actual_delta": "0.00095"}],
+        }
+    )
+    closed_with_dust = asyncio.run(strategy.run_once(now=7200.0))
+
+    assert closed_with_dust.action == "closed"
+    assert closed_with_dust.primary_size == Decimal("0.00005")
+    assert closed_with_dust.hedge_size == Decimal("-0.00005")
+    assert lighter.balance_reads == 0
+    assert extended.balance_reads == 0
+    assert not equity_path.exists()
+
+
+def test_exact_flat_close_appends_decimal_equity_strings(tmp_path) -> None:
+    """精确平仓后按 Decimal 合计两腿权益，并以字符串追加 JSONL。"""
+    equity_path = tmp_path / "equity.jsonl"
+    lighter = _LighterAdapter(
+        "lighter",
+        balance_equity=Decimal("561.490000000000000001"),
+    )
+    extended = _ExtendedAdapter(
+        "extended",
+        balance_equity=Decimal("552.340000000000000002"),
+    )
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=extended,
+        executor=_ScriptedExecutor(),
+        equity_path=equity_path,
+    )
+
+    asyncio.run(strategy.run_once(now=0.0))
+    closed = asyncio.run(strategy.run_once(now=7200.0))
+
+    assert closed.action == "closed"
+    row = json.loads(equity_path.read_text(encoding="utf-8"))
+    assert row == {
+        "ts": 7200.0,
+        "round_index": 1,
+        "primary_equity": "561.490000000000000001",
+        "hedge_equity": "552.340000000000000002",
+        "total_equity": "1113.830000000000000003",
+    }
 
 
 def test_primary_auth_error_reloads_client_and_skips_round(tmp_path) -> None:
