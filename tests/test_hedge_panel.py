@@ -280,3 +280,188 @@ def test_each_leg_shows_side_and_usd_value(tmp_path) -> None:
     assert "leg-short" in html and "leg-long" in html
     assert "-$1,680" in html
     assert "$1,680" in html
+
+
+def test_fresh_position_read_failure_is_not_rendered_as_empty_position(tmp_path) -> None:
+    """新鲜心跳明确读取失败时，两条腿必须显示读取失败而不是空仓。"""
+    instance = _write_instance(
+        tmp_path,
+        name="read_failed",
+        heartbeat=_heartbeat(
+            action="position_read_failed",
+            primary_size=None,
+            hedge_size=None,
+            net_exposure=None,
+        ),
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert html.count('class="mono leg-read-failed">⚠ 读取失败</strong>') == 2
+    assert 'class="mono leg-flat">空仓</strong>' not in html
+
+
+def test_zero_position_is_rendered_as_empty_position_not_read_failure(tmp_path) -> None:
+    """数值零是已确认的空仓，不得误报为读取失败。"""
+    instance = _write_instance(
+        tmp_path,
+        name="empty",
+        heartbeat=_heartbeat(
+            primary_size="0",
+            hedge_size=0,
+            net_exposure="0",
+        ),
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert html.count('class="mono leg-flat">空仓</strong>') == 2
+    assert 'class="mono leg-read-failed">' not in html
+
+
+def test_read_failure_shows_previous_valid_readings_and_their_ages(tmp_path) -> None:
+    """读取失败时回溯每个字段最近的有效读数，并显示距当前的秒数。"""
+    instance = _write_instance(
+        tmp_path,
+        name="history",
+        heartbeat=_heartbeat(
+            action="position_read_failed",
+            primary_size=None,
+            hedge_size=None,
+            net_exposure=None,
+        ),
+    )
+    heartbeats = (
+        _heartbeat(
+            ts=str(NOW - Decimal("95")),
+            primary_size="-0.02630",
+            hedge_size="0.02625",
+            net_exposure="-0.00005",
+        ),
+        _heartbeat(
+            ts=str(NOW - Decimal("30")),
+            action="position_read_failed",
+            primary_size=None,
+            hedge_size=None,
+            net_exposure=None,
+        ),
+    )
+    instance.heartbeat_path.write_text(
+        "".join(json.dumps(item) + "\n" for item in heartbeats),
+        encoding="utf-8",
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert "上次读数 -0.02630（95 秒前）" in html
+    assert "上次读数 0.02625（95 秒前）" in html
+    assert "上次读数 -0.00005（95 秒前）" in html
+
+
+def test_previous_reading_scan_is_limited_to_recent_lines(tmp_path, monkeypatch) -> None:
+    """回溯只读取末尾有限行，不能随心跳文件增长而扫描整个文件。"""
+    heartbeat_path = tmp_path / "long.jsonl"
+    old_valid = _heartbeat(
+        ts=str(NOW - Decimal("5000")),
+        primary_size="9.99",
+    )
+    failures = [
+        _heartbeat(
+            ts=str(NOW - Decimal(index)),
+            action="position_read_failed",
+            primary_size=None,
+            hedge_size=None,
+            net_exposure=None,
+        )
+        for index in range(5000, 0, -1)
+    ]
+    heartbeat_path.write_text(
+        "".join(json.dumps(item) + "\n" for item in (old_valid, *failures)),
+        encoding="utf-8",
+    )
+    file_size = heartbeat_path.stat().st_size
+    bytes_read = 0
+    original_open = Path.open
+
+    class CountingReader:
+        """统计目标二进制文件的实际读取字节数。"""
+
+        def __init__(self, stream) -> None:
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def read(self, size=-1):
+            nonlocal bytes_read
+            chunk = self.stream.read(size)
+            bytes_read += len(chunk)
+            return chunk
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+    def counted_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        if path == heartbeat_path and args and args[0] == "rb":
+            return CountingReader(stream)
+        return stream
+
+    monkeypatch.setattr(Path, "open", counted_open)
+
+    readings = hedge_panel.read_previous_readings(heartbeat_path, max_lines=200)
+
+    assert readings == {}
+    assert bytes_read < file_size
+
+
+def test_missing_net_exposure_makes_overview_total_unavailable(tmp_path) -> None:
+    """任一实例净敞口读取失败时，总览不得展示不完整的部分合计。"""
+    failed = _write_instance(
+        tmp_path,
+        name="failed_exposure",
+        heartbeat=_heartbeat(
+            action="position_read_failed",
+            primary_size=None,
+            hedge_size=None,
+            net_exposure=None,
+        ),
+    )
+    valid = _write_instance(
+        tmp_path,
+        name="valid_exposure",
+        heartbeat=_heartbeat(net_exposure="0.000005"),
+    )
+
+    html = hedge_panel.build_page(instances=(failed, valid), now=NOW)
+
+    assert (
+        "两个实例净敞口合计</span>\n"
+        '        <strong class="mono exposure-missing">—</strong>'
+    ) in html
+    assert 'class="net-value mono exposure-read-failed">⚠ 读取失败</strong>' in html
+
+
+def test_read_failure_uses_yellow_hint_without_interlock_red_outline(tmp_path) -> None:
+    """常态读取抖动使用黄色提示，不得冒充互锁的整卡红色警报。"""
+    instance = _write_instance(
+        tmp_path,
+        name="yellow_failure",
+        heartbeat=_heartbeat(
+            action="position_read_failed",
+            primary_size=None,
+            hedge_size=None,
+            net_exposure=None,
+            hedge_interlock_active=False,
+        ),
+    )
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert 'class="instance-card read-failed"' in html
+    assert 'class="instance-card interlocked"' not in html
+    assert 'class="read-status">⚠ 持仓读取失败</span>' in html
+    assert ".instance-card.read-failed:not(.interlocked)" in html

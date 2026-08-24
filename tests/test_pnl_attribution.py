@@ -191,10 +191,19 @@ def test_pnl_attribution_plist_runs_hourly_from_repository() -> None:
     )
 
 
-def test_readme_documents_attribution_service_and_result() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+def test_docs_document_attribution_service_and_result() -> None:
+    """归因服务与产物路径必须在面向用户的文档中有记载。
 
-    assert "com.variational.pnl-attribution" in readme
-    assert "deploy/com.variational.pnl-attribution.plist" in readme
-    assert "python -m tools.pnl_attribution" in readme
-    assert "data/attribution.json" in readme
+    同 `test_docs_document_lighter_hedge_service_and_install_source`：
+    深度运维内容已拆到 `docs/guides/运维手册.md`，两份文档任一处命中即可。
+    """
+    docs = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "README.md", ROOT / "docs" / "guides" / "运维手册.md")
+        if path.exists()
+    )
+
+    assert "com.variational.pnl-attribution" in docs
+    assert "deploy/com.variational.pnl-attribution.plist" in docs
+    assert "python -m tools.pnl_attribution" in docs
+    assert "data/attribution.json" in docs

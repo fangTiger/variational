@@ -20,6 +20,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STALE_AFTER_SECONDS = Decimal("120")
 GOOD_EXPOSURE_LIMIT = Decimal("0.0001")
 WARN_EXPOSURE_LIMIT = Decimal("0.001")
+JSONL_READ_BLOCK_BYTES = 8192
+PREVIOUS_READING_MAX_LINES = 200
+POSITION_FIELDS = ("primary_size", "hedge_size", "net_exposure")
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,14 @@ class InstanceConfig:
 
 
 @dataclass(frozen=True)
+class PreviousReading:
+    """心跳历史中的一条有效字段读数。"""
+
+    value: object
+    timestamp: Decimal | None
+
+
+@dataclass(frozen=True)
 class InstanceSnapshot:
     """一次页面渲染所使用的实例快照。"""
 
@@ -44,6 +55,7 @@ class InstanceSnapshot:
     state: dict
     pid: int | None
     running: bool
+    previous_readings: dict[str, PreviousReading]
 
     @property
     def data(self) -> dict:
@@ -91,19 +103,47 @@ def read_json_object(path: Path | str) -> dict:
 
 def read_last_jsonl(path: Path | str) -> dict:
     """读取 JSONL 的最后一个非空行；不可读时返回空字典。"""
-    try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return {}
-    for line in reversed(lines):
-        if not line.strip():
-            continue
+    for line in _read_recent_jsonl_lines(path, max_lines=1):
         try:
             value = _load_json(line)
         except json.JSONDecodeError:
             return {}
         return value if isinstance(value, dict) else {}
     return {}
+
+
+def _read_recent_jsonl_lines(path: Path | str, *, max_lines: int) -> list[str]:
+    """从文件末尾反向读取有限数量的非空 JSONL 文本行。"""
+    if max_lines <= 0:
+        return []
+
+    recent: list[str] = []
+    try:
+        with Path(path).open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            position = stream.tell()
+            remainder = b""
+
+            while position > 0 and len(recent) < max_lines:
+                block_size = min(JSONL_READ_BLOCK_BYTES, position)
+                position -= block_size
+                stream.seek(position)
+                chunk = stream.read(block_size)
+                parts = (chunk + remainder).split(b"\n")
+                remainder = parts[0]
+
+                for raw_line in reversed(parts[1:]):
+                    if not raw_line.strip():
+                        continue
+                    recent.append(raw_line.decode("utf-8"))
+                    if len(recent) == max_lines:
+                        break
+
+            if position == 0 and len(recent) < max_lines and remainder.strip():
+                recent.append(remainder.decode("utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return []
+    return recent
 
 
 def pid_is_alive(pid: int) -> bool:
@@ -137,12 +177,25 @@ def read_process_status(lock_path: Path | str) -> tuple[int | None, bool]:
 def collect_instance(config: InstanceConfig) -> InstanceSnapshot:
     """只读采集一套实例的心跳、状态和锁文件。"""
     pid, running = read_process_status(config.lock_path)
+    heartbeat = read_last_jsonl(config.heartbeat_path)
+    state = read_json_object(config.state_path)
+    combined = dict(state)
+    combined.update(heartbeat)
+    needs_history = (
+        str(combined.get("action", "")).strip().lower() == "position_read_failed"
+        or any(_to_decimal(combined.get(field)) is None for field in POSITION_FIELDS)
+    )
     return InstanceSnapshot(
         config=config,
-        heartbeat=read_last_jsonl(config.heartbeat_path),
-        state=read_json_object(config.state_path),
+        heartbeat=heartbeat,
+        state=state,
         pid=pid,
         running=running,
+        previous_readings=(
+            read_previous_readings(config.heartbeat_path)
+            if needs_history
+            else {}
+        ),
     )
 
 
@@ -155,6 +208,36 @@ def _to_decimal(value: object) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return None
     return parsed if parsed.is_finite() else None
+
+
+def read_previous_readings(
+    path: Path | str,
+    *,
+    max_lines: int = PREVIOUS_READING_MAX_LINES,
+) -> dict[str, PreviousReading]:
+    """在最近有限行中查找各持仓字段上一条有效读数。"""
+    readings: dict[str, PreviousReading] = {}
+    for line in _read_recent_jsonl_lines(path, max_lines=max_lines):
+        try:
+            payload = _load_json(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("action", "")).strip().lower() == "position_read_failed":
+            continue
+
+        timestamp = _to_decimal(payload.get("ts"))
+        for field in POSITION_FIELDS:
+            if field in readings:
+                continue
+            value = payload.get(field)
+            if _to_decimal(value) is not None:
+                readings[field] = PreviousReading(value=value, timestamp=timestamp)
+
+        if len(readings) == len(POSITION_FIELDS):
+            break
+    return readings
 
 
 def _truthy(value: object) -> bool:
@@ -270,6 +353,7 @@ def _action(value: object) -> str:
         "waiting": "等待中",
         "skipped": "已跳过",
         "idle": "空闲",
+        "position_read_failed": "持仓读取失败",
     }
     return labels.get(normalized, _text(value))
 
@@ -284,6 +368,42 @@ def _freshness(heartbeat: dict, now: Decimal) -> tuple[str, str, bool]:
     return _local_time(timestamp), f"{seconds} 秒前", age > STALE_AFTER_SECONDS
 
 
+def _heartbeat_is_fresh(heartbeat: dict, now: Decimal) -> bool:
+    """判断心跳是否存在且仍在新鲜窗口内。"""
+    timestamp = _to_decimal(heartbeat.get("ts"))
+    if timestamp is None:
+        return False
+    return max(Decimal("0"), now - timestamp) <= STALE_AFTER_SECONDS
+
+
+def _field_state(
+    snapshot: InstanceSnapshot,
+    field: str,
+    now: Decimal,
+) -> str:
+    """返回持仓字段的有效、读取失败或心跳不可用三态。"""
+    if not _heartbeat_is_fresh(snapshot.heartbeat, now):
+        return "heartbeat-unavailable"
+    action = str(snapshot.data.get("action", "")).strip().lower()
+    if action == "position_read_failed" or _to_decimal(snapshot.data.get(field)) is None:
+        return "read-failed"
+    return "valid"
+
+
+def _previous_reading_text(
+    reading: PreviousReading | None,
+    now: Decimal,
+) -> str:
+    """格式化上一次有效读数及其距当前的时间。"""
+    if reading is None:
+        return ""
+    value_text = _decimal_text(reading.value)
+    if reading.timestamp is None:
+        return f"上次读数 {value_text}（时间未知）"
+    age = max(Decimal("0"), now - reading.timestamp)
+    return f"上次读数 {value_text}（{int(age)} 秒前）"
+
+
 def _render_leg(
     role: str,
     exchange: object,
@@ -291,6 +411,10 @@ def _render_leg(
     notional: object,
     pnl: object,
     entry: object,
+    *,
+    read_failed: bool,
+    previous_reading: PreviousReading | None,
+    now: Decimal,
 ) -> str:
     """渲染单腿持仓：方向、数量、折合美元、盈亏与入场价。
 
@@ -298,7 +422,9 @@ def _render_leg(
     对冲是否成立要靠心算两个带符号小数，实际用起来很吃力。
     """
     parsed = _to_decimal(size)
-    if parsed is None:
+    if read_failed:
+        side_class, position_text = "leg-read-failed", "⚠ 读取失败"
+    elif parsed is None:
         side, side_class, position_text = "", "leg-flat", "—"
     elif parsed > 0:
         side, side_class = "多", "leg-long"
@@ -308,14 +434,14 @@ def _render_leg(
         position_text = f"{side} {_decimal_text(size)}"
     else:
         side, side_class = "空仓", "leg-flat"
-        position_text = f"{side} {_decimal_text(size)}"
+        position_text = side
 
     # 名义额是策略给这一轮定的单边美元数，两腿共用，用它折算即可，
     # 避免面板进程为了取价而去连交易所。
     value = _to_decimal(notional)
     usd = (
         f"≈ {'-' if parsed < 0 else ''}${value:,.0f}"
-        if value is not None and parsed not in (None, 0)
+        if not read_failed and value is not None and parsed not in (None, 0)
         else ""
     )
     pnl_class = _pnl_class(pnl)
@@ -325,12 +451,19 @@ def _render_leg(
         if entry_value is not None
         else ""
     )
+    previous_text = _previous_reading_text(previous_reading, now)
+    previous_html = (
+        f'      <small class="previous-reading mono">{_text(previous_text)}</small>\n'
+        if read_failed and previous_text
+        else ""
+    )
 
     return (
         f'    <div class="leg">\n'
         f"      <span>{_text(role)} · {_text(exchange)}</span>\n"
         f'      <strong class="mono {side_class}">{_text(position_text)}</strong>\n'
         f'      <em class="leg-usd">{_text(usd)}</em>\n'
+        f"{previous_html}"
         f'      <div class="leg-pnl-row"><span>未实现盈亏</span><em class="leg-pnl mono {pnl_class}">{_text(_money_text(pnl))}</em></div>\n'
         f"{entry_html}"
         f"    </div>"
@@ -380,10 +513,24 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
     """渲染单个实例卡片。"""
     data = snapshot.data
     interlocked = _truthy(data.get("hedge_interlock_active"))
-    card_class = "instance-card interlocked" if interlocked else "instance-card"
+    primary_state = _field_state(snapshot, "primary_size", now)
+    hedge_state = _field_state(snapshot, "hedge_size", now)
+    net_state = _field_state(snapshot, "net_exposure", now)
+    read_failed = "read-failed" in (primary_state, hedge_state, net_state)
+    card_classes = ["instance-card"]
+    if interlocked:
+        card_classes.append("interlocked")
+    if read_failed:
+        card_classes.append("read-failed")
+    card_class = " ".join(card_classes)
     time_text, age_text, stale = _freshness(snapshot.heartbeat, now)
     freshness_class = "data-time stale" if stale else "data-time"
     stale_warning = "<strong>⚠ 数据可能已过期</strong>" if stale else ""
+    read_status_html = (
+        '<span class="read-status">⚠ 持仓读取失败</span>'
+        if read_failed
+        else ""
+    )
 
     if snapshot.running:
         status_class = "status running"
@@ -399,8 +546,21 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
     round_index = _field(data, "round_index")
     notional = _field(data, "notional_usd", "current_notional_usd")
     due_at = _field(data, "due_at")
-    net_exposure = _field(data, "net_exposure")
-    net_class = exposure_class(net_exposure)
+    primary_size = data.get("primary_size") if primary_state == "valid" else None
+    hedge_size = data.get("hedge_size") if hedge_state == "valid" else None
+    net_exposure = data.get("net_exposure") if net_state == "valid" else None
+    if net_state == "read-failed":
+        net_text = "⚠ 读取失败"
+        net_class = "exposure-read-failed"
+        previous_net_text = _previous_reading_text(
+            snapshot.previous_readings.get("net_exposure"),
+            now,
+        )
+        net_hint = previous_net_text or "未找到近期有效读数"
+    else:
+        net_text = _decimal_text(net_exposure)
+        net_class = exposure_class(net_exposure)
+        net_hint = "绝对值越接近 0 越好"
     interlock_reason = _field(data, "hedge_interlock_reason")
 
     if interlocked:
@@ -425,7 +585,7 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
     <div class="data-block">
       <div class="{freshness_class}">数据时间：<span class="mono">{time_text}</span>（{age_text}） {stale_warning}</div>
     </div>
-    <span class="{status_class}">{_text(status_text)}</span>
+    <div class="card-statuses">{read_status_html}<span class="{status_class}">{_text(status_text)}</span></div>
   </div>
   <div class="title-row">
     <div>
@@ -437,8 +597,8 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
 
   <section class="net-block">
     <span>净敞口</span>
-    <strong class="net-value mono {net_class}">{_text(_decimal_text(net_exposure))}</strong>
-    <small>绝对值越接近 0 越好</small>
+    <strong class="net-value mono {net_class}">{_text(net_text)}</strong>
+    <small class="{'previous-reading mono' if net_state == 'read-failed' else ''}">{_text(net_hint)}</small>
   </section>
 
   <section class="facts">
@@ -449,11 +609,11 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
   </section>
 
   <section class="legs" aria-label="两腿持仓">
-{_render_leg("主腿", snapshot.config.primary_exchange, data.get("primary_size"), notional, data.get("primary_pnl"), data.get("primary_entry"))}
-{_render_leg("对冲腿", snapshot.config.hedge_exchange, data.get("hedge_size"), notional, data.get("hedge_pnl"), data.get("hedge_entry"))}
+{_render_leg("主腿", snapshot.config.primary_exchange, primary_size, notional, data.get("primary_pnl"), data.get("primary_entry"), read_failed=primary_state == "read-failed", previous_reading=snapshot.previous_readings.get("primary_size"), now=now)}
+{_render_leg("对冲腿", snapshot.config.hedge_exchange, hedge_size, notional, data.get("hedge_pnl"), data.get("hedge_entry"), read_failed=hedge_state == "read-failed", previous_reading=snapshot.previous_readings.get("hedge_size"), now=now)}
   </section>
   {_render_pair_pnl(data.get("pair_pnl"))}
-  {_render_offset(data.get("primary_size"), data.get("hedge_size"))}
+  {_render_offset(primary_size, hedge_size)}
 
   {interlock_html}
   {_render_warnings(data.get("warnings"))}
@@ -471,12 +631,19 @@ def build_page(
         current = Decimal(str(time.time()))
     snapshots = tuple(collect_instance(config) for config in instances)
 
-    exposures = [
-        parsed
-        for snapshot in snapshots
-        if (parsed := _to_decimal(snapshot.data.get("net_exposure"))) is not None
-    ]
-    total_exposure = sum(exposures, Decimal("0")) if exposures else None
+    exposures: list[Decimal] = []
+    exposures_complete = bool(snapshots)
+    for snapshot in snapshots:
+        parsed = _to_decimal(snapshot.data.get("net_exposure"))
+        if _field_state(snapshot, "net_exposure", current) != "valid" or parsed is None:
+            exposures_complete = False
+            break
+        exposures.append(parsed)
+    total_exposure = (
+        sum(exposures, Decimal("0"))
+        if exposures_complete
+        else None
+    )
     total_text = _decimal_text(total_exposure)
     total_class = exposure_class(total_exposure)
     pair_pnls = [
@@ -549,6 +716,10 @@ def build_page(
       .summary-danger { color: var(--red); }
       .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
       .instance-card { min-width: 0; padding: 18px; }
+      .instance-card.read-failed:not(.interlocked) {
+        border-color: rgba(246, 196, 83, 0.8);
+        box-shadow: 0 0 0 1px rgba(246, 196, 83, 0.12), 0 18px 48px rgba(0, 0, 0, 0.28);
+      }
       .instance-card.interlocked {
         border: 2px solid var(--red);
         box-shadow: 0 0 0 2px rgba(255, 85, 115, 0.18), 0 18px 52px rgba(255, 85, 115, 0.18);
@@ -558,6 +729,7 @@ def build_page(
       .data-time { color: var(--text); font-size: 14px; font-weight: 700; }
       .data-time.stale { color: var(--red); }
       .data-time.stale strong { display: block; margin-top: 4px; }
+      .card-statuses { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
       .status, .round {
         flex: 0 0 auto;
         border: 1px solid var(--line);
@@ -568,6 +740,16 @@ def build_page(
       }
       .status.running { color: var(--green); border-color: rgba(66, 211, 146, 0.45); }
       .status.stopped { color: var(--muted); }
+      .read-status {
+        flex: 0 0 auto;
+        color: var(--yellow);
+        border: 1px solid rgba(246, 196, 83, 0.62);
+        border-radius: 999px;
+        padding: 6px 9px;
+        font-size: 12px;
+        white-space: nowrap;
+        background: rgba(246, 196, 83, 0.1);
+      }
       .eyebrow { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
       .round { color: var(--blue); }
       .net-block {
@@ -592,6 +774,7 @@ def build_page(
       .exposure-warn { color: var(--yellow); }
       .exposure-bad { color: var(--red); }
       .exposure-missing { color: var(--muted); }
+      .exposure-read-failed { color: var(--yellow); font-size: clamp(25px, 5vw, 38px); }
       .facts, .legs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
       .facts > div, .leg {
         min-width: 0;
@@ -606,7 +789,9 @@ def build_page(
       .leg-long { color: var(--green); }
       .leg-short { color: var(--red); }
       .leg-flat { color: var(--muted); }
+      .leg-read-failed { color: var(--yellow); }
       .leg-usd { display: block; margin-top: 3px; font-style: normal; font-size: 12px; color: var(--muted); }
+      .previous-reading { display: block; margin-top: 5px; color: var(--yellow) !important; font-size: 12px; }
       .leg-pnl-row { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
       .leg-pnl-row span { margin: 0; }
       .leg-pnl { font-style: normal; font-size: 16px; font-weight: 800; }

@@ -42,10 +42,19 @@ def test_lighter_hedge_plist_enables_15_second_maker_first_execution() -> None:
     assert arguments[option_index + 1] == "15"
 
 
-def test_readme_documents_lighter_hedge_service_and_install_source() -> None:
-    """README 必须说明服务入口及从仓库 plist 人工安装。"""
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+def test_docs_document_lighter_hedge_service_and_install_source() -> None:
+    """服务入口与「从仓库 plist 人工安装」必须在面向用户的文档中有记载。
 
-    assert "com.variational.lighter-hedge" in readme
-    assert "deploy/com.variational.lighter-hedge.plist" in readme
-    assert "tools.run_lighter_hedge --live" in readme
+    原先只查 README。深度运维内容后来拆到了 `docs/guides/运维手册.md`，
+    再硬查 README 会把正确的拆分判成错误——这里改为在两份文档里任一处命中即可，
+    守的是「这些服务有文档可查」，而不是「必须写在某个特定文件里」。
+    """
+    docs = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "README.md", ROOT / "docs" / "guides" / "运维手册.md")
+        if path.exists()
+    )
+
+    assert "com.variational.lighter-hedge" in docs
+    assert "deploy/com.variational.lighter-hedge.plist" in docs
+    assert "tools.run_lighter_hedge --live" in docs
