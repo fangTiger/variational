@@ -208,7 +208,7 @@ def test_missing_pnl_renders_dashes_without_crashing(tmp_path) -> None:
 
     assert html.count('class="leg-pnl mono pnl-missing">—</') == 2
     assert 'class="pair-pnl-value mono pnl-missing">—</' in html
-    assert "两对合计盈亏" in html
+    assert "1 对合计盈亏" in html
 
 
 def test_overview_sums_two_pair_pnls(tmp_path) -> None:
@@ -226,7 +226,7 @@ def test_overview_sums_two_pair_pnls(tmp_path) -> None:
 
     html = hedge_panel.build_page(instances=(first, second), now=NOW)
 
-    assert "两对合计盈亏" in html
+    assert "2 对合计盈亏" in html
     assert 'class="mono pnl-positive">+$0.75</strong>' in html
 
 
@@ -439,7 +439,7 @@ def test_missing_net_exposure_makes_overview_total_unavailable(tmp_path) -> None
     html = hedge_panel.build_page(instances=(failed, valid), now=NOW)
 
     assert (
-        "两个实例净敞口合计</span>\n"
+        "2 个实例净敞口合计</span>\n"
         '        <strong class="mono exposure-missing">—</strong>'
     ) in html
     assert 'class="net-value mono exposure-read-failed">⚠ 读取失败</strong>' in html
@@ -465,3 +465,34 @@ def test_read_failure_uses_yellow_hint_without_interlock_red_outline(tmp_path) -
     assert 'class="instance-card interlocked"' not in html
     assert 'class="read-status">⚠ 持仓读取失败</span>' in html
     assert ".instance-card.read-failed:not(.interlocked)" in html
+
+
+def test_overview_counts_follow_actual_instance_count(tmp_path) -> None:
+    """总览标题里的数量必须跟随实际实例数，不能写死。
+
+    原先硬编码成「两个实例」「两对合计」，加第三对时页面就开始说谎。
+    这条测试用 1 / 2 / 3 个实例各渲染一次，确保数字随之变化。
+    """
+    instances = [
+        _write_instance(tmp_path, name=f"n{i}", heartbeat=_heartbeat())
+        for i in range(3)
+    ]
+
+    for count in (1, 2, 3):
+        html = hedge_panel.build_page(instances=tuple(instances[:count]), now=NOW)
+
+        assert f"{count} 个实例净敞口合计" in html
+        assert f"{count} 对合计盈亏" in html
+
+
+def test_default_instances_cover_all_running_pairs() -> None:
+    """默认实例清单要覆盖三对，且各自路径互不相同。
+
+    路径写重了会让两张卡片显示同一份数据，而页面上看不出异常。
+    """
+    configs = hedge_panel.DEFAULT_INSTANCES
+
+    assert len(configs) == 3
+    for attr in ("key", "heartbeat_path", "state_path", "lock_path"):
+        values = [getattr(c, attr) for c in configs]
+        assert len(set(values)) == len(values), f"{attr} 存在重复"

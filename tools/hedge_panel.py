@@ -84,6 +84,15 @@ DEFAULT_INSTANCES = (
         state_path=PROJECT_ROOT / "data" / "timed_volume_var" / "state.json",
         lock_path=PROJECT_ROOT / "data" / "timed_volume_var" / "state.json.lock",
     ),
+    InstanceConfig(
+        key="lighter_variational_eth",
+        name="实例 C · Lighter × Variational（ETH）",
+        primary_exchange="Lighter",
+        hedge_exchange="Variational",
+        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_eth.jsonl",
+        state_path=PROJECT_ROOT / "data" / "timed_volume_eth" / "state.json",
+        lock_path=PROJECT_ROOT / "data" / "timed_volume_eth" / "state.json.lock",
+    ),
 )
 
 
@@ -864,11 +873,11 @@ def build_page(
     </header>
     <section class="overview" aria-label="总览">
       <div class="summary-item">
-        <span>两个实例净敞口合计</span>
+        <span>{len(snapshots)} 个实例净敞口合计</span>
         <strong class="mono {total_class}">{_text(total_text)}</strong>
       </div>
       <div class="summary-item">
-        <span>两对合计盈亏</span>
+        <span>{len(snapshots)} 对合计盈亏</span>
         <strong class="mono {_pnl_class(total_pair_pnl)}">{_text(_money_text(total_pair_pnl))}</strong>
       </div>
       <div class="summary-item">
