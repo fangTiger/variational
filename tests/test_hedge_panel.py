@@ -496,3 +496,17 @@ def test_default_instances_cover_all_running_pairs() -> None:
     for attr in ("key", "heartbeat_path", "state_path", "lock_path"):
         values = [getattr(c, attr) for c in configs]
         assert len(set(values)) == len(values), f"{attr} 存在重复"
+
+
+def test_cards_layout_adapts_to_instance_count(tmp_path) -> None:
+    """卡片列数必须自适应宽度，不能写死列数。
+
+    写死 `repeat(2, ...)` 时，加到第三对就会折行，用户得下拉才能看全。
+    用 auto-fit 让够宽时所有实例排在同一行，加第四对也不会突然折行。
+    """
+    instance = _write_instance(tmp_path, heartbeat=_heartbeat())
+
+    html = hedge_panel.build_page(instances=(instance,), now=NOW)
+
+    assert "grid-template-columns: repeat(auto-fit, minmax(" in html
+    assert "repeat(2, minmax(0, 1fr));\n        gap: 14px" not in html

@@ -699,18 +699,19 @@ def build_page(
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         font-variant-numeric: tabular-nums;
       }
-      .shell { width: min(1180px, calc(100vw - 28px)); margin: 0 auto; padding: 28px 0 42px; }
+      /* 放宽容器：三对及以上时要能一屏并排看完，不用横向或纵向滚动 */
+      .shell { width: min(1720px, calc(100vw - 28px)); margin: 0 auto; padding: 22px 0 32px; }
       .page-head { margin-bottom: 16px; }
       h1, h2, h3, p { margin: 0; }
-      h1 { font-size: clamp(26px, 4vw, 38px); line-height: 1.1; }
-      h2 { margin-top: 5px; font-size: clamp(19px, 2.2vw, 25px); }
+      h1 { font-size: clamp(22px, 2.6vw, 30px); line-height: 1.1; }
+      h2 { margin-top: 4px; font-size: clamp(16px, 1.6vw, 20px); }
       .rendered-at { margin-top: 10px; color: var(--muted); }
       .manual-note { margin-top: 5px; color: var(--blue); font-size: 13px; }
       .overview {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 12px;
-        margin: 18px 0;
+        gap: 10px;
+        margin: 12px 0;
       }
       .summary-item, .instance-card {
         background: rgba(17, 24, 33, 0.96);
@@ -718,13 +719,20 @@ def build_page(
         border-radius: 10px;
         box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
       }
-      .summary-item { padding: 14px 16px; }
+      .summary-item { padding: 11px 14px; }
       .summary-item span { display: block; color: var(--muted); font-size: 12px; }
-      .summary-item strong { display: block; margin-top: 5px; font-size: 22px; }
+      .summary-item strong { display: block; margin-top: 4px; font-size: 19px; }
       .summary-ok { color: var(--green); }
       .summary-danger { color: var(--red); }
-      .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-      .instance-card { min-width: 0; padding: 18px; }
+      /* 列数随宽度自适应：够宽就把所有实例排在同一行，不逼用户下拉。
+         写死列数会在加第 N 对时突然折行——那正是这次要修的问题。 */
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+        gap: 14px;
+        align-items: start;
+      }
+      .instance-card { min-width: 0; padding: 15px; }
       .instance-card.read-failed:not(.interlocked) {
         border-color: rgba(246, 196, 83, 0.8);
         box-shadow: 0 0 0 1px rgba(246, 196, 83, 0.12), 0 18px 48px rgba(0, 0, 0, 0.28);
@@ -765,8 +773,8 @@ def build_page(
         display: flex;
         flex-direction: column;
         align-items: center;
-        margin: 18px 0 14px;
-        padding: 18px 12px;
+        margin: 12px 0 10px;
+        padding: 12px 10px;
         background: var(--panel-2);
         border: 1px solid var(--line);
         border-radius: 9px;
@@ -775,7 +783,7 @@ def build_page(
       .net-value {
         max-width: 100%;
         margin: 4px 0;
-        font-size: clamp(38px, 7vw, 58px);
+        font-size: clamp(28px, 3.2vw, 40px);
         line-height: 1.08;
         overflow-wrap: anywhere;
       }
@@ -783,8 +791,8 @@ def build_page(
       .exposure-warn { color: var(--yellow); }
       .exposure-bad { color: var(--red); }
       .exposure-missing { color: var(--muted); }
-      .exposure-read-failed { color: var(--yellow); font-size: clamp(25px, 5vw, 38px); }
-      .facts, .legs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+      .exposure-read-failed { color: var(--yellow); font-size: clamp(19px, 2.4vw, 27px); }
+      .facts, .legs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
       .facts > div, .leg {
         min-width: 0;
         padding: 11px;
@@ -794,7 +802,7 @@ def build_page(
       }
       .facts span, .leg span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 12px; }
       .facts strong, .leg strong { overflow-wrap: anywhere; }
-      .legs { margin-top: 9px; }
+      .legs { margin-top: 7px; }
       .leg-long { color: var(--green); }
       .leg-short { color: var(--red); }
       .leg-flat { color: var(--muted); }
@@ -843,7 +851,7 @@ def build_page(
       .warnings h3 { font-size: 14px; }
       .warnings ul { margin: 7px 0 0; padding-left: 20px; }
       .warnings li + li { margin-top: 5px; }
-      @media (max-width: 820px) {
+      @media (max-width: 1080px) {
         .cards { grid-template-columns: 1fr; }
         .overview { grid-template-columns: 1fr; }
       }
