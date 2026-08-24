@@ -308,6 +308,7 @@ def _build_strategy(
     position_tolerance: Decimal = Decimal("0.000001"),
     auth_error_types: tuple[type[Exception], ...] = (),
     on_auth_error=None,
+    on_hedge_auth_error=None,
 ):
     api = _api()
     lighter = lighter or _LighterAdapter("lighter")
@@ -332,6 +333,7 @@ def _build_strategy(
         hedge_available=hedge_available,
         auth_error_types=auth_error_types,
         on_auth_error=on_auth_error,
+        on_hedge_auth_error=on_hedge_auth_error,
     )
     return api, strategy, lighter, extended
 
@@ -467,6 +469,46 @@ def test_auth_failure_after_other_leg_fill_rolls_back_filled_leg(tmp_path) -> No
     assert hedge.position == 0
     assert executor.calls[-1]["adapter"] == "extended"
     assert executor.calls[-1]["target_delta"] == Decimal("20.000")
+    assert executor.calls[-1]["reduce_only"] is True
+
+
+def test_hedge_auth_failure_after_primary_fill_rolls_back_primary_leg(tmp_path) -> None:
+    """Variational 对冲腿认证失效时停止开仓，并回滚已成交主腿。"""
+
+    class TestAuthError(Exception):
+        """测试专用认证异常。"""
+
+    primary = _LighterAdapter("lighter")
+    hedge = _ExtendedAdapter("variational")
+    executor = _ScriptedExecutor(
+        {
+            "lighter": [{}, {}],
+            "variational": [
+                {"fraction": "0", "error": TestAuthError("Cookie 已过期")},
+            ],
+        }
+    )
+
+    def failed_reload():
+        raise TestAuthError("新 Cookie 仍失效")
+
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=primary,
+        extended=hedge,
+        executor=executor,
+        auth_error_types=(TestAuthError,),
+        on_hedge_auth_error=failed_reload,
+    )
+
+    result = asyncio.run(strategy.run_once(now=0.0))
+
+    assert result.action == "auth_reload_failed"
+    assert result.hedge_available is False
+    assert primary.position == 0
+    assert hedge.position == 0
+    assert executor.calls[-1]["adapter"] == "lighter"
+    assert executor.calls[-1]["target_delta"] == Decimal("-20.000")
     assert executor.calls[-1]["reduce_only"] is True
 
 

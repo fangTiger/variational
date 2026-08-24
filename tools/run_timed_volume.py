@@ -13,6 +13,7 @@ ensure_ssl_cert()
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
 import fcntl  # noqa: E402
+import hashlib  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import time  # noqa: E402
@@ -41,6 +42,7 @@ from timed_volume.strategy import (  # noqa: E402
 logger = get_logger("timed_volume")
 
 _ROOT = Path(__file__).resolve().parent.parent
+_DATA_ROOT = _ROOT / "data"
 _DEFAULT_STATE = _ROOT / "data" / "timed_volume" / "state.json"
 _DEFAULT_HEARTBEAT = _ROOT / "data" / "timed_volume.jsonl"
 
@@ -138,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hedge-venue",
-        choices=("extended", "hyperliquid"),
+        choices=("extended", "hyperliquid", "variational"),
         default="extended",
         help="对冲腿交易所（默认 extended）",
     )
@@ -168,17 +170,19 @@ def _build_primary_client(args: argparse.Namespace):
 
 
 def _build_hedge_client(args: argparse.Namespace):
-    """按 --hedge-venue 装配对冲腿；两者都以显式交易开关构造。"""
+    """按 --hedge-venue 装配可交易对冲腿。"""
     if args.hedge_venue == "hyperliquid":
         return HyperliquidClient.from_env(
             prefix=args.hedge_env_prefix,
             trading_enabled=True,
         )
+    if args.hedge_venue == "variational":
+        return VariationalClient(Session.from_env())
     return ExtendedClient.from_env(prefix=args.account)
 
 
-def _reload_variational_primary() -> VariationalClient:
-    """覆盖重读 .env 后重建 Variational 主腿。"""
+def _reload_variational_client() -> VariationalClient:
+    """覆盖重读 .env 后重建 Variational 客户端。"""
     try:
         from dotenv import load_dotenv
 
@@ -186,6 +190,11 @@ def _reload_variational_primary() -> VariationalClient:
     except ImportError:
         pass
     return VariationalClient(Session.from_env())
+
+
+def _reload_variational_primary() -> VariationalClient:
+    """兼容既有主腿认证重载接线。"""
+    return _reload_variational_client()
 
 
 def _primary_account_identity(args: argparse.Namespace) -> str | None:
@@ -197,6 +206,8 @@ def _primary_account_identity(args: argparse.Namespace) -> str | None:
 
 def _hedge_account_identity(args: argparse.Namespace) -> str | None:
     """从离线配置解析对冲腿公开账户标识。"""
+    if args.hedge_venue == "variational":
+        return os.environ.get("VARIATIONAL_WALLET_ADDRESS") or None
     if args.hedge_venue == "hyperliquid":
         return os.environ.get(f"{args.hedge_env_prefix}_ACCOUNT_ADDRESS") or None
     public_key = os.environ.get(f"{args.account}_PUBLIC_KEY")
@@ -212,6 +223,49 @@ def _mask_account(account: str | None) -> str:
     if len(normalized) <= 8:
         return "****"
     return f"{normalized[:4]}…{normalized[-4:]}"
+
+
+def _account_fingerprint(account: str) -> str:
+    """返回规范化账户标识的十二位 SHA-256 指纹。"""
+    normalized = str(account or "").strip().casefold()
+    if not normalized:
+        raise RuntimeError("拒绝启动：缺少账户标识，无法建立市场占用锁")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+
+
+def _instance_lock_legs(args: argparse.Namespace) -> list[dict[str, str]]:
+    """生成不含原始账户信息的双腿市场占用身份。"""
+    identities = (
+        (
+            args.primary_venue,
+            _primary_account_identity(args),
+            args.market,
+            "主腿",
+        ),
+        (
+            args.hedge_venue,
+            _hedge_account_identity(args),
+            args.hedge_market,
+            "对冲腿",
+        ),
+    )
+    legs: list[dict[str, str]] = []
+    for venue, account, market, label in identities:
+        if not str(account or "").strip():
+            raise RuntimeError(
+                f"拒绝启动：{label} {venue} 缺少公开账户标识，无法建立市场占用锁"
+            )
+        normalized_market = str(market or "").strip()
+        if not normalized_market:
+            raise RuntimeError(f"拒绝启动：{label} {venue} 缺少市场标识")
+        legs.append(
+            {
+                "venue": str(venue).strip().casefold(),
+                "account_fingerprint": _account_fingerprint(str(account)),
+                "market": normalized_market,
+            }
+        )
+    return legs
 
 
 def _validate_account_pair(
@@ -270,6 +324,59 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _normalized_leg_key(leg: object) -> tuple[str, str, str] | None:
+    """把锁文件中的腿身份归一化为可比较三元组。"""
+    if not isinstance(leg, dict):
+        return None
+    venue = str(leg.get("venue") or "").strip().casefold()
+    fingerprint = str(leg.get("account_fingerprint") or "").strip().casefold()
+    market = str(leg.get("market") or "").strip().casefold()
+    if not venue or not fingerprint or not market:
+        return None
+    return venue, fingerprint, market
+
+
+def _check_market_occupancy(
+    legs: list[dict[str, str]],
+    *,
+    scan_root: Path,
+    own_lock_path: Path,
+) -> None:
+    """扫描存活实例的锁，拒绝重复占用同账户同市场。"""
+    requested = {
+        key for leg in legs if (key := _normalized_leg_key(leg)) is not None
+    }
+    if not requested or not scan_root.exists():
+        return
+    own_resolved = own_lock_path.resolve()
+    for lock_path in scan_root.rglob("*.lock"):
+        try:
+            if lock_path.resolve() == own_resolved:
+                continue
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            owner_pid = int(payload.get("pid"))
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            AttributeError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+        if not _pid_is_alive(owner_pid):
+            continue
+        for occupied_leg in payload.get("legs") or ():
+            key = _normalized_leg_key(occupied_leg)
+            if key not in requested:
+                continue
+            venue, fingerprint, market = key
+            raise RuntimeError(
+                f"拒绝启动：PID {owner_pid} 已占用 {venue} 的 "
+                f"{market.upper()} 市场（账户指纹 {fingerprint}）"
+            )
+
+
 @dataclass
 class _StatePathLease:
     """持有状态文件的进程级排他租约。"""
@@ -298,62 +405,91 @@ class _StatePathLease:
                 self.descriptor = -1
 
 
-def _acquire_state_path_lease(state_path: Path | str) -> _StatePathLease:
-    """非阻塞占用状态路径，并记录持有者 PID 与启动时间。"""
+def _acquire_state_path_lease(
+    state_path: Path | str,
+    *,
+    legs: list[dict[str, str]] | None = None,
+    scan_root: Path | str | None = None,
+) -> _StatePathLease:
+    """原子检查市场占用并非阻塞占用状态路径。"""
     lock_path = _state_lock_path(state_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    normalized_legs = list(legs or ())
+    scan_path = _DATA_ROOT if scan_root is None else Path(scan_root)
+    guard_descriptor = -1
+    if normalized_legs:
+        scan_path.mkdir(parents=True, exist_ok=True)
+        guard_path = scan_path / ".timed-volume-market-scan"
+        guard_descriptor = os.open(guard_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(guard_descriptor, fcntl.LOCK_EX)
     try:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
             os.lseek(descriptor, 0, os.SEEK_SET)
             try:
-                owner = json.loads(os.read(descriptor, 4096).decode("utf-8"))
-                owner_pid = int(owner.get("pid"))
-            except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-                owner_pid = -1
-            raise RuntimeError(
-                f"拒绝启动：状态文件 {Path(state_path)} 正在被 PID "
-                f"{owner_pid if owner_pid > 0 else '未知'} 的实例占用"
-            ) from exc
-
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        raw = os.read(descriptor, 4096)
-        if raw:
-            try:
-                existing = json.loads(raw.decode("utf-8"))
-                existing_pid = int(existing.get("pid"))
-            except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"拒绝启动：状态文件锁 {lock_path} 内容损坏，无法确认持有者"
-                ) from exc
-            if existing_pid != os.getpid() and _pid_is_alive(existing_pid):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                try:
+                    owner = json.loads(os.read(descriptor, 4096).decode("utf-8"))
+                    owner_pid = int(owner.get("pid"))
+                except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+                    owner_pid = -1
                 raise RuntimeError(
                     f"拒绝启动：状态文件 {Path(state_path)} 正在被 PID "
-                    f"{existing_pid} 的实例占用"
+                    f"{owner_pid if owner_pid > 0 else '未知'} 的实例占用"
+                ) from exc
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            raw = os.read(descriptor, 4096)
+            if raw:
+                try:
+                    existing = json.loads(raw.decode("utf-8"))
+                    existing_pid = int(existing.get("pid"))
+                except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        f"拒绝启动：状态文件锁 {lock_path} 内容损坏，无法确认持有者"
+                    ) from exc
+                if existing_pid != os.getpid() and _pid_is_alive(existing_pid):
+                    raise RuntimeError(
+                        f"拒绝启动：状态文件 {Path(state_path)} 正在被 PID "
+                        f"{existing_pid} 的实例占用"
+                    )
+
+            if normalized_legs:
+                _check_market_occupancy(
+                    normalized_legs,
+                    scan_root=scan_path,
+                    own_lock_path=lock_path,
                 )
 
-        started_at = time.time()
-        owner_token = f"{os.getpid()}:{time.time_ns()}"
-        payload = {
-            "pid": os.getpid(),
-            "started_at": started_at,
-            "owner_token": owner_token,
-            "state_path": str(Path(state_path).resolve()),
-        }
-        encoded = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-        os.ftruncate(descriptor, 0)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        os.write(descriptor, encoded)
-        os.fsync(descriptor)
-        return _StatePathLease(lock_path, descriptor, owner_token)
-    except Exception:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
-        raise
+            started_at = time.time()
+            owner_token = f"{os.getpid()}:{time.time_ns()}"
+            payload = {
+                "pid": os.getpid(),
+                "started_at": started_at,
+                "owner_token": owner_token,
+                "state_path": str(Path(state_path).resolve()),
+                "legs": normalized_legs,
+            }
+            encoded = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+            return _StatePathLease(lock_path, descriptor, owner_token)
+        except Exception:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+            raise
+    finally:
+        if guard_descriptor >= 0:
+            try:
+                fcntl.flock(guard_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(guard_descriptor)
 
 
 def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
@@ -501,7 +637,10 @@ async def run(args: argparse.Namespace) -> None:
         print(startup_summary(args, TimedVolumeState()))
         return
     _validate_account_isolation(args)
-    state_lease = _acquire_state_path_lease(config.state_path)
+    state_lease = _acquire_state_path_lease(
+        config.state_path,
+        legs=_instance_lock_legs(args),
+    )
     primary = None
     hedge = None
     try:
@@ -509,11 +648,12 @@ async def run(args: argparse.Namespace) -> None:
         hedge = _build_hedge_client(args)
         await asyncio.gather(primary.connect(), hedge.connect())
         strategy_kwargs = {}
+        if "variational" in (args.primary_venue, args.hedge_venue):
+            strategy_kwargs["auth_error_types"] = (VariationalAuthError,)
         if args.primary_venue == "variational":
-            strategy_kwargs = {
-                "auth_error_types": (VariationalAuthError,),
-                "on_auth_error": _reload_variational_primary,
-            }
+            strategy_kwargs["on_auth_error"] = _reload_variational_primary
+        if args.hedge_venue == "variational":
+            strategy_kwargs["on_hedge_auth_error"] = _reload_variational_client
         strategy = TimedHedgedVolumeStrategy(
             primary,
             hedge,

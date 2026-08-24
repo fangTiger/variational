@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import asyncio
+import hashlib
 import json
 import sys
 from decimal import Decimal
@@ -99,6 +100,31 @@ def test_build_hyperliquid_hedge_uses_selected_env_prefix(monkeypatch) -> None:
     }
 
 
+def test_build_variational_hedge_uses_environment_session(monkeypatch) -> None:
+    """Variational 可作为 RFQ 对冲腿，并复用环境会话构造客户端。"""
+    cli = _cli()
+    session = object()
+    captured = {}
+
+    class FakeSession:
+        @classmethod
+        def from_env(cls):
+            return session
+
+    class FakeVariational:
+        def __init__(self, received_session):
+            captured["session"] = received_session
+
+    monkeypatch.setattr(cli, "Session", FakeSession)
+    monkeypatch.setattr(cli, "VariationalClient", FakeVariational)
+    args = cli.build_parser().parse_args(["--hedge-venue", "variational"])
+
+    client = cli._build_hedge_client(args)
+
+    assert isinstance(client, FakeVariational)
+    assert captured["session"] is session
+
+
 def test_same_venue_account_and_market_are_rejected() -> None:
     """4.3：同平台、同账户、同市场的双腿配置必须失败关闭。"""
     cli = _cli()
@@ -157,6 +183,213 @@ def test_stale_state_lock_is_reclaimed(tmp_path) -> None:
 
     assert json.loads(lock_path.read_text(encoding="utf-8"))["pid"] != 99999999
     lease.release()
+
+
+def test_live_market_lock_rejects_same_leg_with_different_state_path(tmp_path) -> None:
+    """不同状态路径不得绕过同账户同市场的跨实例占用保护。"""
+    cli = _cli()
+    data_path = tmp_path / "data"
+    account = "0x1234567890abcdef"
+    legs = [
+        {
+            "venue": "lighter",
+            "account_fingerprint": cli._account_fingerprint(account),
+            "market": "BTC",
+        }
+    ]
+    first = cli._acquire_state_path_lease(
+        data_path / "first.state.json",
+        legs=legs,
+        scan_root=data_path,
+    )
+    try:
+        with pytest.raises(RuntimeError, match=r"PID \d+.*lighter.*BTC"):
+            cli._acquire_state_path_lease(
+                data_path / "second.state.json",
+                legs=legs,
+                scan_root=data_path,
+            )
+    finally:
+        first.release()
+
+
+def test_live_run_checks_market_lock_before_building_network_clients(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """实盘入口必须在构造联网客户端前拒绝已占用市场。"""
+    cli = _cli()
+    data_path = tmp_path / "data"
+    monkeypatch.setattr(cli, "_DATA_ROOT", data_path)
+    monkeypatch.setenv("VARIATIONAL_WALLET_ADDRESS", "0xvariational")
+    occupied = cli._acquire_state_path_lease(
+        data_path / "first.state.json",
+        legs=[
+            {
+                "venue": "lighter",
+                "account_fingerprint": cli._account_fingerprint("0xlighter"),
+                "market": "ETH",
+            }
+        ],
+        scan_root=data_path,
+    )
+
+    def forbidden_client_build(_args):
+        raise AssertionError("市场占用检查前不得构造联网客户端")
+
+    monkeypatch.setattr(cli, "_build_primary_client", forbidden_client_build)
+    args = cli.build_parser().parse_args(
+        [
+            "--live",
+            "--lighter-address",
+            "0xlighter",
+            "--market",
+            "ETH",
+            "--hedge-venue",
+            "variational",
+            "--hedge-market",
+            "ETH",
+            "--state-path",
+            str(data_path / "second.state.json"),
+        ]
+    )
+    try:
+        with pytest.raises(RuntimeError, match=r"PID \d+.*lighter.*ETH"):
+            asyncio.run(cli.run(args))
+    finally:
+        occupied.release()
+
+
+def test_live_market_lock_allows_same_account_on_different_market(tmp_path) -> None:
+    """同一交易所账户分别运行 BTC 与 ETH 时允许并存。"""
+    cli = _cli()
+    data_path = tmp_path / "data"
+    fingerprint = cli._account_fingerprint("0x1234567890abcdef")
+    btc = cli._acquire_state_path_lease(
+        data_path / "btc.state.json",
+        legs=[
+            {
+                "venue": "lighter",
+                "account_fingerprint": fingerprint,
+                "market": "BTC",
+            }
+        ],
+        scan_root=data_path,
+    )
+    try:
+        eth = cli._acquire_state_path_lease(
+            data_path / "eth.state.json",
+            legs=[
+                {
+                    "venue": "lighter",
+                    "account_fingerprint": fingerprint,
+                    "market": "ETH",
+                }
+            ],
+            scan_root=data_path,
+        )
+        eth.release()
+    finally:
+        btc.release()
+
+
+def test_stale_market_lock_does_not_block_live_instance(tmp_path) -> None:
+    """PID 已死的跨实例市场锁必须自动忽略。"""
+    cli = _cli()
+    data_path = tmp_path / "data"
+    data_path.mkdir()
+    fingerprint = cli._account_fingerprint("0x1234567890abcdef")
+    stale_lock = data_path / "stale.state.json.lock"
+    stale_lock.write_text(
+        json.dumps(
+            {
+                "pid": 99999999,
+                "started_at": 1.0,
+                "owner_token": "stale",
+                "state_path": str(data_path / "stale.state.json"),
+                "legs": [
+                    {
+                        "venue": "lighter",
+                        "account_fingerprint": fingerprint,
+                        "market": "BTC",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    lease = cli._acquire_state_path_lease(
+        data_path / "fresh.state.json",
+        legs=[
+            {
+                "venue": "lighter",
+                "account_fingerprint": fingerprint,
+                "market": "BTC",
+            }
+        ],
+        scan_root=data_path,
+    )
+
+    lease.release()
+
+
+def test_market_lock_contains_fingerprint_but_not_raw_account(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """市场锁只能落盘账户指纹，禁止泄露原始公开地址。"""
+    cli = _cli()
+    data_path = tmp_path / "data"
+    primary_account = "0x1234567890abcdef"
+    hedge_account = "0xfedcba0987654321"
+    monkeypatch.setenv("VARIATIONAL_WALLET_ADDRESS", primary_account)
+    monkeypatch.setenv("HYPERLIQUID_LOCK_ACCOUNT_ADDRESS", hedge_account)
+    args = cli.build_parser().parse_args(
+        [
+            "--primary-venue",
+            "variational",
+            "--market",
+            "ETH",
+            "--hedge-venue",
+            "hyperliquid",
+            "--hedge-env-prefix",
+            "HYPERLIQUID_LOCK",
+            "--hedge-market",
+            "ETH",
+        ]
+    )
+    legs = cli._instance_lock_legs(args)
+    state_path = data_path / "private.state.json"
+    lease = cli._acquire_state_path_lease(
+        state_path,
+        legs=legs,
+        scan_root=data_path,
+    )
+    try:
+        raw = cli._state_lock_path(state_path).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        assert primary_account not in raw
+        assert hedge_account not in raw
+        assert payload["legs"] == [
+            {
+                "venue": "variational",
+                "account_fingerprint": hashlib.sha256(
+                    primary_account.encode("utf-8")
+                ).hexdigest()[:12],
+                "market": "ETH",
+            },
+            {
+                "venue": "hyperliquid",
+                "account_fingerprint": hashlib.sha256(
+                    hedge_account.encode("utf-8")
+                ).hexdigest()[:12],
+                "market": "ETH",
+            },
+        ]
+        assert all(len(leg["account_fingerprint"]) == 12 for leg in payload["legs"])
+    finally:
+        lease.release()
 
 
 def test_dry_run_summary_masks_accounts_and_prints_instance_boundaries(
@@ -389,6 +622,7 @@ def test_non_live_run_prints_summary_without_constructing_clients(
 def test_live_run_connects_both_clients_and_closes_them(monkeypatch, tmp_path) -> None:
     """live 装配必须让 Lighter 可交易、连接两腿，并在退出时关闭两腿。"""
     cli = _cli()
+    monkeypatch.setattr(cli, "_DATA_ROOT", tmp_path / "data")
     captured = {}
 
     class FakeLighter:
@@ -438,6 +672,7 @@ def test_live_run_connects_both_clients_and_closes_them(monkeypatch, tmp_path) -
     monkeypatch.setattr(cli, "TimedHedgedVolumeStrategy", FakeStrategy)
     monkeypatch.setattr(cli, "run_loop", fake_run_loop)
     monkeypatch.setenv("LIGHTER_API_PRIVATE_KEY", "test-key")
+    monkeypatch.setenv("X10_HEDGE_PUBLIC_KEY", "0xextended")
     args = cli.build_parser().parse_args(
         [
             "--live",
@@ -468,6 +703,7 @@ def test_variational_live_run_wires_auth_reload_and_avoids_lighter_credentials(
 ) -> None:
     """3.5/4.1：Variational 实盘装配认证自愈，且不依赖 Lighter 密钥。"""
     cli = _cli()
+    monkeypatch.setattr(cli, "_DATA_ROOT", tmp_path / "data")
     captured = {"dotenv_overrides": []}
 
     class FakeSession:
@@ -559,6 +795,90 @@ def test_variational_live_run_wires_auth_reload_and_avoids_lighter_credentials(
     assert captured["hedge_prefix"] == "HYPERLIQUID_VAR"
     assert captured["strategy_primary"].connected is True
     assert captured["strategy_hedge"].connected is True
+
+
+def test_variational_hedge_live_run_wires_hedge_auth_reload(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Variational 位于对冲腿时必须把认证重载回调接到对冲腿。"""
+    cli = _cli()
+    monkeypatch.setattr(cli, "_DATA_ROOT", tmp_path / "data")
+    captured = {"dotenv_overrides": []}
+
+    class FakeSession:
+        calls = 0
+
+        @classmethod
+        def from_env(cls):
+            cls.calls += 1
+            return SimpleNamespace(wallet_address="0xvariational")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.connected = False
+            self.closed = False
+
+        async def connect(self):
+            self.connected = True
+
+        async def close(self):
+            self.closed = True
+
+    class FakeLighter(FakeClient):
+        pass
+
+    class FakeVariational(FakeClient):
+        pass
+
+    class FakeStrategy:
+        def __init__(self, primary, hedge, config, **kwargs):
+            del config
+            captured["primary"] = primary
+            captured["hedge"] = hedge
+            captured["strategy_kwargs"] = kwargs
+            self.state = TimedVolumeState()
+
+    async def fake_run_loop(strategy, **kwargs):
+        del strategy, kwargs
+
+    fake_dotenv = SimpleNamespace(
+        load_dotenv=lambda *, override=False: captured["dotenv_overrides"].append(
+            override
+        )
+    )
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    monkeypatch.setattr(cli, "Session", FakeSession)
+    monkeypatch.setattr(cli, "LighterClient", FakeLighter)
+    monkeypatch.setattr(cli, "VariationalClient", FakeVariational)
+    monkeypatch.setattr(cli, "TimedHedgedVolumeStrategy", FakeStrategy)
+    monkeypatch.setattr(cli, "run_loop", fake_run_loop)
+    monkeypatch.setenv("LIGHTER_API_PRIVATE_KEY", "test-key")
+    monkeypatch.setenv("VARIATIONAL_WALLET_ADDRESS", "0xvariational")
+    args = cli.build_parser().parse_args(
+        [
+            "--live",
+            "--lighter-address",
+            "0xlighter",
+            "--hedge-venue",
+            "variational",
+            "--hedge-market",
+            "ETH",
+            "--state-path",
+            str(tmp_path / "state.json"),
+        ]
+    )
+
+    asyncio.run(cli.run(args))
+
+    kwargs = captured["strategy_kwargs"]
+    assert kwargs["auth_error_types"] == (cli.VariationalAuthError,)
+    assert "on_auth_error" not in kwargs
+    replacement = kwargs["on_hedge_auth_error"]()
+    assert isinstance(replacement, FakeVariational)
+    assert captured["dotenv_overrides"] == [True]
+    assert FakeSession.calls == 2
 
 
 def test_run_loop_uses_emergency_retry_for_unknown_or_naked_state(
