@@ -63,7 +63,7 @@ class FakeVariationalClient:
     async def raw(self, path: str) -> dict:
         """返回不含筛选逻辑的账户余额。"""
         assert path == "/portfolio"
-        return {"balance": "552.340000000000000001", "upnl": "95"}
+        return {"balance": "552.340000000000000001", "upnl": "95"}  # balance 已含 upnl
 
     async def get_positions(self) -> list[dict]:
         """返回策略 BTC 仓位和人工 SOL 仓位。"""
@@ -80,7 +80,11 @@ class FakeVariationalClient:
 
 
 def test_hyperliquid_equity_filters_manual_symbol_and_ignores_account_value() -> None:
-    """Hyperliquid 只把 BTC 浮盈亏加到 Spot，且绝不使用 accountValue。"""
+    """Hyperliquid 权益 = Spot 减去非策略币种浮盈亏。
+
+    Spot USDC **本身已含**全部未实现（实测 Δspot == Δupnl），
+    所以策略币种的浮盈亏不能再加一遍，人工币种的则要减掉。
+    """
     equity = asyncio.run(
         portfolio_equity.read_hyperliquid_equity(
             FakeHyperliquidClient(),
@@ -89,9 +93,11 @@ def test_hyperliquid_equity_filters_manual_symbol_and_ignores_account_value() ->
     )
 
     assert isinstance(equity, Decimal)
-    assert equity == Decimal("552.34")
-    assert equity != Decimal("557.34") + Decimal("62.00")
-    assert equity != Decimal("557.34") + Decimal("-5.00") + Decimal("17.25")
+    # spot 557.34 已含 BTC(-5) 与 SOL(+17.25)；只需减掉人工的 SOL。
+    assert equity == Decimal("557.34") - Decimal("17.25")
+    assert equity != Decimal("557.34") + Decimal("-5.00"), "不得再叠加策略币种浮盈亏"
+    assert equity != Decimal("557.34"), "不得忽略人工币种"
+    assert equity != Decimal("557.34") + Decimal("62.00"), "不得使用 accountValue"
 
 
 def test_lighter_equity_uses_collateral_plus_filtered_unrealized_pnl() -> None:
@@ -110,7 +116,12 @@ def test_lighter_equity_uses_collateral_plus_filtered_unrealized_pnl() -> None:
 
 
 def test_variational_equity_excludes_manual_symbol_without_float_conversion() -> None:
-    """Variational 只累计策略 BTC 的浮盈亏，并保持 Decimal 精度。"""
+    """Variational 权益 = balance 减去非策略币种浮盈亏，且保持 Decimal 精度。
+
+    balance **本身已含**未实现（实测 Δbalance == Δupnl），
+    早期实现写成 balance + upnl，把未实现算了两遍，
+    误差随行情摆动，在面板上表现为「越刷亏损越大」的假象。
+    """
     equity = asyncio.run(
         portfolio_equity.read_variational_equity(
             FakeVariationalClient(),
@@ -119,7 +130,12 @@ def test_variational_equity_excludes_manual_symbol_without_float_conversion() ->
     )
 
     assert isinstance(equity, Decimal)
-    assert equity == Decimal("547.339999999999999999")
+    # balance 552.34 已含 BTC(-5) 与 SOL(+100)；只需减掉人工的 SOL。
+    assert equity == Decimal("552.340000000000000001") - Decimal("100")
+    assert equity != Decimal("552.340000000000000001") + Decimal(
+        "-5.000000000000000002"
+    ), "不得再叠加策略币种浮盈亏"
+    assert equity != Decimal("552.340000000000000001"), "不得忽略人工币种"
 
 
 def test_strategy_symbols_are_derived_from_volume_instance_configs() -> None:
@@ -180,7 +196,7 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
 
     written = json.loads(output.read_text(encoding="utf-8"))
     assert snapshot == written
-    assert written["schema"] == 2
+    assert written["schema"] == 3
     assert written["symbols"] == {
         "lighter": ["BTC", "ETH"],
         "variational": ["BTC", "ETH"],

@@ -394,7 +394,14 @@ async def read_variational_equity(
     client: Any,
     symbols: Sequence[str],
 ) -> Decimal:
-    """读取 Variational 余额，并只叠加策略币种的未实现盈亏。"""
+    """读取 Variational 权益：``balance`` **已包含**未实现盈亏，故不再叠加。
+
+    实测（2026-08-25，8 秒间隔三次采样）：``Δbalance`` 与 ``Δupnl``
+    逐次完全相等，证明 balance 实时反映未实现盈亏。
+    早期实现写成 ``balance + upnl``，把未实现算了两遍。
+
+    非策略币种（用户手工开的仓位）的未实现已含在 balance 里，需要**减掉**。
+    """
     targets = {_symbol(symbol, label="Variational 策略币种") for symbol in symbols}
     portfolio = await client.raw("/portfolio")
     if not isinstance(portfolio, Mapping):
@@ -407,7 +414,8 @@ async def read_variational_equity(
     )
     if not isinstance(positions, list):
         raise ValueError("Variational positions 响应缺少持仓数组")
-    unrealized_pnl = Decimal("0")
+    # balance 已含全部币种的未实现，这里累计**非策略币种**的部分，稍后减掉。
+    foreign_unrealized_pnl = Decimal("0")
     for index, position in enumerate(positions):
         if not isinstance(position, Mapping):
             raise ValueError(f"Variational 第 {index + 1} 条持仓不是对象")
@@ -421,22 +429,28 @@ async def read_variational_equity(
             instrument.get("underlying"),
             label=f"Variational 第 {index + 1} 条持仓币种",
         )
-        if symbol not in targets:
+        if symbol in targets:
             continue
-        unrealized_pnl += _decimal(
+        foreign_unrealized_pnl += _decimal(
             position.get("upnl"),
             label=f"Variational {symbol} 未实现盈亏",
         )
-    return cash + unrealized_pnl
+    return cash - foreign_unrealized_pnl
 
 
 async def read_hyperliquid_equity(
     client: Any,
     symbols: Sequence[str],
 ) -> Decimal:
-    """读取 Hyperliquid Spot USDC，并只叠加策略币种的未实现盈亏。
+    """读取 Hyperliquid 权益：Spot USDC **已包含**未实现盈亏，故不再叠加。
 
-    此处直接读取持仓分项，完全不读取 ``marginSummary.accountValue``。
+    实测（2026-08-25，8 秒间隔三次采样）：``Δspot`` 与 ``ΔunrealizedPnl``
+    逐次完全相等，证明 Spot USDC 实时反映永续未实现盈亏。
+    早期实现写成 ``spot + 未实现``，把未实现算了两遍，误差随行情来回摆动，
+    在面板上表现为「越刷亏损越大」的假象。
+
+    非策略币种（用户手工开的仓位）的未实现已含在 spot 里，需要**减掉**。
+    此处仍不读取 ``marginSummary.accountValue``——那是占用记账，不可加。
     """
     targets = {_symbol(symbol, label="Hyperliquid 策略币种") for symbol in symbols}
     state = await client._user_state()
@@ -445,7 +459,8 @@ async def read_hyperliquid_equity(
     ):
         raise ValueError("Hyperliquid 账户状态缺少 assetPositions 数组")
 
-    unrealized_pnl = Decimal("0")
+    # spot 已含全部币种的未实现，这里累计的是**非策略币种**的部分，稍后减掉。
+    foreign_unrealized_pnl = Decimal("0")
     for index, raw_position in enumerate(state["assetPositions"]):
         if not isinstance(raw_position, Mapping) or not isinstance(
             raw_position.get("position"), Mapping
@@ -456,9 +471,9 @@ async def read_hyperliquid_equity(
             position.get("coin"),
             label=f"Hyperliquid 第 {index + 1} 条持仓币种",
         )
-        if symbol not in targets:
+        if symbol in targets:
             continue
-        unrealized_pnl += _decimal(
+        foreign_unrealized_pnl += _decimal(
             position.get("unrealizedPnl"),
             label=f"Hyperliquid {symbol} 未实现盈亏",
         )
@@ -478,7 +493,7 @@ async def read_hyperliquid_equity(
             balance.get("total"),
             label="Hyperliquid Spot USDC",
         )
-    return spot + unrealized_pnl
+    return spot - foreign_unrealized_pnl
 
 
 async def _read_lighter_from_env(symbols: tuple[str, ...]) -> Decimal:
@@ -640,7 +655,10 @@ async def collect_snapshot(
         total += result
 
     snapshot: dict[str, object] = {
-        "schema": 2,
+        # schema 3：修正 Hyperliquid 与 Variational 的重复计算
+        # （spot / balance 本就含未实现，此前又叠加了一次）。
+        # 面板只用同一 schema 的快照算累计，避免新旧公式混用得出无意义的差值。
+        "schema": 3,
         "ts": time.time() if timestamp is None else timestamp,
         "accounts": accounts,
         "symbols": {
