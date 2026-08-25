@@ -48,6 +48,9 @@ class _Adapter:
         size=Decimal("0"),
         place_error=None,
         position_sequence=None,
+        quote_sequence=None,
+        tick_size=Decimal("1"),
+        place_error_sequence=None,
     ):
         """fill_sequence: 每次查询订单返回的已成交量或 (成交量, 状态)。"""
         self.limit_orders = []
@@ -55,22 +58,39 @@ class _Adapter:
         self.cancelled = []
         self.hedge_calls = []
         self.order_reads = 0
+        self.market_price_reads = 0
         self._fills = list(fill_sequence or [Decimal("0")])
         self._cancel_error = cancel_error
         self._size = size
         self._place_error = place_error
+        self._place_errors = list(place_error_sequence or [])
         self._positions = (
             [Decimal(str(value)) for value in position_sequence]
             if position_sequence is not None
             else None
         )
+        self._quotes = list(
+            quote_sequence
+            or [(Decimal("60000"), Decimal("60001"))]
+        )
+        self._tick_size = Decimal(str(tick_size))
 
     async def get_market_price(self, market_name):
+        self.market_price_reads += 1
+        bid, ask = (
+            self._quotes[0]
+            if len(self._quotes) == 1
+            else self._quotes.pop(0)
+        )
         return MarketPrice(
             market=market_name,
-            bid=Decimal("60000"),
-            ask=Decimal("60001"),
+            bid=Decimal(str(bid)),
+            ask=Decimal(str(ask)),
         )
+
+    async def get_price_tick_size(self, market):
+        del market
+        return self._tick_size
 
     async def get_position(self, market):
         if self._positions:
@@ -99,9 +119,13 @@ class _Adapter:
                 "reduce_only": reduce_only,
             }
         )
+        if self._place_errors:
+            place_error = self._place_errors.pop(0)
+            if place_error is not None:
+                raise place_error
         if self._place_error is not None:
             raise self._place_error
-        return _Response(_Order("L1"))
+        return _Response(_Order(f"L{len(self.limit_orders)}"))
 
     async def get_order_by_id(self, market, order_id):
         self.order_reads += 1
@@ -110,7 +134,12 @@ class _Adapter:
             filled, status = value
         else:
             filled = value
-            status = "FILLED" if filled >= self.limit_orders[0]["amount"] else "NEW"
+            order_index = int(str(order_id).removeprefix("L")) - 1
+            status = (
+                "FILLED"
+                if filled >= self.limit_orders[order_index]["amount"]
+                else "NEW"
+            )
         return _Order(order_id, filled=filled, status=status)
 
     async def cancel_order(self, market, order_id):
@@ -257,6 +286,26 @@ def _run(
     )
 
 
+class _Clock:
+    """让重挂限频测试使用确定的单调时钟，不等待真实时间。"""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _use_fake_clock(monkeypatch) -> _Clock:
+    clock = _Clock()
+    monkeypatch.setattr("engine.hedge_engine.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("engine.hedge_engine.asyncio.sleep", clock.sleep)
+    return clock
+
+
 def test_sell_places_maker_at_ask():
     """卖出挂在 best ask。挂在 bid 会立刻成交，被 post_only 拒绝。"""
     adapter = _Adapter(fill_sequence=[Decimal("1")])
@@ -286,6 +335,220 @@ def test_full_maker_fill_avoids_taker():
     assert adapter.market_orders == []
     assert result.used_taker is False
     assert result.filled == Decimal("1")
+
+
+def test_repeg_when_best_price_moves_one_tick_without_fill(monkeypatch):
+    """本方最优价走开一档且零成交时，撤旧单并挂到新的最优价。"""
+    _use_fake_clock(monkeypatch)
+    adapter = _Adapter(
+        fill_sequence=[
+            (Decimal("0"), "NEW"),
+            (Decimal("0"), "NEW"),
+            (Decimal("0"), "CANCELLED"),
+            (Decimal("1"), "FILLED"),
+        ],
+        quote_sequence=[
+            (Decimal("60000"), Decimal("60001")),
+            (Decimal("59999"), Decimal("60000")),
+        ],
+    )
+
+    result = _run(adapter, timeout_s=6, poll_s=1)
+
+    assert adapter.cancelled == ["L1"]
+    assert [order["price"] for order in adapter.limit_orders] == [
+        Decimal("60001"),
+        Decimal("60000"),
+    ]
+    assert result == HedgeFillResult(
+        filled=Decimal("1"),
+        used_taker=False,
+        note="maker 全部成交（重挂 1 次）",
+    )
+
+
+def test_unchanged_best_price_does_not_cancel(monkeypatch):
+    """盘口未移动时保持排队位置，成交前不得发出撤单。"""
+    _use_fake_clock(monkeypatch)
+    adapter = _Adapter(
+        fill_sequence=[
+            (Decimal("0"), "NEW"),
+            (Decimal("1"), "FILLED"),
+        ]
+    )
+
+    result = _run(adapter, timeout_s=5, poll_s=1)
+
+    assert len(adapter.limit_orders) == 1
+    assert adapter.cancelled == []
+    assert result.used_taker is False
+
+
+def test_partial_fill_repeg_uses_final_fill_after_cancel(monkeypatch):
+    """撤单终态若追加成交到 0.7，只能按最终实成量重挂剩余 0.3。"""
+    _use_fake_clock(monkeypatch)
+    adapter = _Adapter(
+        fill_sequence=[
+            (Decimal("0.4"), "NEW"),
+            (Decimal("0.4"), "NEW"),
+            (Decimal("0.7"), "CANCELLED"),
+            (Decimal("0.3"), "FILLED"),
+        ],
+        quote_sequence=[
+            (Decimal("60000"), Decimal("60001")),
+            (Decimal("59999"), Decimal("60000")),
+        ],
+    )
+
+    result = _run(adapter, timeout_s=6, poll_s=1)
+
+    assert adapter.cancelled == ["L1"]
+    assert adapter.limit_orders[1]["amount"] == Decimal("0.3")
+    assert adapter.limit_orders[1]["amount"] != Decimal("0.6")
+    assert result.filled == Decimal("1")
+    assert result.used_taker is False
+
+
+@pytest.mark.parametrize(
+    "cancelled_status",
+    ["CANCELLED", "CANCELLED-POST-ONLY"],
+)
+def test_silent_cancel_without_fill_can_repeg(monkeypatch, cancelled_status):
+    """Lighter 静默取消零成交单时，只要盘口已移动也要恢复 maker 挂单。"""
+    _use_fake_clock(monkeypatch)
+    adapter = _Adapter(
+        fill_sequence=[
+            (Decimal("0"), cancelled_status),
+            (Decimal("0"), cancelled_status),
+            (Decimal("1"), "FILLED"),
+        ],
+        quote_sequence=[
+            (Decimal("60000"), Decimal("60001")),
+            (Decimal("59999"), Decimal("60000")),
+        ],
+    )
+
+    result = _run(adapter, timeout_s=6, poll_s=1)
+
+    assert adapter.cancelled == []
+    assert len(adapter.limit_orders) == 2
+    assert adapter.limit_orders[1]["price"] == Decimal("60000")
+    assert result.used_taker is False
+
+
+def test_max_repegs_falls_back_to_existing_taker_path(monkeypatch):
+    """达到重挂上限后撤掉当前单，并按未成交量走原有吃单补齐路径。"""
+    _use_fake_clock(monkeypatch)
+    adapter = _Adapter(
+        fill_sequence=[
+            (Decimal("0"), "NEW"),
+            (Decimal("0"), "NEW"),
+            (Decimal("0"), "CANCELLED"),
+            (Decimal("0"), "NEW"),
+            (Decimal("0"), "NEW"),
+            (Decimal("0"), "CANCELLED"),
+        ],
+        quote_sequence=[
+            (Decimal("60000"), Decimal("60002")),
+            (Decimal("59999"), Decimal("60001")),
+            (Decimal("59999"), Decimal("60001")),
+            (Decimal("59998"), Decimal("60000")),
+            (Decimal("59998"), Decimal("60000")),
+        ],
+    )
+
+    result = _run(
+        adapter,
+        timeout_s=8,
+        poll_s=1,
+        max_repegs=1,
+    )
+
+    assert len(adapter.limit_orders) == 2
+    assert adapter.cancelled == ["L1", "L2"]
+    assert adapter.market_orders[0]["amount"] == Decimal("1")
+    assert result.used_taker is True
+    assert "已达到重挂上限 1 次" in result.note
+
+
+def test_repeg_interval_too_short_skips_repeg(monkeypatch):
+    """距离首次挂单不足两秒时即使盘口移动，也跳过本次重挂。"""
+    _use_fake_clock(monkeypatch)
+    adapter = _Adapter(
+        fill_sequence=[
+            (Decimal("0"), "NEW"),
+            (Decimal("0"), "NEW"),
+            (Decimal("0"), "CANCELLED"),
+        ],
+        quote_sequence=[
+            (Decimal("60000"), Decimal("60001")),
+            (Decimal("59999"), Decimal("60000")),
+        ],
+    )
+
+    result = _run(adapter, timeout_s=1.5, poll_s=0.5)
+
+    assert len(adapter.limit_orders) == 1
+    assert adapter.cancelled == ["L1"]
+    assert adapter.market_price_reads == 4
+    assert result.used_taker is True
+
+
+def test_repeg_can_be_disabled(monkeypatch):
+    """显式关闭重挂后，盘口移动不改变原有等待与成交语义。"""
+    _use_fake_clock(monkeypatch)
+    adapter = _Adapter(
+        fill_sequence=[
+            (Decimal("0"), "NEW"),
+            (Decimal("1"), "FILLED"),
+        ],
+        quote_sequence=[
+            (Decimal("60000"), Decimal("60001")),
+            (Decimal("59999"), Decimal("60000")),
+        ],
+    )
+
+    result = _run(
+        adapter,
+        timeout_s=5,
+        poll_s=1,
+        repeg_enabled=False,
+    )
+
+    assert len(adapter.limit_orders) == 1
+    assert adapter.cancelled == []
+    assert result.used_taker is False
+
+
+def test_repeg_post_only_rejection_uses_actual_position_gap(monkeypatch):
+    """重挂撞进交叉价被拒后，按整个周期的实际仓位差吃单补齐。"""
+    _use_fake_clock(monkeypatch)
+    adapter = _Adapter(
+        fill_sequence=[
+            (Decimal("0.4"), "NEW"),
+            (Decimal("0.4"), "NEW"),
+            (Decimal("0.4"), "CANCELLED"),
+        ],
+        quote_sequence=[
+            (Decimal("60000"), Decimal("60001")),
+            (Decimal("59999"), Decimal("60000")),
+        ],
+        position_sequence=[Decimal("0"), Decimal("-0.4")],
+        place_error_sequence=[
+            None,
+            RuntimeError(
+                "Hyperliquid 下单失败：Post only order would have immediately matched"
+            ),
+        ],
+    )
+
+    result = _run(adapter, timeout_s=6, poll_s=1)
+
+    assert adapter.cancelled == ["L1"]
+    assert adapter.market_orders[0]["amount"] == Decimal("0.6")
+    assert result.filled == Decimal("1")
+    assert result.used_taker is True
+    assert "重挂 post-only 被拒" in result.note
 
 
 def test_missing_execution_model_keeps_orderbook_maker_path():

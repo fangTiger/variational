@@ -20,6 +20,11 @@ from infra.logger import get_logger
 
 logger = get_logger("hedge_engine")
 
+# 两秒间隔用于限制盘口来回跳动时的撤挂频率，避免触发交易所限频或刷单。
+MAKER_REPEG_MIN_INTERVAL_S = 2.0
+# 单轮最多重挂二十次，防止长超时配置在单边行情中产生无界委托请求。
+MAKER_REPEG_MAX_ATTEMPTS = 20
+
 
 @dataclass
 class HedgeConfig:
@@ -414,11 +419,13 @@ async def maker_first_hedge(
     timeout_s: float = 15.0,
     poll_s: float = 1.0,
     reduce_only: bool = False,
+    repeg_enabled: bool = True,
+    max_repegs: int = MAKER_REPEG_MAX_ATTEMPTS,
 ) -> HedgeFillResult:
-    """先挂 maker，超时未成交则撤单、按剩余量吃单。
+    """先挂 maker 并跟随本方最优价，超时后按实际剩余量吃单。
 
-    成交判定使用订单状态与已成交量，而不是持仓差值。持仓差值遇到部分成交
-    会误判成全部成交，导致欠对冲并留下无人跟踪的孤儿单。
+    每张子订单都以撤单终态的累计成交量为准，只把剩余数量重挂；无法可靠
+    单查时才降级使用整个执行周期的实际仓位差，绝不按委托量推断成交量。
     """
     if target_delta == 0:
         return HedgeFillResult(
@@ -513,16 +520,21 @@ async def maker_first_hedge(
             used_taker=True,
             note=f"post-only 被拒；按实际仓位差吃单补 {remaining}",
         )
+    initial_place_at = time.monotonic()
 
     def _field(value, name: str):
         if isinstance(value, dict):
             return value.get(name)
         return getattr(value, name, None)
 
-    response_data = _field(response, "data") or response
-    order_id = _field(response_data, "id") or _field(response, "id")
-    if order_id is None:
-        raise RuntimeError("maker 下单响应缺少订单 ID，无法安全追踪")
+    def _order_id(response_value):
+        response_data = _field(response_value, "data") or response_value
+        tracked_id = _field(response_data, "id") or _field(response_value, "id")
+        if tracked_id is None:
+            raise RuntimeError("maker 下单响应缺少订单 ID，无法安全追踪")
+        return tracked_id
+
+    order_id = _order_id(response)
 
     order_getter = getattr(adapter, "get_order_by_id", None)
     if isinstance(adapter, ExchangeAdapter):
@@ -531,58 +543,233 @@ async def maker_first_hedge(
             order_getter = None
     order_lookup_available = callable(order_getter)
 
-    async def _read_order() -> tuple[Decimal, str]:
+    async def _read_order(tracked_order_id) -> tuple[Decimal, str]:
         if not order_lookup_available:
             raise NotImplementedError("适配器未实现按 ID 查询订单")
-        got = await order_getter(market, order_id)
+        got = await order_getter(market, tracked_order_id)
         if got is None:
-            raise LookupError(f"订单 {order_id} 暂未出现在查询结果中")
+            raise LookupError(f"订单 {tracked_order_id} 暂未出现在查询结果中")
         data = _field(got, "data") or got
         raw_filled = _field(data, "filled_qty")
         raw_status = _field(data, "status")
         filled_qty = Decimal(str(raw_filled or 0))
         status = str(raw_status or "").upper().rsplit(".", 1)[-1]
+        if status.startswith("CANCELED"):
+            status = "CANCELLED" + status[len("CANCELED") :]
         return filled_qty, status
 
-    deadline = time.monotonic() + timeout_s
-    filled = Decimal(0)
-    terminal_statuses = {"FILLED", "CANCELLED", "EXPIRED", "REJECTED"}
+    def _is_cancelled(status: str) -> bool:
+        return status.startswith("CANCELLED")
+
+    def _is_terminal(status: str) -> bool:
+        return (
+            status == "FILLED"
+            or _is_cancelled(status)
+            or status in {"EXPIRED", "REJECTED"}
+        )
+
+    tick_size: Decimal | None = None
+    repeg_active = repeg_enabled and max_repegs > 0 and order_lookup_available
+    if repeg_active:
+        tick_getter = getattr(adapter, "get_price_tick_size", None)
+        if callable(tick_getter):
+            try:
+                raw_tick = await tick_getter(market)
+                if raw_tick is not None:
+                    parsed_tick = Decimal(str(raw_tick))
+                    if parsed_tick > 0:
+                        tick_size = parsed_tick
+            except Exception as exc:  # noqa: BLE001 行情仍能严格判断价格是否移动
+                logger.warning(
+                    "maker 跟价读取价格 tick 失败，将按最优价严格变化判断：%s",
+                    exc,
+                )
+
+    def _best_price(book) -> Decimal:
+        return Decimal(str(book.ask if side is Side.SELL else book.bid))
+
+    def _has_moved_behind(order_price: Decimal, best_price: Decimal) -> bool:
+        distance = (
+            order_price - best_price
+            if side is Side.SELL
+            else best_price - order_price
+        )
+        if tick_size is None:
+            return distance > 0
+        return distance >= tick_size
+
+    deadline = initial_place_at + timeout_s
+    current_order_id = order_id
+    current_price = price
+    current_filled = Decimal(0)
+    maker_filled = Decimal(0)
+    repeg_count = 0
+    last_place_at = initial_place_at
     fallback_reason = ""
+    note_parts: list[str] = []
     if order_lookup_available:
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_s)
             try:
-                filled, status = await _read_order()
+                current_filled, status = await _read_order(current_order_id)
             except Exception as exc:  # noqa: BLE001 单查失效必须转仓位差降级
                 fallback_reason = f"订单状态读取失败（{exc}）"
                 logger.warning("%s，将撤单后按实际仓位差补单", fallback_reason)
                 break
-            if filled >= amount:
+
+            observed_best: Decimal | None = None
+            if repeg_active:
+                try:
+                    observed_best = _best_price(
+                        await adapter.get_market_price(market)
+                    )
+                except Exception as exc:  # noqa: BLE001 单次盘口失败只跳过本次跟价
+                    logger.warning("maker 跟价读取盘口失败，本次不重挂：%s", exc)
+
+            total_filled = maker_filled + current_filled
+            if total_filled >= amount:
+                note = "maker 全部成交"
+                if repeg_count:
+                    note += f"（重挂 {repeg_count} 次）"
                 return HedgeFillResult(
-                    filled=filled,
+                    filled=amount,
                     used_taker=False,
-                    note="maker 全部成交",
+                    note=note,
                 )
-            if status in terminal_statuses:
+
+            # 只把交易所的静默撤单视为可恢复状态；过期或普通拒单仍沿用
+            # 原有收尾路径，避免对余额、精度等永久性错误反复下单。
+            if _is_terminal(status) and not _is_cancelled(status):
                 break
+
+            price_moved = (
+                observed_best is not None
+                and _has_moved_behind(current_price, observed_best)
+            )
+            if not price_moved:
+                if _is_terminal(status):
+                    break
+                continue
+
+            now = time.monotonic()
+            if now - last_place_at < MAKER_REPEG_MIN_INTERVAL_S:
+                logger.debug(
+                    "maker 最优价已移动，但距上次挂单不足 %.1f 秒，本次跳过重挂",
+                    MAKER_REPEG_MIN_INTERVAL_S,
+                )
+                continue
+            if repeg_count >= max_repegs:
+                note_parts.append(f"已达到重挂上限 {max_repegs} 次")
+                logger.warning(
+                    "maker 已达到重挂上限 %s 次，转入撤单与吃单补齐路径",
+                    max_repegs,
+                )
+                break
+
+            if not _is_cancelled(status):
+                try:
+                    await adapter.cancel_order(market, current_order_id)
+                except Exception as exc:  # noqa: BLE001 旧单可能仍在，禁止再挂新单
+                    note_parts.append(f"撤单失败（{exc}）")
+                    logger.warning(
+                        "maker 跟价撤单失败，禁止重挂并转入安全收尾：%s",
+                        exc,
+                    )
+                    break
+
+                # 撤单请求返回不等于订单已经终止。只有读到终态及其最终累计
+                # 成交量，才能安全计算下一张子订单的数量。
+                while True:
+                    try:
+                        current_filled, status = await _read_order(
+                            current_order_id
+                        )
+                    except Exception as exc:  # noqa: BLE001 必须转实际仓位差
+                        fallback_reason = f"撤单后订单状态读取失败（{exc}）"
+                        logger.warning(
+                            "%s，将按实际仓位差补单",
+                            fallback_reason,
+                        )
+                        break
+                    if _is_terminal(status):
+                        break
+                    if time.monotonic() >= deadline:
+                        logger.warning(
+                            "maker 跟价撤单未在总超时内进入终态，停止重挂"
+                        )
+                        break
+                    await asyncio.sleep(
+                        min(poll_s, max(0.0, deadline - time.monotonic()))
+                    )
+                if fallback_reason or not _is_terminal(status):
+                    break
+                if status in {"EXPIRED", "REJECTED"}:
+                    break
+
+            # 此处的 current_filled 来自交易所终态；即便轮询时只看到部分
+            # 成交，也不能用此前快照或原委托量推断剩余数量。
+            maker_filled += current_filled
+            remaining = amount - maker_filled
+            if remaining <= 0:
+                note = "maker 全部成交"
+                if repeg_count:
+                    note += f"（重挂 {repeg_count} 次）"
+                return HedgeFillResult(
+                    filled=amount,
+                    used_taker=False,
+                    note=note,
+                )
+
+            try:
+                response = await adapter.place_limit_order(
+                    market,
+                    side,
+                    remaining,
+                    observed_best,
+                    post_only=True,
+                    reduce_only=reduce_only,
+                )
+            except Exception as exc:  # noqa: BLE001 交易所业务拒绝类型不统一
+                if not _is_post_only_immediate_match_error(exc):
+                    raise
+                fallback_reason = f"重挂 post-only 被拒（{exc}）"
+                current_order_id = None
+                logger.warning(
+                    "maker 重挂 post-only 被拒，将按实际仓位差吃单补齐：%s",
+                    exc,
+                )
+                break
+
+            current_order_id = _order_id(response)
+            current_price = observed_best
+            current_filled = Decimal(0)
+            repeg_count += 1
+            last_place_at = time.monotonic()
+            logger.info(
+                "maker 跟价重挂第 %s/%s 次：价格=%s 剩余数量=%s",
+                repeg_count,
+                max_repegs,
+                current_price,
+                remaining,
+            )
     else:
         fallback_reason = "适配器缺少订单状态查询能力"
         if timeout_s > 0:
             await asyncio.sleep(timeout_s)
         logger.warning("%s，将撤单后按实际仓位差补单", fallback_reason)
 
-    note = ""
-    try:
-        await adapter.cancel_order(market, order_id)
-    except Exception as exc:  # noqa: BLE001
-        note = f"撤单失败（{exc}）"
-        logger.warning("对冲撤单失败，将按重读结果决定是否吃单：%s", exc)
+    if current_order_id is not None:
+        try:
+            await adapter.cancel_order(market, current_order_id)
+        except Exception as exc:  # noqa: BLE001
+            note_parts.append(f"撤单失败（{exc}）")
+            logger.warning("对冲撤单失败，将按重读结果决定是否吃单：%s", exc)
 
     # 有单查能力时仍优先重读精确成交量；能力缺失、返回空或请求异常时，
     # 统一退回实际仓位差。撤单失败也不能跳过这一步。
-    if not fallback_reason:
+    if not fallback_reason and current_order_id is not None:
         try:
-            filled, _status = await _read_order()
+            current_filled, _status = await _read_order(current_order_id)
         except Exception as exc:  # noqa: BLE001 单查瞬时失效同样安全降级
             fallback_reason = f"撤单后订单状态读取失败（{exc}）"
             logger.warning("%s，将按实际仓位差补单", fallback_reason)
@@ -596,9 +783,11 @@ async def maker_first_hedge(
         same_direction = remaining_delta * target_delta > 0
         remaining = abs(remaining_delta) if same_direction else Decimal(0)
         filled = min(amount, abs(actual_delta))
-        note = (note + f"；{fallback_reason}").lstrip("；")
+        note_parts.append(fallback_reason)
     else:
+        filled = min(amount, maker_filled + current_filled)
         remaining = amount - filled
+    note = "；".join(note_parts)
     if remaining <= 0:
         return HedgeFillResult(
             filled=filled,
