@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 LEDGER_FILL_RETRIES = 4
 LEDGER_FILL_RETRY_DELAY_SECONDS = 3.0
 
+#: 实盘轮询约 30 秒；连续三次已足以排除单次瞬态拒单，又能在约 90 秒内止损。
+MAX_CONSECUTIVE_CLOSE_FAILURES = 3
+#: 受限地区或交易权限故障通常不会秒级恢复；15 分钟可显著限制重复成交成本。
+CLOSE_RETRY_BACKOFF_SECONDS = 900.0
+
 #: 基差门控只使用单实例最近的有限轮次，避免陈旧结构变化稀释当前分布。
 BASIS_GATE_HISTORY_ROUNDS = 20
 #: 少于五轮无法可靠估计分布，必须直接放行。
@@ -160,6 +165,9 @@ class TimedVolumeState:
     ledger_primary_size: Decimal | None = None
     ledger_hedge_size: Decimal | None = None
     basis_gate_wait_started_at: float | None = None
+    consecutive_close_failures: int = 0
+    close_halted_since: float | None = None
+    close_halt_rehedged_since: float | None = None
 
     @property
     def is_open(self) -> bool:
@@ -301,6 +309,11 @@ class TimedHedgedVolumeStrategy:
             )
             if current_notional is not None and current_notional <= 0:
                 raise ValueError("当前轮名义额必须大于零")
+            consecutive_close_failures = int(
+                raw.get("consecutive_close_failures", 0)
+            )
+            if consecutive_close_failures < 0:
+                raise ValueError("连续平仓失败次数不得为负")
             state = TimedVolumeState(
                 round_index=max(0, int(raw.get("round_index", 0))),
                 last_direction=RoundDirection(last_raw) if last_raw else None,
@@ -314,6 +327,7 @@ class TimedHedgedVolumeStrategy:
                 due_at=(
                     float(raw["due_at"]) if raw.get("due_at") is not None else None
                 ),
+                consecutive_close_failures=consecutive_close_failures,
             )
         except (TypeError, ValueError, KeyError) as exc:
             logger.warning("轮次状态字段无效，将以实际持仓恢复：%s", exc)
@@ -328,6 +342,26 @@ class TimedHedgedVolumeStrategy:
                 state.basis_gate_wait_started_at = wait_started
             except (TypeError, ValueError) as exc:
                 logger.warning("基差门控等待状态无效，仅清除等待计时：%s", exc)
+
+        close_halted_raw = raw.get("close_halted_since")
+        if close_halted_raw is not None:
+            try:
+                close_halted_since = float(close_halted_raw)
+                if not math.isfinite(close_halted_since):
+                    raise ValueError("退避起点必须为有限时间戳")
+                state.close_halted_since = close_halted_since
+            except (TypeError, ValueError) as exc:
+                logger.warning("平仓退避状态无效，仅清除退避计时：%s", exc)
+
+        close_halt_rehedged_raw = raw.get("close_halt_rehedged_since")
+        if close_halt_rehedged_raw is not None:
+            try:
+                close_halt_rehedged_since = float(close_halt_rehedged_raw)
+                if not math.isfinite(close_halt_rehedged_since):
+                    raise ValueError("再对冲周期标记必须为有限时间戳")
+                state.close_halt_rehedged_since = close_halt_rehedged_since
+            except (TypeError, ValueError) as exc:
+                logger.warning("平仓退避再对冲状态无效，仅清除限次标记：%s", exc)
 
         if self.config.ledger_path is None:
             return state
@@ -385,6 +419,12 @@ class TimedHedgedVolumeStrategy:
         state.ledger_hedge_entry = None
         state.ledger_primary_size = None
         state.ledger_hedge_size = None
+
+    def _clear_close_failure_state(self) -> None:
+        """清空连续平仓失败与退避状态。"""
+        self.state.consecutive_close_failures = 0
+        self.state.close_halted_since = None
+        self.state.close_halt_rehedged_since = None
 
     def _is_within_hedge_tolerance(self, net_exposure: Decimal) -> bool:
         """按交易所最小可交易量推导的容差判断净敞口。"""
@@ -876,6 +916,7 @@ class TimedHedgedVolumeStrategy:
                 self.state.opened_at = None
                 self.state.due_at = None
                 self._clear_ledger_state(self.state)
+                self._clear_close_failure_state()
                 self._save_state()
             return primary_size, hedge_size, False
 
@@ -1335,8 +1376,113 @@ class TimedHedgedVolumeStrategy:
         self._save_state()
         return self._result("opened", primary_size, hedge_size, warnings)
 
+    def _mark_round_closed(self) -> None:
+        """结束当前轮次并清除所有平仓失败状态。"""
+        self.state.last_direction = self.state.current_direction
+        self.state.current_direction = None
+        self.state.current_notional_usd = None
+        self.state.opened_at = None
+        self.state.due_at = None
+        self.state.basis_gate_wait_started_at = None
+        self._clear_ledger_state(self.state)
+        self._clear_close_failure_state()
+        self._save_state()
+
+    async def _restore_neutral_during_close_halt(
+        self,
+        primary_size: Decimal,
+        hedge_size: Decimal,
+        warnings: list[str],
+        limits: _OrderLimits,
+    ) -> tuple[Decimal, Decimal]:
+        """退避期间只提交一次净敞口再对冲，不触发整轮平仓。"""
+        net = primary_size + hedge_size
+        if self._is_within_hedge_tolerance(net):
+            return primary_size, hedge_size
+        if abs(primary_size) <= abs(hedge_size):
+            adapter = self.primary
+            market = self.config.primary_market
+            minimum = limits.primary_minimum
+            label = "主腿"
+        else:
+            adapter = self.hedge
+            market = self.config.hedge_market
+            minimum = limits.hedge_minimum
+            label = "对冲腿"
+        if abs(net) < minimum:
+            self._warn(
+                warnings,
+                f"退避期间恢复中性所需数量 {abs(net)} 低于{label}最小下单量 "
+                f"{minimum}，不提交不可交易再对冲",
+            )
+            return primary_size, hedge_size
+
+        self._warn(
+            warnings,
+            f"平仓退避期间检测到净敞口 {net}，在{label}执行本周期唯一一次再对冲",
+        )
+        recovered = await asyncio.gather(
+            self._execute(
+                adapter,
+                market,
+                -net,
+                reduce_only=False,
+            ),
+            return_exceptions=True,
+        )
+        if isinstance(recovered[0], Exception):
+            self._warn(warnings, f"平仓退避期间再对冲失败：{recovered[0]}")
+        return await self._read_positions()
+
+    async def _handle_close_halt(
+        self,
+        now: float,
+        primary_size: Decimal,
+        hedge_size: Decimal,
+        warnings: list[str],
+        limits: _OrderLimits,
+    ) -> TimedVolumeResult:
+        """在退避期核对持仓，并在期满时只放行一次平仓重试。"""
+        halted_since = self.state.close_halted_since
+        if halted_since is None:
+            raise RuntimeError("平仓退避起点缺失")
+        if now - halted_since >= CLOSE_RETRY_BACKOFF_SECONDS:
+            return await self._close_round(now, warnings, limits)
+
+        flat = self._is_effectively_flat(
+            primary_size,
+            limits.primary_minimum,
+        ) and self._is_effectively_flat(
+            hedge_size,
+            limits.hedge_minimum,
+        )
+        if flat:
+            self._mark_round_closed()
+            return self._result("closed", primary_size, hedge_size, warnings)
+
+        net = primary_size + hedge_size
+        if (
+            not self._is_within_hedge_tolerance(net)
+            and self.state.close_halt_rehedged_since != halted_since
+        ):
+            self.state.close_halt_rehedged_since = halted_since
+            self._save_state()
+            primary_size, hedge_size = await self._restore_neutral_during_close_halt(
+                primary_size,
+                hedge_size,
+                warnings,
+                limits,
+            )
+        return self._result(
+            "close_halted",
+            primary_size,
+            hedge_size,
+            warnings,
+        )
+
     async def _close_round(
         self,
+        now: float,
         warnings: list[str],
         limits: _OrderLimits,
     ) -> TimedVolumeResult:
@@ -1350,15 +1496,32 @@ class TimedHedgedVolumeStrategy:
             limits.hedge_minimum,
         )
         if flat:
-            self.state.last_direction = self.state.current_direction
-            self.state.current_direction = None
-            self.state.current_notional_usd = None
-            self.state.opened_at = None
-            self.state.due_at = None
-            self.state.basis_gate_wait_started_at = None
-            self._clear_ledger_state(self.state)
-            self._save_state()
+            self._mark_round_closed()
             return self._result("closed", primary_size, hedge_size, warnings)
+
+        self.state.consecutive_close_failures += 1
+        if (
+            self.state.consecutive_close_failures
+            >= MAX_CONSECUTIVE_CLOSE_FAILURES
+        ):
+            self.state.close_halted_since = now
+            self.state.close_halt_rehedged_since = None
+            self._save_state()
+            self._warn(
+                warnings,
+                "连续平仓失败已达 "
+                f"{self.state.consecutive_close_failures} 次，进入 "
+                f"{CLOSE_RETRY_BACKOFF_SECONDS:g} 秒退避；"
+                "退避期内禁止重复平仓和开新轮次",
+            )
+            return self._result(
+                "close_halted",
+                primary_size,
+                hedge_size,
+                warnings,
+            )
+
+        self._save_state()
         self._warn(warnings, "到期平仓未能两侧归零，保留轮次并在下一次继续收敛")
         return self._result(
             "close_failed_neutral",
@@ -1444,6 +1607,14 @@ class TimedHedgedVolumeStrategy:
                     hedge_size,
                     warnings,
                 )
+            if self.state.close_halted_since is not None:
+                return await self._handle_close_halt(
+                    current_time,
+                    primary_size,
+                    hedge_size,
+                    warnings,
+                    limits,
+                )
             hedge_available = await self._check_hedge_available(limits)
             primary_size, hedge_size, converged = await self._reconcile_actual_state(
                 current_time,
@@ -1463,7 +1634,7 @@ class TimedHedgedVolumeStrategy:
             if self.state.is_open:
                 due_at = self.state.due_at
                 if due_at is None or current_time >= due_at:
-                    return await self._close_round(warnings, limits)
+                    return await self._close_round(current_time, warnings, limits)
                 return self._result("wait", primary_size, hedge_size, warnings)
 
             if not hedge_available:

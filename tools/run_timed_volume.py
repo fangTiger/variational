@@ -16,6 +16,7 @@ import fcntl  # noqa: E402
 import hashlib  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
+import sys  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from decimal import Decimal  # noqa: E402
@@ -45,6 +46,30 @@ _ROOT = Path(__file__).resolve().parent.parent
 _DATA_ROOT = _ROOT / "data"
 _DEFAULT_STATE = _ROOT / "data" / "timed_volume" / "state.json"
 _DEFAULT_HEARTBEAT = _ROOT / "data" / "timed_volume.jsonl"
+_PROXY_ENV_NAMES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+
+
+def _warn_if_proxy_configured() -> bool:
+    """检测代理环境并打印高危提示，但不阻断确有代理需求的部署。"""
+    configured = [
+        name for name in _PROXY_ENV_NAMES if str(os.environ.get(name, "")).strip()
+    ]
+    if not configured:
+        return False
+    print(
+        "⚠⚠⚠【代理环境高危警告】检测到代理变量："
+        f"{'、'.join(configured)}。代理出口可能落在受限地区导致下单被拒；"
+        "读接口却可能完全正常，极易误诊。请在实盘启动前确认代理出口地区。",
+        file=sys.stderr,
+    )
+    return True
 
 
 def _equity_path_from_heartbeat(path: Path | str) -> Path:
@@ -779,6 +804,7 @@ def main() -> None:
         load_dotenv()
     except ImportError:
         pass
+    _warn_if_proxy_configured()
     args = build_parser().parse_args()
     asyncio.run(run(args))
 

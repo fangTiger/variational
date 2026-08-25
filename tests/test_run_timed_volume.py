@@ -24,6 +24,50 @@ def _cli():
     return importlib.import_module("tools.run_timed_volume")
 
 
+_PROXY_ENV_NAMES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+
+
+@pytest.mark.parametrize("proxy_name", _PROXY_ENV_NAMES)
+def test_startup_warns_for_every_supported_proxy_variable(
+    proxy_name,
+    monkeypatch,
+    capsys,
+) -> None:
+    """任一代理变量都必须提示写接口拒单但读接口正常的误诊风险。"""
+    cli = _cli()
+    for name in _PROXY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(proxy_name, "http://127.0.0.1:10808")
+
+    warned = cli._warn_if_proxy_configured()
+
+    captured = capsys.readouterr()
+    assert warned is True
+    assert proxy_name in captured.err
+    assert "代理出口可能落在受限地区导致下单被拒" in captured.err
+    assert "读接口却可能完全正常，极易误诊" in captured.err
+
+
+def test_startup_does_not_warn_without_proxy_variables(monkeypatch, capsys) -> None:
+    """代理变量均不存在时不得制造无关启动噪声。"""
+    cli = _cli()
+    for name in _PROXY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+    warned = cli._warn_if_proxy_configured()
+
+    captured = capsys.readouterr()
+    assert warned is False
+    assert captured.err == ""
+
+
 def test_parser_defaults_match_two_hour_randomized_notional_plan() -> None:
     """入口默认值就是已批准的 2 小时、2000~2300 美元方案。"""
     cli = _cli()

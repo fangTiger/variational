@@ -267,6 +267,42 @@ class _ScriptedExecutor:
         return HedgeFillResult(filled=reported, used_taker=False)
 
 
+class _RestrictedVariationalCloseExecutor:
+    """复现代理出口受限时 Variational 拒绝平仓、HL 正常成交的执行器。"""
+
+    def __init__(self) -> None:
+        self.block_variational_close = True
+        self.calls: list[dict] = []
+
+    async def __call__(
+        self,
+        adapter,
+        market: str,
+        target_delta: Decimal,
+        *,
+        timeout_s: float,
+        poll_s: float,
+        reduce_only: bool,
+    ) -> HedgeFillResult:
+        call = {
+            "adapter": adapter.name,
+            "market": market,
+            "target_delta": target_delta,
+            "timeout_s": timeout_s,
+            "poll_s": poll_s,
+            "reduce_only": reduce_only,
+        }
+        self.calls.append(call)
+        if (
+            adapter.name == "variational"
+            and reduce_only
+            and self.block_variational_close
+        ):
+            raise RuntimeError("Variational 拒绝下单：代理出口位于受限地区")
+        adapter.position += target_delta
+        return HedgeFillResult(filled=abs(target_delta), used_taker=False)
+
+
 def _signature_shape(method):
     """只比较调用契约，不要求测试桩复制生产类型注解。"""
     return [
@@ -360,6 +396,31 @@ def _build_strategy(
         on_hedge_auth_error=on_hedge_auth_error,
     )
     return api, strategy, lighter, extended
+
+
+def _build_restricted_close_strategy(tmp_path):
+    """先正常建仓，再切换到真实事故组合的平仓失败执行器。"""
+    variational = _LighterAdapter("variational")
+    hyperliquid = _ExtendedAdapter("hyperliquid")
+    api, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=variational,
+        extended=hyperliquid,
+        executor=_ScriptedExecutor(),
+    )
+    opened = asyncio.run(strategy.run_once(now=0.0))
+    assert opened.action == "opened"
+    executor = _RestrictedVariationalCloseExecutor()
+    strategy._trade_executor = executor
+    return api, strategy, variational, hyperliquid, executor
+
+
+def _enter_close_halt(strategy):
+    """连续执行三次失败平仓并返回三次结果。"""
+    return [
+        asyncio.run(strategy.run_once(now=7200.0 + offset))
+        for offset in range(3)
+    ]
 
 
 _HIGH_VARIANCE_BASIS_HISTORY = (
@@ -2187,6 +2248,184 @@ def test_close_failure_rebuilds_other_leg_instead_of_leaving_naked(tmp_path) -> 
     assert lighter.position == Decimal("20.000")
     assert extended.position == Decimal("-20.000")
     assert result.net_exposure == 0
+
+
+def test_restricted_variational_close_enters_halt_and_stops_flatten_calls(
+    tmp_path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """连续三次真实部分失败后，后续节拍不得再次执行整轮平仓。"""
+    _, strategy, _, _, _ = _build_restricted_close_strategy(tmp_path)
+    flatten_calls = 0
+    original_flatten = strategy._flatten_all
+
+    async def counted_flatten(warnings, limits):
+        nonlocal flatten_calls
+        flatten_calls += 1
+        return await original_flatten(warnings, limits)
+
+    monkeypatch.setattr(strategy, "_flatten_all", counted_flatten)
+    with caplog.at_level(logging.WARNING):
+        failed = _enter_close_halt(strategy)
+        halted = asyncio.run(strategy.run_once(now=7203.0))
+
+    assert [result.action for result in failed] == [
+        "close_failed_neutral",
+        "close_failed_neutral",
+        "close_halted",
+    ]
+    assert halted.action == "close_halted"
+    assert flatten_calls == 3
+    assert strategy.state.consecutive_close_failures == 3
+    assert strategy.state.close_halted_since == 7202.0
+    persisted = json.loads(
+        (tmp_path / "state.json").read_text(encoding="utf-8")
+    )
+    assert persisted["consecutive_close_failures"] == 3
+    assert persisted["close_halted_since"] == 7202.0
+    assert sum("连续平仓失败已达 3 次" in message for message in caplog.messages) == 1
+
+
+def test_close_halt_never_opens_a_new_round(tmp_path) -> None:
+    """退避仍有效时，即使实际两腿已空，也不得在同一节拍开新轮次。"""
+    _, strategy, variational, hyperliquid, executor = (
+        _build_restricted_close_strategy(tmp_path)
+    )
+    _enter_close_halt(strategy)
+    calls_before = len(executor.calls)
+    variational.position = Decimal("0")
+    hyperliquid.position = Decimal("0")
+
+    result = asyncio.run(strategy.run_once(now=7203.0))
+
+    assert result.action != "opened"
+    assert len(executor.calls) == calls_before
+
+
+def test_close_halt_expiry_retry_success_clears_persisted_state(tmp_path) -> None:
+    """退避期满后只重试一次；成功平仓须清零计数并解除退避。"""
+    _, strategy, variational, hyperliquid, executor = (
+        _build_restricted_close_strategy(tmp_path)
+    )
+    _enter_close_halt(strategy)
+    halted_since = strategy.state.close_halted_since
+    assert halted_since == 7202.0
+    executor.block_variational_close = False
+
+    _, restarted, _, _ = _build_strategy(
+        tmp_path,
+        lighter=variational,
+        extended=hyperliquid,
+        executor=executor,
+    )
+    calls_before = len(executor.calls)
+    still_halted = asyncio.run(
+        restarted.run_once(
+            now=halted_since + 899.0,
+        )
+    )
+    recovered = asyncio.run(
+        restarted.run_once(
+            now=halted_since + 900.0,
+        )
+    )
+
+    assert still_halted.action == "close_halted"
+    assert len(executor.calls) == calls_before + 2
+    assert recovered.action == "closed"
+    assert restarted.state.consecutive_close_failures == 0
+    assert restarted.state.close_halted_since is None
+    persisted = json.loads(
+        (tmp_path / "state.json").read_text(encoding="utf-8")
+    )
+    assert persisted["consecutive_close_failures"] == 0
+    assert persisted["close_halted_since"] is None
+
+
+def test_close_halt_rehedges_net_exposure_at_most_once_per_cycle(tmp_path) -> None:
+    """退避中恢复一次中性；重启后同周期再次漂移仍不得重复下单。"""
+    _, strategy, variational, hyperliquid, executor = (
+        _build_restricted_close_strategy(tmp_path)
+    )
+    _enter_close_halt(strategy)
+    halted_since = strategy.state.close_halted_since
+    assert halted_since == 7202.0
+    recovery_calls_before = sum(
+        call["adapter"] == "hyperliquid" and not call["reduce_only"]
+        for call in executor.calls
+    )
+
+    hyperliquid.position = Decimal("0")
+    rehedged = asyncio.run(strategy.run_once(now=halted_since + 1))
+    recovery_calls_after_first_drift = sum(
+        call["adapter"] == "hyperliquid" and not call["reduce_only"]
+        for call in executor.calls
+    )
+
+    assert rehedged.action == "close_halted"
+    assert rehedged.net_exposure == 0
+    assert variational.position == Decimal("20.000")
+    assert recovery_calls_after_first_drift == recovery_calls_before + 1
+    assert strategy.state.close_halt_rehedged_since == halted_since
+    persisted = json.loads(
+        (tmp_path / "state.json").read_text(encoding="utf-8")
+    )
+    assert persisted["close_halt_rehedged_since"] == halted_since
+
+    _, restarted, _, _ = _build_strategy(
+        tmp_path,
+        lighter=variational,
+        extended=hyperliquid,
+        executor=executor,
+    )
+    hyperliquid.position = Decimal("0")
+    repeated = asyncio.run(restarted.run_once(now=halted_since + 2))
+    recovery_calls_after_restart = sum(
+        call["adapter"] == "hyperliquid" and not call["reduce_only"]
+        for call in executor.calls
+    )
+
+    assert repeated.action == "close_halted"
+    assert repeated.net_exposure == Decimal("20.000")
+    assert recovery_calls_after_restart == recovery_calls_after_first_drift
+
+
+def test_failed_retry_starts_new_halt_cycle_with_one_rehedge_allowance(
+    tmp_path,
+) -> None:
+    """期满重试再次失败须重置计时，并给新周期一次再对冲额度。"""
+    _, strategy, variational, hyperliquid, executor = (
+        _build_restricted_close_strategy(tmp_path)
+    )
+    _enter_close_halt(strategy)
+    first_halted_since = strategy.state.close_halted_since
+    assert first_halted_since == 7202.0
+    recoveries_before_retry = sum(
+        call["adapter"] == "hyperliquid" and not call["reduce_only"]
+        for call in executor.calls
+    )
+
+    retried = asyncio.run(strategy.run_once(now=first_halted_since + 900.0))
+    second_halted_since = strategy.state.close_halted_since
+    recoveries_after_retry = sum(
+        call["adapter"] == "hyperliquid" and not call["reduce_only"]
+        for call in executor.calls
+    )
+    hyperliquid.position = Decimal("0")
+    rehedged = asyncio.run(strategy.run_once(now=second_halted_since + 1.0))
+    recoveries_in_new_cycle = sum(
+        call["adapter"] == "hyperliquid" and not call["reduce_only"]
+        for call in executor.calls
+    )
+
+    assert retried.action == "close_halted"
+    assert second_halted_since == first_halted_since + 900.0
+    assert strategy.state.consecutive_close_failures == 4
+    assert recoveries_after_retry == recoveries_before_retry + 1
+    assert rehedged.action == "close_halted"
+    assert rehedged.net_exposure == 0
+    assert recoveries_in_new_cycle == recoveries_after_retry + 1
 
 
 def test_one_day_replay_has_twelve_alternating_rounds_and_48000_volume(
