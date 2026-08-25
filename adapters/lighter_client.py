@@ -499,6 +499,46 @@ class LighterClient(ExchangeAdapter):
             context="历史订单",
         )
 
+    async def get_fills_by_time(
+        self,
+        market: str,
+        start_time: float,
+        end_time: float,
+    ) -> list[dict[str, Decimal | int]]:
+        """从近期非活动订单按轮次窗口归一化真实成交均价。"""
+        start_ms = int(Decimal(str(start_time)) * Decimal(1000))
+        end_ms = int(Decimal(str(end_time)) * Decimal(1000))
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("Lighter 成交时间窗无效")
+        fills: list[dict[str, Decimal | int]] = []
+        for order in await self.get_orders_history(market, limit=100):
+            created_at = int(order.created_at)
+            timestamp_ms = (
+                created_at
+                if created_at >= 1_000_000_000_000
+                else created_at * 1000
+            )
+            if not start_ms <= timestamp_ms <= end_ms:
+                continue
+            average_price = order.average_price
+            if average_price is None or order.filled_qty <= 0:
+                continue
+            if order.side == Side.BUY.value:
+                signed_size = order.filled_qty
+            elif order.side == Side.SELL.value:
+                signed_size = -order.filled_qty
+            else:
+                raise ValueError(f"Lighter 成交方向无效：{order.side!r}")
+            fills.append(
+                {
+                    "price": average_price,
+                    "signed_size": signed_size,
+                    "fee": Decimal(0),
+                    "timestamp_ms": timestamp_ms,
+                }
+            )
+        return fills
+
     async def get_order_by_id(
         self,
         market: str,

@@ -72,6 +72,42 @@ def test_explicit_equity_path_overrides_derived_default(tmp_path) -> None:
     assert config.equity_path == equity_path
 
 
+def test_ledger_is_disabled_unless_cli_option_is_present() -> None:
+    """不传 --ledger-path 时必须保持既有的不记账行为。"""
+    cli = _cli()
+
+    args = cli.build_parser().parse_args([])
+    config = cli.build_config(args)
+
+    assert args.ledger_path is None
+    assert config.ledger_path is None
+
+
+def test_ledger_path_without_value_follows_selected_heartbeat(tmp_path) -> None:
+    """只给 --ledger-path 时按心跳文件名派生同目录台账路径。"""
+    cli = _cli()
+    heartbeat_path = tmp_path / "lighter_entropy.jsonl"
+    args = cli.build_parser().parse_args(
+        ["--heartbeat-path", str(heartbeat_path), "--ledger-path"]
+    )
+
+    config = cli.build_config(args)
+
+    assert config.ledger_path == tmp_path / "lighter_entropy_ledger.jsonl"
+    assert config.instance == "lighter_entropy"
+
+
+def test_explicit_ledger_path_overrides_derived_default(tmp_path) -> None:
+    """显式台账路径必须原样进入策略配置。"""
+    cli = _cli()
+    ledger_path = tmp_path / "round_ledger.jsonl"
+    args = cli.build_parser().parse_args(["--ledger-path", str(ledger_path)])
+
+    config = cli.build_config(args)
+
+    assert config.ledger_path == ledger_path
+
+
 def test_build_primary_client_supports_variational(monkeypatch) -> None:
     """4.1：显式选择 Variational 时用环境会话构造主腿。"""
     cli = _cli()

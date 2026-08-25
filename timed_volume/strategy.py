@@ -55,6 +55,8 @@ class TimedVolumeConfig:
     state_path: Path | str = Path("data/timed_volume/state.json")
     convergence_attempts: int = 3
     equity_path: Path | str | None = None
+    ledger_path: Path | str | None = None
+    instance: str | None = None
 
     def __post_init__(self) -> None:
         """归一化配置并拒绝无法安全运行的数值。"""
@@ -70,6 +72,15 @@ class TimedVolumeConfig:
         self.state_path = Path(self.state_path)
         if self.equity_path is not None:
             self.equity_path = Path(self.equity_path)
+        if self.ledger_path is not None:
+            self.ledger_path = Path(self.ledger_path)
+        if self.instance is not None:
+            self.instance = str(self.instance).strip() or None
+        if self.ledger_path is not None and self.instance is None:
+            stem = self.ledger_path.stem
+            self.instance = (
+                stem[:-7] if stem.lower().endswith("_ledger") else stem
+            )
         if not isinstance(self.initial_direction, RoundDirection):
             self.initial_direction = RoundDirection(str(self.initial_direction))
         if self.notional_min_usd <= 0 or self.notional_max_usd <= 0:
@@ -107,6 +118,10 @@ class TimedVolumeState:
     opened_at: float | None = None
     due_at: float | None = None
     current_notional_usd: int | None = None
+    ledger_primary_entry: Decimal | None = None
+    ledger_hedge_entry: Decimal | None = None
+    ledger_primary_size: Decimal | None = None
+    ledger_hedge_size: Decimal | None = None
 
     @property
     def is_open(self) -> bool:
@@ -157,6 +172,29 @@ class _OrderLimits:
 
     primary_minimum: Decimal
     hedge_minimum: Decimal
+
+
+@dataclass(frozen=True)
+class _RoundLedgerContext:
+    """平仓前冻结的轮次成交记账上下文。"""
+
+    round_index: int
+    direction: RoundDirection | None
+    notional_usd: int | None
+    opened_at: float | None
+    primary_entry: Decimal | None
+    hedge_entry: Decimal | None
+    primary_size: Decimal | None
+    hedge_size: Decimal | None
+
+
+@dataclass(frozen=True)
+class _FillSummary:
+    """单腿整轮手续费与平仓方向成交均价。"""
+
+    exit_price: Decimal | None
+    exit_size: Decimal
+    fee: Decimal
 
 
 class TimedHedgedVolumeStrategy:
@@ -219,7 +257,7 @@ class TimedHedgedVolumeStrategy:
             )
             if current_notional is not None and current_notional <= 0:
                 raise ValueError("当前轮名义额必须大于零")
-            return TimedVolumeState(
+            state = TimedVolumeState(
                 round_index=max(0, int(raw.get("round_index", 0))),
                 last_direction=RoundDirection(last_raw) if last_raw else None,
                 current_direction=RoundDirection(current_raw) if current_raw else None,
@@ -237,6 +275,27 @@ class TimedHedgedVolumeStrategy:
             logger.warning("轮次状态字段无效，将以实际持仓恢复：%s", exc)
             return TimedVolumeState()
 
+        if self.config.ledger_path is None:
+            return state
+        try:
+            for key in (
+                "ledger_primary_entry",
+                "ledger_hedge_entry",
+                "ledger_primary_size",
+                "ledger_hedge_size",
+            ):
+                value = raw.get(key)
+                if value is None:
+                    continue
+                decimal_value = Decimal(str(value))
+                if not decimal_value.is_finite():
+                    raise ValueError(f"{key} 必须为有限十进制数")
+                setattr(state, key, decimal_value)
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            logger.warning("轮次台账元数据读取失败，仅跳过本轮记账：%s", exc)
+            self._clear_ledger_state(state)
+        return state
+
     def _save_state(self) -> None:
         """原子写入轮次记录，避免进程中断留下半截 JSON。"""
         path = self.config.state_path
@@ -245,12 +304,33 @@ class TimedHedgedVolumeStrategy:
         for key in ("last_direction", "current_direction"):
             value = payload[key]
             payload[key] = value.value if value is not None else None
+        ledger_keys = (
+            "ledger_primary_entry",
+            "ledger_hedge_entry",
+            "ledger_primary_size",
+            "ledger_hedge_size",
+        )
+        if self.config.ledger_path is None:
+            for key in ledger_keys:
+                payload.pop(key, None)
+        else:
+            for key in ledger_keys:
+                value = payload[key]
+                payload[key] = str(value) if value is not None else None
         temporary = path.with_name(f".{path.name}.tmp")
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         temporary.replace(path)
+
+    @staticmethod
+    def _clear_ledger_state(state: TimedVolumeState) -> None:
+        """清空已结束轮次的附加记账元数据。"""
+        state.ledger_primary_entry = None
+        state.ledger_hedge_entry = None
+        state.ledger_primary_size = None
+        state.ledger_hedge_size = None
 
     def _is_within_hedge_tolerance(self, net_exposure: Decimal) -> bool:
         """按交易所最小可交易量推导的容差判断净敞口。"""
@@ -741,6 +821,7 @@ class TimedHedgedVolumeStrategy:
                 self.state.current_notional_usd = None
                 self.state.opened_at = None
                 self.state.due_at = None
+                self._clear_ledger_state(self.state)
                 self._save_state()
             return primary_size, hedge_size, False
 
@@ -762,6 +843,7 @@ class TimedHedgedVolumeStrategy:
                 self.state.current_direction = actual_direction
                 self.state.opened_at = now
                 self.state.due_at = now + self.config.cycle_seconds
+                self._clear_ledger_state(self.state)
                 self._save_state()
             return primary_size, hedge_size, False
 
@@ -822,6 +904,7 @@ class TimedHedgedVolumeStrategy:
                     if not record_keeps_schedule:
                         self.state.opened_at = now
                         self.state.due_at = now + self.config.cycle_seconds
+                        self._clear_ledger_state(self.state)
                     self._save_state()
                     return primary_size, hedge_size, True
 
@@ -838,6 +921,7 @@ class TimedHedgedVolumeStrategy:
             self.state.current_notional_usd = None
             self.state.opened_at = None
             self.state.due_at = None
+            self._clear_ledger_state(self.state)
             self._save_state()
         return primary_size, hedge_size, True
 
@@ -1038,6 +1122,7 @@ class TimedHedgedVolumeStrategy:
             self.state.current_notional_usd = None
             self.state.opened_at = None
             self.state.due_at = None
+            self._clear_ledger_state(self.state)
             self._save_state()
             return self._result("closed", primary_size, hedge_size, warnings)
         self._warn(warnings, "到期平仓未能两侧归零，保留轮次并在下一次继续收敛")
@@ -1251,15 +1336,359 @@ class TimedHedgedVolumeStrategy:
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+    def _round_ledger_context(self) -> _RoundLedgerContext:
+        """冻结当前轮次的台账字段，供交易完成后的隔离记账使用。"""
+        return _RoundLedgerContext(
+            round_index=self.state.round_index,
+            direction=self.state.current_direction,
+            notional_usd=self.state.current_notional_usd,
+            opened_at=self.state.opened_at,
+            primary_entry=self.state.ledger_primary_entry,
+            hedge_entry=self.state.ledger_hedge_entry,
+            primary_size=self.state.ledger_primary_size,
+            hedge_size=self.state.ledger_hedge_size,
+        )
+
+    def _capture_round_ledger_entry(self, result: TimedVolumeResult) -> None:
+        """从持仓展示快照保存精确入场均价；失败只影响本轮记账。"""
+        if (
+            self.config.ledger_path is None
+            or not self.state.is_open
+            or result.primary_entry is None
+            or result.hedge_entry is None
+            or result.primary_size is None
+            or result.hedge_size is None
+        ):
+            return
+        if all(
+            value is not None
+            for value in (
+                self.state.ledger_primary_entry,
+                self.state.ledger_hedge_entry,
+                self.state.ledger_primary_size,
+                self.state.ledger_hedge_size,
+            )
+        ):
+            return
+        values = (
+            result.primary_entry,
+            result.hedge_entry,
+            result.primary_size,
+            result.hedge_size,
+        )
+        if not all(value.is_finite() for value in values):
+            raise ValueError("轮次台账入场字段必须为有限十进制数")
+        if result.primary_entry <= 0 or result.hedge_entry <= 0:
+            raise ValueError("轮次台账入场均价必须大于零")
+        if result.primary_size == 0 or result.hedge_size == 0:
+            raise ValueError("轮次台账开仓数量不得为零")
+        self.state.ledger_primary_entry = result.primary_entry
+        self.state.ledger_hedge_entry = result.hedge_entry
+        self.state.ledger_primary_size = result.primary_size
+        self.state.ledger_hedge_size = result.hedge_size
+        self._save_state()
+
+    @staticmethod
+    def _fill_decimal(fill: object, key: str) -> Decimal:
+        """从成交对象提取有限 Decimal 字段。"""
+        value = fill.get(key) if isinstance(fill, dict) else getattr(fill, key, None)
+        decimal_value = Decimal(str(value))
+        if not decimal_value.is_finite():
+            raise ValueError(f"成交字段 {key} 必须为有限十进制数")
+        return decimal_value
+
+    async def _read_fill_summary(
+        self,
+        adapter,
+        market: str,
+        *,
+        opened_at: float,
+        closed_at: float,
+        opening_size: Decimal,
+    ) -> _FillSummary | None:
+        """读取整轮成交，并按平仓方向计算数量加权均价。"""
+        reader = getattr(adapter, "get_fills_by_time", None)
+        if not callable(reader):
+            return None
+        fills = await reader(market, opened_at, closed_at)
+        if not isinstance(fills, list):
+            raise ValueError("成交时间窗响应必须为数组")
+        fee = Decimal(0)
+        exit_quantity = Decimal(0)
+        exit_quote = Decimal(0)
+        for fill in fills:
+            price = self._fill_decimal(fill, "price")
+            signed_size = self._fill_decimal(fill, "signed_size")
+            fill_fee = self._fill_decimal(fill, "fee")
+            if price <= 0 or signed_size == 0:
+                raise ValueError("成交价格必须大于零且成交数量不得为零")
+            fee += fill_fee
+            if signed_size * opening_size < 0:
+                quantity = abs(signed_size)
+                exit_quantity += quantity
+                exit_quote += price * quantity
+        exit_price = (
+            exit_quote / exit_quantity if exit_quantity > 0 else None
+        )
+        return _FillSummary(
+            exit_price=exit_price,
+            exit_size=exit_quantity,
+            fee=fee,
+        )
+
+    @staticmethod
+    def _venue_name(adapter) -> str:
+        """返回用于台账的规范化交易所名称。"""
+        return str(getattr(adapter, "name", type(adapter).__name__)).strip().lower()
+
+    @staticmethod
+    def _mid_price(quote: object, role: str) -> Decimal:
+        """从盘口对象提取有效中价。"""
+        value = Decimal(str(getattr(quote, "mid")))
+        if not value.is_finite() or value <= 0:
+            raise ValueError(f"{role}平仓中价必须为有限正数")
+        return value
+
+    async def _round_exit_data(
+        self,
+        context: _RoundLedgerContext,
+        *,
+        closed_at: float,
+        primary_closed_size: Decimal,
+        hedge_closed_size: Decimal,
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal, str]:
+        """优先取双腿精确成交均价，否则统一降级为两腿中价。"""
+        if (
+            context.opened_at is None
+            or context.primary_size is None
+            or context.hedge_size is None
+        ):
+            raise ValueError("轮次台账缺少开仓时间或数量")
+        summaries = await asyncio.gather(
+            self._read_fill_summary(
+                self.primary,
+                self.config.primary_market,
+                opened_at=context.opened_at,
+                closed_at=closed_at,
+                opening_size=context.primary_size,
+            ),
+            self._read_fill_summary(
+                self.hedge,
+                self.config.hedge_market,
+                opened_at=context.opened_at,
+                closed_at=closed_at,
+                opening_size=context.hedge_size,
+            ),
+            return_exceptions=True,
+        )
+        primary_venue = self._venue_name(self.primary)
+        hedge_venue = self._venue_name(self.hedge)
+        normalized: list[_FillSummary | None] = []
+        for venue, summary in zip(
+            (primary_venue, hedge_venue),
+            summaries,
+            strict=True,
+        ):
+            if isinstance(summary, BaseException):
+                if venue == "hyperliquid":
+                    raise summary
+                normalized.append(None)
+            else:
+                normalized.append(summary)
+        primary_summary, hedge_summary = normalized
+
+        def fee_for(venue: str, summary: _FillSummary | None) -> Decimal:
+            if venue in {"lighter", "variational"}:
+                return Decimal(0)
+            if summary is None:
+                raise ValueError(f"{venue} 缺少整轮手续费成交明细")
+            return summary.fee
+
+        primary_fee = fee_for(primary_venue, primary_summary)
+        hedge_fee = fee_for(hedge_venue, hedge_summary)
+        summaries_with_targets = (
+            (primary_venue, primary_summary, primary_closed_size),
+            (hedge_venue, hedge_summary, hedge_closed_size),
+        )
+        for venue, summary, expected_size in summaries_with_targets:
+            complete = (
+                summary is not None
+                and summary.exit_price is not None
+                and summary.exit_size >= expected_size
+            )
+            if venue == "hyperliquid" and not complete:
+                raise ValueError("Hyperliquid 平仓成交尚未完整出现在时间窗内")
+
+        primary_complete = (
+            primary_summary is not None
+            and primary_summary.exit_price is not None
+            and primary_summary.exit_size >= primary_closed_size
+        )
+        hedge_complete = (
+            hedge_summary is not None
+            and hedge_summary.exit_price is not None
+            and hedge_summary.exit_size >= hedge_closed_size
+        )
+        if primary_complete and hedge_complete:
+            assert primary_summary is not None
+            assert primary_summary.exit_price is not None
+            assert hedge_summary is not None
+            assert hedge_summary.exit_price is not None
+            return (
+                primary_summary.exit_price,
+                hedge_summary.exit_price,
+                primary_fee,
+                hedge_fee,
+                "fill",
+            )
+
+        primary_quote, hedge_quote = await asyncio.gather(
+            self.primary.get_market_price(self.config.primary_market),
+            self.hedge.get_market_price(self.config.hedge_market),
+        )
+        return (
+            self._mid_price(primary_quote, "主腿"),
+            self._mid_price(hedge_quote, "对冲腿"),
+            primary_fee,
+            hedge_fee,
+            "mid",
+        )
+
+    def _append_round_ledger(self, payload: dict) -> None:
+        """向启用的轮次台账追加一条 JSONL。"""
+        path = self.config.ledger_path
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    async def _record_round_ledger(
+        self,
+        result: TimedVolumeResult,
+        context: _RoundLedgerContext,
+        *,
+        now: float | None,
+    ) -> None:
+        """仅在平仓完成后按成交台账计算本轮成本归因。"""
+        if self.config.ledger_path is None or result.action != "closed":
+            return
+        required = (
+            context.direction,
+            context.notional_usd,
+            context.opened_at,
+            context.primary_entry,
+            context.hedge_entry,
+            context.primary_size,
+            context.hedge_size,
+        )
+        if any(value is None for value in required):
+            raise ValueError("轮次台账缺少完整入场上下文")
+        assert context.direction is not None
+        assert context.notional_usd is not None
+        assert context.opened_at is not None
+        assert context.primary_entry is not None
+        assert context.hedge_entry is not None
+        assert context.primary_size is not None
+        assert context.hedge_size is not None
+
+        closed_at = time.time() if now is None else float(now)
+        (
+            primary_exit,
+            hedge_exit,
+            primary_fee,
+            hedge_fee,
+            exit_price_source,
+        ) = await self._round_exit_data(
+            context,
+            closed_at=closed_at,
+            primary_closed_size=abs(
+                context.primary_size - (result.primary_size or Decimal(0))
+            ),
+            hedge_closed_size=abs(
+                context.hedge_size - (result.hedge_size or Decimal(0))
+            ),
+        )
+        entry_basis = (
+            (context.primary_entry - context.hedge_entry)
+            / context.hedge_entry
+            * Decimal(100)
+        )
+        exit_basis = (
+            (primary_exit - hedge_exit) / hedge_exit * Decimal(100)
+        )
+        fee_total = primary_fee + hedge_fee
+        realized_pnl = (
+            (primary_exit - context.primary_entry) * context.primary_size
+            + (hedge_exit - context.hedge_entry) * context.hedge_size
+            - fee_total
+        )
+        symbol = (
+            str(self.config.primary_market)
+            .upper()
+            .split("-", 1)[0]
+            .split("/", 1)[0]
+        )
+        payload = {
+            "ts": closed_at,
+            "instance": self.config.instance,
+            "round_index": context.round_index,
+            "direction": context.direction.value,
+            "notional_usd": context.notional_usd,
+            "symbol": symbol,
+            "primary": {
+                "venue": self._venue_name(self.primary),
+                "entry": str(context.primary_entry),
+                "exit": str(primary_exit),
+                "size": str(context.primary_size),
+                "fee": str(primary_fee),
+            },
+            "hedge": {
+                "venue": self._venue_name(self.hedge),
+                "entry": str(context.hedge_entry),
+                "exit": str(hedge_exit),
+                "size": str(context.hedge_size),
+                "fee": str(hedge_fee),
+            },
+            "entry_basis_pct": str(entry_basis),
+            "exit_basis_pct": str(exit_basis),
+            "basis_change_pct": str(exit_basis - entry_basis),
+            "realized_pnl": str(realized_pnl),
+            "fee_total": str(fee_total),
+            "exit_price_source": exit_price_source,
+            "opened_at": context.opened_at,
+            "held_seconds": closed_at - context.opened_at,
+        }
+        self._append_round_ledger(payload)
+
     async def run_once(self, *, now: float | None = None) -> TimedVolumeResult:
         """先完成交易状态机，再以完全隔离的只读查询补充面板数据。"""
+        ledger_context = (
+            self._round_ledger_context()
+            if self.config.ledger_path is not None
+            else None
+        )
         result = await self._run_trading_once(now=now)
+        if ledger_context is not None and result.action == "closed":
+            try:
+                await self._record_round_ledger(
+                    result,
+                    ledger_context,
+                    now=now,
+                )
+            except Exception as exc:  # noqa: BLE001 台账不得改变任何交易结果
+                logger.warning("轮次成交台账记录失败，仅跳过本轮记录：%s", exc)
         try:
             await self._record_equity_snapshot(result, now=now)
         except Exception as exc:  # noqa: BLE001 权益记账不得改变任何交易结果
             logger.warning("权益快照记录失败，仅影响累计盈亏展示：%s", exc)
         try:
-            return await self._attach_display_pnl(result)
+            result = await self._attach_display_pnl(result)
         except Exception as exc:  # noqa: BLE001 展示数据不得改变任何交易结果
             logger.warning("盈亏快照整理失败，仅影响面板展示：%s", exc)
-            return result
+        if ledger_context is not None and result.action != "closed":
+            try:
+                self._capture_round_ledger_entry(result)
+            except Exception as exc:  # noqa: BLE001 台账不得改变任何交易结果
+                logger.warning("轮次成交台账记录失败，仅跳过本轮记录：%s", exc)
+        return result

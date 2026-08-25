@@ -1268,6 +1268,54 @@ def test_get_orders_history_reads_inactive_orders(tmp_path) -> None:
     assert got[0].filled_qty == Decimal("0.00300")
 
 
+def test_fills_by_time_uses_inactive_order_average_and_signed_side(tmp_path) -> None:
+    """成交窗口只保留区间内订单，并按真实成交额计算带方向均价。"""
+    client = _trading_client(
+        tmp_path,
+        _FakeSigner(),
+        history=[
+            _raw_order(
+                client_order_index=1,
+                created_at=1000,
+                is_ask=False,
+                filled_base_amount="0.02000",
+                filled_quote_amount="2000.00",
+            ),
+            _raw_order(
+                client_order_index=2,
+                created_at=2000,
+                is_ask=True,
+                filled_base_amount="0.02000",
+                filled_quote_amount="2220.00",
+            ),
+            _raw_order(
+                client_order_index=3,
+                created_at=3000,
+                is_ask=True,
+                filled_base_amount="0.02000",
+                filled_quote_amount="2400.00",
+            ),
+        ],
+    )
+
+    got = _run_and_close(client, client.get_fills_by_time("BTC", 999.5, 2000.5))
+
+    assert got == [
+        {
+            "price": Decimal("100000"),
+            "signed_size": Decimal("0.02000"),
+            "fee": Decimal("0"),
+            "timestamp_ms": 1_000_000,
+        },
+        {
+            "price": Decimal("111000"),
+            "signed_size": Decimal("-0.02000"),
+            "fee": Decimal("0"),
+            "timestamp_ms": 2_000_000,
+        },
+    ]
+
+
 def test_get_order_by_id_returns_status_and_filled_quantity(tmp_path) -> None:
     """按引擎保存的 client_order_index 返回统一订单视图。"""
     client = _trading_client(

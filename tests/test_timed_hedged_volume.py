@@ -322,6 +322,8 @@ def _build_strategy(
     on_auth_error=None,
     on_hedge_auth_error=None,
     equity_path=None,
+    ledger_path=None,
+    instance="test_instance",
 ):
     api = _api()
     lighter = lighter or _LighterAdapter("lighter")
@@ -338,6 +340,8 @@ def _build_strategy(
         position_tolerance=position_tolerance,
         state_path=tmp_path / state_name,
         equity_path=equity_path,
+        ledger_path=ledger_path,
+        instance=instance,
     )
     strategy = api.TimedHedgedVolumeStrategy(
         lighter,
@@ -350,6 +354,92 @@ def _build_strategy(
         on_hedge_auth_error=on_hedge_auth_error,
     )
     return api, strategy, lighter, extended
+
+
+class _LedgerLighter(_LighterAdapter):
+    """提供可控入场价、盘口与成交历史的主腿测试桩。"""
+
+    def __init__(
+        self,
+        name: str = "lighter",
+        *,
+        entry_price: Decimal = Decimal("100"),
+        mid_price: Decimal = Decimal("110"),
+        fills: list[dict] | None = None,
+    ) -> None:
+        super().__init__(name)
+        self.entry_price = entry_price
+        self.mid_price = mid_price
+        self.fills = list(fills or ())
+        self.fill_reads = 0
+
+    async def get_market_price(self, market: str):
+        return MarketPrice(
+            market,
+            bid=self.mid_price - Decimal("1"),
+            ask=self.mid_price + Decimal("1"),
+        )
+
+    async def get_position_pnl(self, market: str):
+        del market
+        return PositionPnl(
+            unrealized_pnl=Decimal("0"),
+            entry_price=self.entry_price,
+            position_value=None,
+        )
+
+    async def get_fills_by_time(
+        self,
+        market: str,
+        start_time: float,
+        end_time: float,
+    ) -> list[dict]:
+        del market, start_time, end_time
+        self.fill_reads += 1
+        return list(self.fills)
+
+
+class _LedgerHedge(_ExtendedAdapter):
+    """提供可控入场价、盘口与成交历史的对冲腿测试桩。"""
+
+    def __init__(
+        self,
+        name: str = "hyperliquid",
+        *,
+        entry_price: Decimal = Decimal("102"),
+        mid_price: Decimal = Decimal("105"),
+        fills: list[dict] | None = None,
+    ) -> None:
+        super().__init__(name)
+        self.entry_price = entry_price
+        self.mid_price = mid_price
+        self.fills = list(fills or ())
+        self.fill_reads = 0
+
+    async def get_market_price(self, market_name: str):
+        return MarketPrice(
+            market_name,
+            bid=self.mid_price - Decimal("1"),
+            ask=self.mid_price + Decimal("1"),
+        )
+
+    async def get_position_pnl(self, market: str):
+        del market
+        return PositionPnl(
+            unrealized_pnl=Decimal("0"),
+            entry_price=self.entry_price,
+            position_value=None,
+        )
+
+    async def get_fills_by_time(
+        self,
+        market: str,
+        start_time: float,
+        end_time: float,
+    ) -> list[dict]:
+        del market, start_time, end_time
+        self.fill_reads += 1
+        return list(self.fills)
 
 
 def test_equity_read_failure_does_not_block_close_or_next_open(tmp_path) -> None:
@@ -453,6 +543,234 @@ def test_exact_flat_close_appends_decimal_equity_strings(tmp_path) -> None:
         "hedge_equity": "552.340000000000000002",
         "total_equity": "1113.830000000000000003",
     }
+
+
+def test_ledger_write_failure_does_not_block_close_or_next_open(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """台账写盘异常不得改变平仓、互锁或下一轮方向。"""
+    ledger_path = tmp_path / "round_ledger.jsonl"
+    lighter = _LedgerLighter(mid_price=Decimal("100"))
+    hedge = _LedgerHedge(name="variational", mid_price=Decimal("102"))
+    executor = _ScriptedExecutor()
+    api, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=hedge,
+        executor=executor,
+        ledger_path=ledger_path,
+    )
+
+    opened = asyncio.run(strategy.run_once(now=0.0))
+
+    write_attempts: list[dict] = []
+
+    def fail_write(payload: dict) -> None:
+        write_attempts.append(payload)
+        raise OSError("台账磁盘暂时不可写")
+
+    monkeypatch.setattr(strategy, "_append_round_ledger", fail_write)
+    closed = asyncio.run(strategy.run_once(now=7200.0))
+    next_opened = asyncio.run(strategy.run_once(now=7200.0))
+
+    assert opened.action == "opened"
+    assert closed.action == "closed"
+    assert closed.hedge_available is True
+    assert strategy.hedge_interlock_active is False
+    assert len(write_attempts) == 1
+    assert write_attempts[0]["round_index"] == 1
+    assert not ledger_path.exists()
+    assert next_opened.action == "opened"
+    assert next_opened.direction is api.RoundDirection.SHORT
+    assert lighter.position == -hedge.position != 0
+
+
+def test_round_ledger_is_written_only_after_close(tmp_path) -> None:
+    """开仓和等待节拍不得记账，只有平仓完成才追加一行。"""
+    ledger_path = tmp_path / "round_ledger.jsonl"
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100")),
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("102")),
+        executor=_ScriptedExecutor(),
+        ledger_path=ledger_path,
+    )
+
+    opened = asyncio.run(strategy.run_once(now=0.0))
+    waited = asyncio.run(strategy.run_once(now=1.0))
+
+    assert opened.action == "opened"
+    assert waited.action == "wait"
+    assert not ledger_path.exists()
+
+    closed = asyncio.run(strategy.run_once(now=7200.0))
+
+    assert closed.action == "closed"
+    rows = ledger_path.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    assert json.loads(rows[0])["round_index"] == 1
+
+
+def test_round_ledger_basis_change_uses_decimal_subtraction(tmp_path) -> None:
+    """基差变化必须严格等于退出基差减入场基差。"""
+    ledger_path = tmp_path / "round_ledger.jsonl"
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(
+            entry_price=Decimal("100"),
+            mid_price=Decimal("110"),
+        ),
+        extended=_LedgerHedge(
+            name="variational",
+            entry_price=Decimal("102"),
+            mid_price=Decimal("105"),
+        ),
+        executor=_ScriptedExecutor(),
+        ledger_path=ledger_path,
+    )
+
+    asyncio.run(strategy.run_once(now=0.0))
+    asyncio.run(strategy.run_once(now=7200.0))
+    row = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+    entry_basis = (Decimal("100") - Decimal("102")) / Decimal("102") * 100
+    exit_basis = (Decimal("110") - Decimal("105")) / Decimal("105") * 100
+    assert Decimal(row["entry_basis_pct"]) == entry_basis
+    assert Decimal(row["exit_basis_pct"]) == exit_basis
+    assert Decimal(row["basis_change_pct"]) == exit_basis - entry_basis
+    assert row["exit_price_source"] == "mid"
+
+
+def test_round_ledger_marks_fill_only_when_both_exit_averages_are_exact(
+    tmp_path,
+) -> None:
+    """两腿成交历史都能聚合平仓均价时才标记 fill，并汇总整轮手续费。"""
+    ledger_path = tmp_path / "round_ledger.jsonl"
+    lighter = _LedgerLighter(
+        mid_price=Decimal("100"),
+        fills=[
+            {"price": "100", "signed_size": "20", "fee": "9"},
+            {"price": "111", "signed_size": "-20", "fee": "9"},
+        ]
+    )
+    hedge = _LedgerHedge(
+        fills=[
+            {"price": "102", "signed_size": "-20", "fee": "0.3"},
+            {"price": "104", "signed_size": "20", "fee": "0.4"},
+        ]
+    )
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=hedge,
+        executor=_ScriptedExecutor(),
+        ledger_path=ledger_path,
+        instance="lighter_entropy",
+    )
+
+    asyncio.run(strategy.run_once(now=0.0))
+    asyncio.run(strategy.run_once(now=7200.0))
+    row = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+    assert row["ts"] == 7200.0
+    assert row["instance"] == "lighter_entropy"
+    assert row["round_index"] == 1
+    assert row["direction"] == "long"
+    assert row["notional_usd"] == 2000
+    assert row["symbol"] == "BTC"
+    assert row["exit_price_source"] == "fill"
+    assert row["primary"]["venue"] == "lighter"
+    assert row["primary"]["entry"] == "100"
+    assert row["primary"]["exit"] == "111"
+    assert row["primary"]["size"] == "20.000"
+    assert row["hedge"]["venue"] == "hyperliquid"
+    assert row["hedge"]["entry"] == "102"
+    assert row["hedge"]["exit"] == "104"
+    assert row["hedge"]["size"] == "-20.000"
+    assert row["primary"]["fee"] == "0"
+    assert row["hedge"]["fee"] == "0.7"
+    assert row["fee_total"] == "0.7"
+    assert row["opened_at"] == 0.0
+    assert row["held_seconds"] == 7200.0
+    for field in (
+        "entry_basis_pct",
+        "exit_basis_pct",
+        "basis_change_pct",
+        "realized_pnl",
+        "fee_total",
+    ):
+        assert isinstance(row[field], str)
+    realized_pnl = (
+        (Decimal("111") - Decimal(row["primary"]["entry"]))
+        * Decimal(row["primary"]["size"])
+        + (Decimal("104") - Decimal(row["hedge"]["entry"]))
+        * Decimal(row["hedge"]["size"])
+        - Decimal("0.7")
+    )
+    assert isinstance(row["realized_pnl"], str)
+    assert Decimal(row["realized_pnl"]) == realized_pnl
+
+
+def test_round_ledger_entry_context_survives_strategy_restart(tmp_path) -> None:
+    """入场均价与实际数量必须随轮次状态持久化，重启后仍可完成记账。"""
+    ledger_path = tmp_path / "round_ledger.jsonl"
+    lighter = _LedgerLighter(
+        entry_price=Decimal("79502.500000000000000001"),
+        mid_price=Decimal("79610"),
+    )
+    hedge = _LedgerHedge(
+        name="variational",
+        entry_price=Decimal("79524"),
+        mid_price=Decimal("79625"),
+    )
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=hedge,
+        executor=_ScriptedExecutor(),
+        ledger_path=ledger_path,
+    )
+    asyncio.run(strategy.run_once(now=0.0))
+
+    _, restarted, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=hedge,
+        executor=_ScriptedExecutor(),
+        ledger_path=ledger_path,
+    )
+    closed = asyncio.run(restarted.run_once(now=7200.0))
+    row = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+    assert closed.action == "closed"
+    assert row["primary"]["entry"] == "79502.500000000000000001"
+    assert row["hedge"]["entry"] == "79524"
+    assert Decimal(row["primary"]["size"]) > 0
+    assert Decimal(row["hedge"]["size"]) < 0
+
+
+def test_missing_ledger_path_preserves_existing_behavior(tmp_path) -> None:
+    """未启用台账时不得查询成交历史或在状态文件写入台账元数据。"""
+    lighter = _LedgerLighter()
+    hedge = _LedgerHedge()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=hedge,
+        executor=_ScriptedExecutor(),
+        ledger_path=None,
+    )
+
+    opened = asyncio.run(strategy.run_once(now=0.0))
+    closed = asyncio.run(strategy.run_once(now=7200.0))
+
+    assert opened.action == "opened"
+    assert closed.action == "closed"
+    assert lighter.fill_reads == 0
+    assert hedge.fill_reads == 0
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert not any(key.startswith("ledger_") for key in state)
 
 
 def test_primary_auth_error_reloads_client_and_skips_round(tmp_path) -> None:

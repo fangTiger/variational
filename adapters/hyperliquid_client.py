@@ -514,6 +514,53 @@ class HyperliquidClient(ExchangeAdapter):
             )
         return None
 
+    async def get_fills_by_time(
+        self,
+        market: str,
+        start_time: float,
+        end_time: float,
+    ) -> list[dict[str, Decimal | int]]:
+        """按秒级轮次窗口读取成交，并归一化价格、方向数量与手续费。"""
+        target = (await self._market(market)).coin
+        start_ms = int(Decimal(str(start_time)) * Decimal(1000))
+        end_ms = int(Decimal(str(end_time)) * Decimal(1000))
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("Hyperliquid 成交时间窗无效")
+        raw = await asyncio.to_thread(
+            self._require_info().user_fills_by_time,
+            self._require_account_address(),
+            start_ms,
+            end_ms,
+            False,
+        )
+        if not isinstance(raw, list):
+            raise ValueError("Hyperliquid 成交时间窗响应不是数组")
+        fills: list[dict[str, Decimal | int]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError(f"Hyperliquid 成交元素无效：{item!r}")
+            if str(item.get("coin", "")).upper() != target.upper():
+                continue
+            side = str(item.get("side", "")).upper()
+            if side not in {"B", "A"}:
+                raise ValueError(f"Hyperliquid 成交方向无效：{side!r}")
+            price = _positive_decimal(item.get("px"), context="成交价格")
+            size = _positive_decimal(item.get("sz"), context="成交数量")
+            fee = _decimal(item.get("fee"), context="成交手续费")
+            try:
+                timestamp_ms = int(item["time"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Hyperliquid 成交缺少有效 time") from exc
+            fills.append(
+                {
+                    "price": price,
+                    "signed_size": size if side == "B" else -size,
+                    "fee": fee,
+                    "timestamp_ms": timestamp_ms,
+                }
+            )
+        return fills
+
     async def get_balance(self) -> HyperliquidBalance:
         """返回全平口径权益：Spot USDC 加全部持仓未实现盈亏。"""
         spot_usdc_total = Decimal(0)

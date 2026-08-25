@@ -55,6 +55,20 @@ def _equity_path_from_heartbeat(path: Path | str) -> Path:
     return heartbeat.with_name(f"{prefix}_equity.jsonl")
 
 
+def _ledger_path_from_heartbeat(path: Path | str) -> Path:
+    """把心跳路径转换为同目录的独立轮次台账 JSONL 路径。"""
+    heartbeat = Path(path)
+    name = heartbeat.name
+    prefix = name[:-6] if name.lower().endswith(".jsonl") else name
+    return heartbeat.with_name(f"{prefix}_ledger.jsonl")
+
+
+def _instance_from_heartbeat(path: Path | str) -> str:
+    """用心跳文件名前缀生成稳定实例名。"""
+    name = Path(path).name
+    return name[:-6] if name.lower().endswith(".jsonl") else name
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建定时定量策略命令行参数。"""
     parser = argparse.ArgumentParser(description="跨交易所定时定量对冲刷量")
@@ -134,6 +148,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--equity-path",
         default=None,
         help="独立权益 JSONL 文件（默认与心跳同目录并追加 _equity 后缀）",
+    )
+    parser.add_argument(
+        "--ledger-path",
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "启用轮次成交台账；不带值时与心跳同目录并追加 _ledger 后缀，"
+            "不传则不记录"
+        ),
     )
     parser.add_argument(
         "--lighter-address",
@@ -508,6 +532,7 @@ def _acquire_state_path_lease(
 def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
     """把命令行参数转换成策略配置。"""
     equity_path = getattr(args, "equity_path", None)
+    ledger_path = getattr(args, "ledger_path", None)
     return TimedVolumeConfig(
         primary_market=args.market,
         hedge_market=args.hedge_market,
@@ -524,6 +549,14 @@ def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
             if equity_path is not None
             else _equity_path_from_heartbeat(args.heartbeat_path)
         ),
+        ledger_path=(
+            None
+            if ledger_path is None
+            else _ledger_path_from_heartbeat(args.heartbeat_path)
+            if ledger_path == ""
+            else Path(ledger_path)
+        ),
+        instance=_instance_from_heartbeat(args.heartbeat_path),
     )
 
 
@@ -546,6 +579,14 @@ def startup_summary(
         if equity_path is not None
         else _equity_path_from_heartbeat(args.heartbeat_path)
     )
+    ledger_path = getattr(args, "ledger_path", None)
+    effective_ledger_path = (
+        "未启用"
+        if ledger_path is None
+        else str(_ledger_path_from_heartbeat(args.heartbeat_path))
+        if ledger_path == ""
+        else str(Path(ledger_path))
+    )
     lines = [
         "定时定量对冲配置",
         f"主腿：{args.primary_venue}，账户：{_mask_account(_primary_account_identity(args))}",
@@ -558,6 +599,7 @@ def startup_summary(
         f"轮次状态：{args.state_path}",
         f"独立心跳：{args.heartbeat_path}",
         f"权益快照：{effective_equity_path}",
+        f"轮次台账：{effective_ledger_path}",
         f"当前轮次：{state.round_index}",
         f"当前方向：{current_direction}",
         f"当前轮名义额：{current_notional}",

@@ -197,7 +197,8 @@ PYTHONPATH=. .venv/bin/python -m tools.run_timed_volume --live \
     --hedge-venue hyperliquid --hedge-market BTC \
     --notional-min <下限> --notional-max <上限> \
     --cycle-hours 4 --initial-direction long \
-    --maker-timeout 300 --poll-interval 30
+    --maker-timeout 300 --poll-interval 30 \
+    --ledger-path data/round_ledger.jsonl
 
 # 第二对：Variational × Entropy（注意三处隔离）
 PYTHONPATH=. .venv/bin/python -m tools.run_timed_volume --live \
@@ -220,6 +221,7 @@ PYTHONPATH=. .venv/bin/python -m tools.run_timed_volume --live \
 | `--initial-direction` | 无历史记录时的首轮方向，之后逐轮交替 |
 | `--maker-timeout` | maker 优先等待秒数，超时才转市价。**订单簿腿的主要成本杠杆** |
 | `--state-path` / `--heartbeat-path` | **多实例必须各自指定**，否则轮次状态互相覆写 |
+| `--ledger-path [路径]` | 启用按实例、按轮次的成交成本台账；省略路径值时按心跳文件派生 `_ledger.jsonl`，完全不传则不记录 |
 
 **同时跑多对的三条隔离要求**（前两条有启动校验强制，第三条靠自觉）：
 

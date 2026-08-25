@@ -217,6 +217,7 @@ class FakeInfo:
         spot_state: dict | None = None,
         orders: list[dict] | None = None,
         history: list[dict] | None = None,
+        fills: list[dict] | None = None,
         query_result: dict | None = None,
     ) -> None:
         self.meta_contexts = (
@@ -227,6 +228,7 @@ class FakeInfo:
         self.spot_state = _spot_user_state() if spot_state is None else spot_state
         self.orders = [] if orders is None else orders
         self.history = [] if history is None else history
+        self.fills = [] if fills is None else fills
         self.query_result = (
             {"status": "unknownOid"} if query_result is None else query_result
         )
@@ -268,6 +270,24 @@ class FakeInfo:
     def historical_orders(self, user: str):
         self.calls.append(("historical_orders", user))
         return self.history
+
+    def user_fills_by_time(
+        self,
+        address: str,
+        start_time: int,
+        end_time: int | None = None,
+        aggregate_by_time: bool = False,
+    ):
+        self.calls.append(
+            (
+                "user_fills_by_time",
+                address,
+                start_time,
+                end_time,
+                aggregate_by_time,
+            )
+        )
+        return self.fills
 
 
 def test_fake_info_preserves_falsy_malformed_responses() -> None:
@@ -964,6 +984,55 @@ def test_liquidation_info_uses_mark_price_and_position_liquidation_price() -> No
     assert result == (Decimal("62500"), Decimal("45000"))
 
 
+def test_fills_by_time_normalizes_signed_size_fee_and_millisecond_window() -> None:
+    """成交时间窗必须按标的过滤，并保留 Decimal 价格、方向数量和手续费。"""
+    info = FakeInfo(
+        fills=[
+            {
+                "coin": "BTC",
+                "px": "79524.000000000000000001",
+                "sz": "0.02853",
+                "side": "A",
+                "fee": "0.3712",
+                "time": 1_787_585_600_250,
+            },
+            {
+                "coin": "ETH",
+                "px": "4000",
+                "sz": "1",
+                "side": "B",
+                "fee": "0.1",
+                "time": 1_787_585_600_500,
+            },
+        ]
+    )
+    client = _client(info=info)
+
+    fills = asyncio.run(
+        client.get_fills_by_time(
+            "BTC",
+            1_787_585_600.125,
+            1_787_600_000.875,
+        )
+    )
+
+    assert fills == [
+        {
+            "price": Decimal("79524.000000000000000001"),
+            "signed_size": Decimal("-0.02853"),
+            "fee": Decimal("0.3712"),
+            "timestamp_ms": 1_787_585_600_250,
+        }
+    ]
+    assert info.calls[-1] == (
+        "user_fills_by_time",
+        ACCOUNT_ADDRESS,
+        1_787_585_600_125,
+        1_787_600_000_875,
+        False,
+    )
+
+
 def test_history_is_filtered_normalized_sorted_and_limited() -> None:
     history = [
         _historical_order("BTC", 101),
@@ -1110,6 +1179,13 @@ def test_real_sdk_signatures_match_the_stubbed_boundary() -> None:
     assert list(inspect.signature(Info.historical_orders).parameters) == [
         "self",
         "user",
+    ]
+    assert list(inspect.signature(Info.user_fills_by_time).parameters) == [
+        "self",
+        "address",
+        "start_time",
+        "end_time",
+        "aggregate_by_time",
     ]
     assert list(inspect.signature(Exchange).parameters) == [
         "wallet",
