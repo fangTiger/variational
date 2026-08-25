@@ -62,6 +62,101 @@ def test_execution_model_defaults_to_orderbook_and_variational_declares_rfq() ->
     assert VariationalClient.execution_model == "rfq"
 
 
+def test_equity_market_order_automatically_uses_rwa_and_caches_metadata() -> None:
+    """股票标的自动采用 RWA 参数，重复下单不得重复读取标的元数据。"""
+    client = object.__new__(VariationalClient)
+    client._max_slippage = 0.01
+    metadata_calls = 0
+    quote_bodies: list[dict] = []
+
+    async def get_supported_assets():
+        nonlocal metadata_calls
+        metadata_calls += 1
+        # 用平台权威字段，而非 token_uri：SNDK 是真实上市公司，
+        # 图标来自第三方数据商，按图标 URL 判断会漏掉它。
+        return {
+            market: [
+                {
+                    "asset": market,
+                    "instrument_type": "perpetual_rwa_future",
+                    "asset_class": "equity",
+                    "token_uri": f"https://images.example.com/{market}.png",
+                }
+            ]
+            for market in ("OPENAI", "ANTHROPIC", "SNDK")
+        }
+
+    async def post(path: str, body: dict | None = None):
+        if path == "/quotes/indicative":
+            quote_bodies.append(body)
+            return {"quote_id": f"quote-{len(quote_bodies)}"}
+        assert path == "/quotes/accept"
+        return {"rfq_id": body["quote_id"]}
+
+    client.get_supported_assets = get_supported_assets
+    client._post = post
+
+    for market in ("OPENAI", "ANTHROPIC", "SNDK", "SNDK"):
+        asyncio.run(client.market_order(market, Side.BUY, Decimal("0.1")))
+
+    assert metadata_calls == 1
+    assert [body["instrument"]["underlying"] for body in quote_bodies] == [
+        "OPENAI",
+        "ANTHROPIC",
+        "SNDK",
+        "SNDK",
+    ]
+    assert all(
+        body["instrument"]["instrument_type"] == "perpetual_rwa_future"
+        and body["instrument"]["kind"] == "equity"
+        for body in quote_bodies
+    )
+
+
+def test_non_equity_market_order_keeps_standard_perpetual_instrument() -> None:
+    """普通标的和无法识别的元数据都保持现有普通永续参数。"""
+    client = object.__new__(VariationalClient)
+    client._max_slippage = 0.01
+    quote_bodies: list[dict] = []
+
+    async def get_supported_assets():
+        return {
+            "BTC": [
+                {
+                    "asset": "BTC",
+                    "token_uri": "https://assets.example/crypto/BTC.svg",
+                }
+            ]
+        }
+
+    async def post(path: str, body: dict | None = None):
+        if path == "/quotes/indicative":
+            quote_bodies.append(body)
+            return {"quote_id": "quote-btc"}
+        return {"rfq_id": "rfq-btc"}
+
+    client.get_supported_assets = get_supported_assets
+    client._post = post
+
+    asyncio.run(client.market_order("BTC", Side.SELL, Decimal("0.001")))
+    asyncio.run(client.market_order("SOL", Side.BUY, Decimal("0.01")))
+
+    assert [body["instrument"] for body in quote_bodies] == [
+        {
+            "funding_interval_s": 3600,
+            "instrument_type": "perpetual_future",
+            "settlement_asset": "USDC",
+            "underlying": "BTC",
+        },
+        {
+            "funding_interval_s": 3600,
+            "instrument_type": "perpetual_future",
+            "settlement_asset": "USDC",
+            "underlying": "SOL",
+        },
+    ]
+
+
 def test_get_balance_reads_portfolio_balance_and_upnl_as_decimal() -> None:
     """Variational 权益必须由 portfolio 的余额与未实现盈亏精确相加。"""
     client = object.__new__(VariationalClient)
@@ -224,3 +319,67 @@ def test_quantity_limits_cached_per_market_and_side() -> None:
     asyncio.run(client.get_min_order_size("BTC", Side.SELL))
 
     assert len(calls) == 2
+
+
+def test_instrument_kind_comes_from_metadata_not_icon_url() -> None:
+    """合约类型必须读平台标注的字段，不能从图标 URL 之类的展示字段推断。
+
+    早期实现按 ``token_uri`` 是否含 ``/equities/`` 判断，对 SNDK 失效——
+    它是真实上市公司，图标来自第三方金融数据商
+    （images.financialmodelingprep.com），而 OPENAI/ANTHROPIC 未上市、
+    只能用自家图标。结果 SNDK 被判成普通永续，下单直接报
+    `unsupported instrument: P-SNDK-USDC-3600`。
+
+    这条用「图标 URL 明确不含 equities，但元数据标了 RWA」的夹具，
+    确保判定只看权威字段。
+    """
+    client = object.__new__(VariationalClient)
+
+    async def get_supported_assets():
+        return {
+            "SNDK": [
+                {
+                    "asset": "SNDK",
+                    "instrument_type": "perpetual_rwa_future",
+                    "asset_class": "equity",
+                    # 第三方图床，不含 /equities/
+                    "token_uri": "https://images.financialmodelingprep.com/symbol/SNDK.png",
+                }
+            ],
+            "XAU": [
+                {
+                    "asset": "XAU",
+                    "instrument_type": "perpetual_rwa_future",
+                    "asset_class": "commodity",
+                }
+            ],
+            "BTC": [{"asset": "BTC", "instrument_type": "perpetual_future"}],
+        }
+
+    client.get_supported_assets = get_supported_assets
+
+    assert asyncio.run(client._instrument_kind_from_metadata("SNDK")) == (
+        "perpetual_rwa_future",
+        "equity",
+    )
+    # 黄金的 kind 是 commodity，不是写死的 equity
+    assert asyncio.run(client._instrument_kind_from_metadata("XAU")) == (
+        "perpetual_rwa_future",
+        "commodity",
+    )
+    assert asyncio.run(client._instrument_kind_from_metadata("BTC")) == (
+        "perpetual_future",
+        None,
+    )
+
+
+def test_instrument_kind_falls_back_when_metadata_unavailable() -> None:
+    """元数据取不到时保持普通永续行为，不猜测。"""
+    client = object.__new__(VariationalClient)
+
+    async def get_supported_assets():
+        raise RuntimeError("元数据服务不可用")
+
+    client.get_supported_assets = get_supported_assets
+
+    assert asyncio.run(client._instrument_kind_from_metadata("SNDK")) is None

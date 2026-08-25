@@ -12,6 +12,8 @@
     已由上述账户授权的 API 代理钱包私钥。仅开启交易时需要。
 ``HYPERLIQUID_API_URL``
     可选，默认使用 SDK 的主网地址。
+``HYPERLIQUID_PERP_DEXS``
+    可选，JSON 数组或逗号分隔的永续 dex 名称；默认同时加载主永续与 ``io``。
 ``HYPERLIQUID_BUILDER_ADDRESS``
     可选 Builder Code 地址；必须与费率同时配置。
 ``HYPERLIQUID_BUILDER_FEE_TENTHS_BPS``
@@ -24,6 +26,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -42,6 +45,7 @@ logger = get_logger("hyperliquid_client")
 
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_MARKET_ORDER_SLIPPAGE = Decimal("0.05")
+DEFAULT_PERP_DEXS = ("", "io")
 # Hyperliquid 永续当前按最小 10 USDC 名义额校验，SDK 元数据不返回数量下限。
 MIN_ORDER_NOTIONAL_USD = Decimal("10")
 PERP_MAX_PRICE_DECIMALS = 6
@@ -162,6 +166,43 @@ class _MarketMeta:
 
     coin: str
     sz_decimals: int
+    asset: int | None = None
+
+
+def _perp_dex_config(value: Any) -> tuple[str, ...]:
+    """校验 SDK 永续 dex 配置，并保留主永续使用的空名称。"""
+    configured = DEFAULT_PERP_DEXS if value is None else value
+    if isinstance(configured, (str, bytes)) or not isinstance(
+        configured, (list, tuple)
+    ):
+        raise ValueError("Hyperliquid perp_dexs 必须是字符串数组")
+    if not configured:
+        raise ValueError("Hyperliquid perp_dexs 不得为空")
+    if not all(isinstance(item, str) for item in configured):
+        raise ValueError("Hyperliquid perp_dexs 元素必须是字符串")
+    normalized = tuple(configured)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("Hyperliquid perp_dexs 不得包含重复项")
+    return normalized
+
+
+def _perp_dexs_from_env(prefix: str) -> tuple[str, ...] | None:
+    """读取可选 dex 配置；JSON 数组可明确表达主永续的空名称。"""
+    raw = os.getenv(f"{prefix}_PERP_DEXS")
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{prefix}_PERP_DEXS 不是有效 JSON 数组") from exc
+        return _perp_dex_config(parsed)
+    values = tuple(
+        "" if item.strip() in {"main", "default"} else item.strip()
+        for item in text.split(",")
+    )
+    return _perp_dex_config(values)
 
 
 def _decimal(value: Any, *, context: str, non_negative: bool = False) -> Decimal:
@@ -256,6 +297,7 @@ class HyperliquidClient(ExchangeAdapter):
         market_order_slippage: Decimal = DEFAULT_MARKET_ORDER_SLIPPAGE,
         builder_address: str | None = None,
         builder_fee_tenths_bps: int | str | None = None,
+        perp_dexs: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         """保存配置但不联网；交易模式必须具备账户地址与代理签名能力。"""
         if trading_enabled and not account_address:
@@ -279,6 +321,7 @@ class HyperliquidClient(ExchangeAdapter):
         self._exchange_factory = exchange_factory
         self._market_order_slippage = slippage
         self._builder = builder
+        self._perp_dexs = _perp_dex_config(perp_dexs)
         self._market_meta: dict[str, _MarketMeta] = {}
         self._market_aliases: dict[str, str] = {}
 
@@ -293,9 +336,11 @@ class HyperliquidClient(ExchangeAdapter):
         """从环境变量构造，且绝不从环境变量隐式开启交易。
 
         读取 ``{prefix}_ACCOUNT_ADDRESS``、``{prefix}_AGENT_PRIVATE_KEY``、
-        可选的 ``{prefix}_API_URL`` 以及成对可选的 builder 地址和费率。只读
-        公共行情不要求账户凭据；交易模式同时要求公开地址与代理钱包私钥。
+        可选的 ``{prefix}_API_URL``、``{prefix}_PERP_DEXS`` 以及成对可选的
+        builder 地址和费率。只读公共行情不要求账户凭据；交易模式同时要求
+        公开地址与代理钱包私钥。
         """
+        configured_perp_dexs = kwargs.pop("perp_dexs", None)
         return cls(
             account_address=os.getenv(f"{prefix}_ACCOUNT_ADDRESS") or None,
             agent_private_key=os.getenv(f"{prefix}_AGENT_PRIVATE_KEY") or None,
@@ -303,6 +348,11 @@ class HyperliquidClient(ExchangeAdapter):
             builder_address=os.getenv(f"{prefix}_BUILDER_ADDRESS") or None,
             builder_fee_tenths_bps=(
                 os.getenv(f"{prefix}_BUILDER_FEE_TENTHS_BPS") or None
+            ),
+            perp_dexs=(
+                configured_perp_dexs
+                if configured_perp_dexs is not None
+                else _perp_dexs_from_env(prefix)
             ),
             trading_enabled=trading_enabled,
             **kwargs,
@@ -320,6 +370,7 @@ class HyperliquidClient(ExchangeAdapter):
                 self._info_factory,
                 base_url=self.base_url,
                 skip_ws=True,
+                perp_dexs=list(self._perp_dexs),
                 timeout=self.timeout,
             )
 
@@ -337,6 +388,7 @@ class HyperliquidClient(ExchangeAdapter):
                 meta=meta,
                 account_address=self.account_address,
                 spot_meta={"tokens": [], "universe": []},
+                perp_dexs=list(self._perp_dexs),
                 timeout=self.timeout,
             )
 
@@ -396,12 +448,61 @@ class HyperliquidClient(ExchangeAdapter):
         self._market_aliases = aliases
         return meta, contexts
 
+    async def _refresh_dex_market_meta(self, dex: str) -> None:
+        """按需加载 builder dex 元数据，不给默认 BTC/ETH 路径增加额外读取。"""
+        raw = await asyncio.to_thread(self._require_info().meta, dex=dex)
+        if not isinstance(raw, dict) or not isinstance(raw.get("universe"), list):
+            raise ValueError(f"Hyperliquid {dex} 元数据缺少 universe 数组")
+
+        name_to_asset = getattr(self._require_info(), "name_to_asset", None)
+        for item in raw["universe"]:
+            if not isinstance(item, dict) or item.get("name") is None:
+                raise ValueError(f"Hyperliquid {dex} universe 元素无效：{item!r}")
+            coin = str(item["name"])
+            try:
+                sz_decimals = int(item["szDecimals"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Hyperliquid {coin} 缺少有效 szDecimals") from exc
+            if not 0 <= sz_decimals <= PERP_MAX_PRICE_DECIMALS:
+                raise ValueError(f"Hyperliquid {coin} szDecimals 超出永续范围")
+            asset = None
+            if callable(name_to_asset):
+                try:
+                    asset = int(name_to_asset(coin))
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(f"Hyperliquid {coin} 缺少有效 asset index") from exc
+            self._market_meta[coin] = _MarketMeta(
+                coin=coin,
+                sz_decimals=sz_decimals,
+                asset=asset,
+            )
+            self._market_aliases[coin.upper()] = coin
+
+    def _configured_dex(self, market: str) -> str | None:
+        """从前缀标的解析已配置 dex；无前缀时返回主永续空名称。"""
+        text = str(market)
+        if ":" not in text:
+            return ""
+        requested = text.split(":", 1)[0].casefold()
+        return next(
+            (dex for dex in self._perp_dexs if dex and dex.casefold() == requested),
+            None,
+        )
+
+    def _market_dex(self, coin: str) -> str:
+        """把交易所完整标的映射回其独立清算 dex。"""
+        configured = self._configured_dex(coin)
+        return configured or ""
+
     async def _market(self, market: str) -> _MarketMeta:
         """按实际交易所名称解析标的，兼容项目常用的 ``BTC-USD`` 别名。"""
         alias = str(market).upper()
         coin = self._market_aliases.get(alias)
         if coin is None:
             await self._refresh_market_meta()
+            coin = self._market_aliases.get(alias)
+        if coin is None and (dex := self._configured_dex(market)):
+            await self._refresh_dex_market_meta(dex)
             coin = self._market_aliases.get(alias)
         if coin is None:
             raise KeyError(f"Hyperliquid 没有标的 {market}")
@@ -444,12 +545,19 @@ class HyperliquidClient(ExchangeAdapter):
             return _positive_decimal(context["markPx"], context=f"{target} 标记价")
         raise KeyError(f"Hyperliquid 没有标的 {market}")
 
-    async def _user_state(self) -> dict[str, Any]:
+    async def _user_state(self, dex: str = "") -> dict[str, Any]:
         """读取账户状态，结构异常时不得伪装成空账户。"""
-        raw = await asyncio.to_thread(
-            self._require_info().user_state,
-            self._require_account_address(),
-        )
+        if dex:
+            raw = await asyncio.to_thread(
+                self._require_info().user_state,
+                self._require_account_address(),
+                dex=dex,
+            )
+        else:
+            raw = await asyncio.to_thread(
+                self._require_info().user_state,
+                self._require_account_address(),
+            )
         if not isinstance(raw, dict) or not isinstance(raw.get("assetPositions"), list):
             raise ValueError("Hyperliquid 账户状态缺少 assetPositions 数组")
         return raw
@@ -485,15 +593,28 @@ class HyperliquidClient(ExchangeAdapter):
     async def get_position(self, market: str) -> Position:
         """返回指定标的有符号持仓；未持有时返回零。"""
         target = (await self._market(market)).coin
-        for position in await self.get_all_positions():
+        dex = self._market_dex(target)
+        positions = (
+            [
+                self._normalize_position(raw)
+                for raw in (await self._user_state(dex))["assetPositions"]
+            ]
+            if dex
+            else await self.get_all_positions()
+        )
+        for position in positions:
             if position.market == target:
-                return Position(market=market, signed_size=position.signed_size, raw=position.raw)
+                return Position(
+                    market=market,
+                    signed_size=position.signed_size,
+                    raw=position.raw,
+                )
         return Position(market=market, signed_size=Decimal(0))
 
     async def get_position_pnl(self, market: str) -> PositionPnl | None:
         """从账户清算状态读取指定永续市场的盈亏快照。"""
         target = (await self._market(market)).coin
-        state = await self._user_state()
+        state = await self._user_state(self._market_dex(target))
         for raw in state["assetPositions"]:
             if not isinstance(raw, dict) or not isinstance(raw.get("position"), dict):
                 raise ValueError(f"Hyperliquid 持仓结构无效：{raw!r}")
@@ -662,7 +783,17 @@ class HyperliquidClient(ExchangeAdapter):
     async def get_open_orders(self, market: str) -> list[HyperliquidOrder]:
         """返回指定标的活动订单。"""
         target = (await self._market(market)).coin
-        return [order for order in await self.get_all_open_orders() if order.market == target]
+        dex = self._market_dex(target)
+        if dex:
+            raw = await asyncio.to_thread(
+                self._require_info().frontend_open_orders,
+                self._require_account_address(),
+                dex=dex,
+            )
+            orders = self._normalize_open_orders(raw)
+        else:
+            orders = await self.get_all_open_orders()
+        return [order for order in orders if order.market == target]
 
     async def get_orders_history(
         self,
@@ -747,9 +878,13 @@ class HyperliquidClient(ExchangeAdapter):
         return self._price_quantum(mark_price, meta.sz_decimals)
 
     async def get_min_order_size(self, market: str) -> Decimal:
-        """把 10 USDC 最小名义额按当前标记价换算并向上对齐数量精度。"""
+        """按当前参考价换算 10 USDC 最小名义额并向上对齐数量精度。"""
         meta = await self._market(market)
-        mark_price = await self.get_mark_price(market)
+        dex = self._market_dex(meta.coin)
+        if dex:
+            mark_price = (await self.get_market_price(market)).mid
+        else:
+            mark_price = await self.get_mark_price(market)
         step = Decimal(1).scaleb(-meta.sz_decimals)
         steps = (MIN_ORDER_NOTIONAL_USD / mark_price / step).to_integral_value(
             rounding=ROUND_CEILING

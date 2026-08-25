@@ -144,6 +144,10 @@ class VariationalClient(ExchangeAdapter):
         self._timeout = timeout
         # 按 (market, side) 缓存数量约束：读取一次要打一发真实 RFQ 询价。
         self._quantity_limits: dict[tuple[str, str | None], "_QuantityLimits"] = {}
+        # 标的分类元数据与股票判定均按进程缓存，避免每次 RFQ 前重复读取。
+        self._supported_assets_loaded = False
+        self._supported_assets_metadata: Any = None
+        self._equity_market_cache: dict[str, bool] = {}
         self._headers = {
             "user-agent": session.user_agent or USER_AGENT,
             "content-type": "application/json",
@@ -522,6 +526,89 @@ class VariationalClient(ExchangeAdapter):
             instrument["kind"] = kind
         return instrument
 
+    async def _instrument_kind_from_metadata(
+        self, underlying: str
+    ) -> tuple[str, str | None] | None:
+        """从 supported_assets 元数据读取平台标注的合约类型与 kind。
+
+        元数据里有权威字段，不必从图标 URL 之类的展示字段推断：
+
+            SNDK       instrument_type=perpetual_rwa_future  asset_class=equity
+            ANTHROPIC  instrument_type=perpetual_rwa_future  asset_class=equity
+            XAU        instrument_type=perpetual_rwa_future  asset_class=commodity
+            BTC        instrument_type=perpetual_future      （无 asset_class）
+
+        早期实现按 ``token_uri`` 是否含 ``/equities/`` 判断，对 SNDK 失效——
+        它是真实上市公司，图标来自第三方金融数据商
+        （images.financialmodelingprep.com），而 OPENAI/ANTHROPIC 未上市、
+        只能用自家图标。**用展示字段做分类判断本就不可靠。**
+
+        取不到元数据时返回 None，调用方保持原有普通永续行为。
+        """
+        cache = getattr(self, "_instrument_kind_cache", None)
+        if cache is None:
+            cache = {}
+            self._instrument_kind_cache = cache
+        key = str(underlying).upper()
+        if key in cache:
+            return cache[key]
+
+        if not getattr(self, "_supported_assets_loaded", False):
+            try:
+                self._supported_assets_metadata = await self.get_supported_assets()
+            except Exception:  # noqa: BLE001 元数据不可用时保持原普通永续行为
+                self._supported_assets_metadata = None
+            self._supported_assets_loaded = True
+
+        metadata = self._supported_assets_metadata
+        records: Any = None
+        if isinstance(metadata, dict):
+            records = next(
+                (
+                    value
+                    for asset, value in metadata.items()
+                    if str(asset).upper() == key
+                ),
+                None,
+            )
+        if isinstance(records, dict):
+            records = [records]
+
+        resolved: tuple[str, str | None] | None = None
+        if isinstance(records, list):
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                declared = str(record.get("instrument_type") or "").strip()
+                if not declared:
+                    continue
+                asset_class = record.get("asset_class")
+                # kind 只在 RWA 类合约上要求；普通永续传 None。
+                kind = (
+                    str(asset_class).strip()
+                    if declared == "perpetual_rwa_future" and asset_class
+                    else None
+                )
+                resolved = (declared, kind)
+                break
+
+        cache[key] = resolved
+        return resolved
+
+    async def _resolve_instrument_params(
+        self,
+        underlying: str,
+        instrument_type: str,
+        kind: str | None,
+    ) -> tuple[str, str | None]:
+        """仅为默认普通永续参数自动补全股票 RWA 类型，显式参数保持不变。"""
+        if instrument_type != "perpetual_future" or kind is not None:
+            return instrument_type, kind
+        resolved = await self._instrument_kind_from_metadata(underlying)
+        if resolved is not None:
+            return resolved
+        return instrument_type, kind
+
     async def request_quote(
         self,
         underlying: str,
@@ -536,8 +623,13 @@ class VariationalClient(ExchangeAdapter):
 
         用 /quotes/indicative：它按用户注册可执行报价（含保证金计算），其 quote_id 可用于
         /quotes/accept 成交。/quotes/simple 是无状态价格预览，quote_id 不可成交。
-        kind：RWA 永续需传（如 XAU=commodity），其余传 None。
+        默认参数会根据标的元数据自动识别股票 RWA；显式黄金参数继续原样透传。
         """
+        instrument_type, kind = await self._resolve_instrument_params(
+            underlying,
+            instrument_type,
+            kind,
+        )
         body = {
             "instrument": self._instrument(
                 underlying,
@@ -576,9 +668,14 @@ class VariationalClient(ExchangeAdapter):
         """RFQ 市价成交：/quotes/simple 询价 → /quotes/accept 成交。
 
         market 传 underlying（如 "BTC"）。amount 为合约数量（BTC 个数）。
-        kind：RWA 永续需传（如 XAU=commodity），其余传 None。
+        默认参数会根据标的元数据自动识别股票 RWA；显式黄金参数继续原样透传。
         """
         s = "buy" if side is Side.BUY else "sell"
+        instrument_type, kind = await self._resolve_instrument_params(
+            market,
+            instrument_type,
+            kind,
+        )
         quote = await self.request_quote(
             market,
             s,

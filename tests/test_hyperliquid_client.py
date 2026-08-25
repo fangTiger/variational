@@ -67,6 +67,18 @@ def _meta_and_contexts(mark_price: str = "62500") -> list:
     ]
 
 
+def _io_meta() -> dict:
+    """返回 Entropy io dex 的精度元数据。"""
+    return {
+        "universe": [
+            {"name": "io:OAI", "szDecimals": 3, "maxLeverage": 5},
+            {"name": "io:ANTH", "szDecimals": 3, "maxLeverage": 5},
+            {"name": "io:SNDK", "szDecimals": 3, "maxLeverage": 5},
+            {"name": "io:IONQ", "szDecimals": 3, "maxLeverage": 5},
+        ]
+    }
+
+
 def _book(bid: str = "62490", ask: str = "62510") -> dict:
     """返回与 ``Info.l2_snapshot`` 文档一致的完整盘口响应。"""
     return {
@@ -219,6 +231,7 @@ class FakeInfo:
         history: list[dict] | None = None,
         fills: list[dict] | None = None,
         query_result: dict | None = None,
+        dex_meta: dict[str, dict] | None = None,
     ) -> None:
         self.meta_contexts = (
             _meta_and_contexts() if meta_contexts is None else meta_contexts
@@ -232,6 +245,15 @@ class FakeInfo:
         self.query_result = (
             {"status": "unknownOid"} if query_result is None else query_result
         )
+        self.dex_meta = {"io": _io_meta()} if dex_meta is None else dex_meta
+        self.asset_indices = {
+            "BTC": 0,
+            "ETH": 1,
+            "io:OAI": 200000,
+            "io:ANTH": 200001,
+            "io:SNDK": 200002,
+            "io:IONQ": 200003,
+        }
         self.user_state_error: Exception | None = None
         self.spot_state_error: Exception | None = None
         self.query_error: Exception | None = None
@@ -240,6 +262,14 @@ class FakeInfo:
     def meta_and_asset_ctxs(self):
         self.calls.append(("meta_and_asset_ctxs",))
         return self.meta_contexts
+
+    def meta(self, dex: str = ""):
+        self.calls.append(("meta", dex))
+        return self.meta_contexts[0] if dex == "" else self.dex_meta[dex]
+
+    def name_to_asset(self, name: str):
+        self.calls.append(("name_to_asset", name))
+        return self.asset_indices[name]
 
     def l2_snapshot(self, name: str):
         self.calls.append(("l2_snapshot", name))
@@ -421,6 +451,37 @@ def test_market_price_rejects_crossed_or_non_positive_book(
 
     with pytest.raises(ValueError, match="盘口"):
         asyncio.run(client.get_market_price("BTC"))
+
+
+def test_io_market_price_and_position_use_prefixed_asset_and_separate_dex() -> None:
+    """io 行情使用前缀标的，持仓必须读取独立的 io 清算账户。"""
+    state = _user_state([_position("io:SNDK", "1.25", "35")])
+    info = FakeInfo(book=_book("49.5", "50.5"), state=state)
+    client = _client(info=info)
+
+    price = asyncio.run(client.get_market_price("io:SNDK"))
+    position = asyncio.run(client.get_position("io:SNDK"))
+
+    assert (price.bid, price.ask) == (Decimal("49.5"), Decimal("50.5"))
+    assert position.signed_size == Decimal("1.25")
+    assert client._market_meta["io:SNDK"].asset == 200002
+    assert ("l2_snapshot", "io:SNDK") in info.calls
+    assert ("user_state", ACCOUNT_ADDRESS, "io") in info.calls
+
+
+def test_btc_market_and_position_keep_default_dex_path() -> None:
+    """回归保护：无前缀标的仍走原始元数据与默认清算账户。"""
+    state = _user_state([_position("BTC", "0.002", "45000")])
+    info = FakeInfo(state=state)
+    client = _client(info=info)
+
+    price = asyncio.run(client.get_market_price("BTC"))
+    position = asyncio.run(client.get_position("BTC"))
+
+    assert (price.bid, price.ask) == (Decimal("62490"), Decimal("62510"))
+    assert position.signed_size == Decimal("0.002")
+    assert ("user_state", ACCOUNT_ADDRESS, "") in info.calls
+    assert not any(call[0] == "meta" for call in info.calls)
 
 
 def test_mark_price_uses_exchange_mark_field_not_book_mid() -> None:
@@ -911,6 +972,24 @@ def test_market_order_uses_ioc_and_forwards_reduce_only() -> None:
     assert result.status == "FILLED"
 
 
+def test_io_limit_and_market_orders_keep_prefixed_coin() -> None:
+    """io 限价单与 IOC 市价单都必须把完整前缀标的交给 SDK。"""
+    exchange = FakeExchange()
+    exchange.order_result = _order_response(state="filled")
+    client = _client(exchange=exchange, trading_enabled=True)
+
+    asyncio.run(
+        client.place_limit_order(
+            "io:SNDK", Side.BUY, Decimal("1"), Decimal("49.9")
+        )
+    )
+    asyncio.run(client.market_order("io:SNDK", Side.SELL, Decimal("1")))
+
+    assert [call[1] for call in exchange.calls] == ["io:SNDK", "io:SNDK"]
+    assert exchange.calls[0][5] == {"limit": {"tif": "Alo"}}
+    assert exchange.calls[1][5] == {"limit": {"tif": "Ioc"}}
+
+
 def test_cancel_missing_open_order_is_success_without_write() -> None:
     exchange = FakeExchange()
     client = _client(
@@ -920,6 +999,18 @@ def test_cancel_missing_open_order_is_success_without_write() -> None:
     asyncio.run(client.cancel_order("BTC", 404))
 
     assert exchange.calls == []
+
+
+def test_io_cancel_reads_open_orders_from_separate_dex() -> None:
+    """io 限价单撤单前也必须从独立 dex 读取活动订单。"""
+    exchange = FakeExchange()
+    info = FakeInfo(orders=[_open_order("io:SNDK", 101)])
+    client = _client(info=info, exchange=exchange, trading_enabled=True)
+
+    asyncio.run(client.cancel_order("io:SNDK", 101))
+
+    assert ("frontend_open_orders", ACCOUNT_ADDRESS, "io") in info.calls
+    assert exchange.calls == [("cancel", "io:SNDK", 101)]
 
 
 def test_cancel_terminal_race_is_treated_as_success() -> None:
@@ -1094,6 +1185,34 @@ def test_agent_wallet_connects_without_main_wallet_private_key() -> None:
     assert created["account_address"] == ACCOUNT_ADDRESS
     assert created["wallet"].address != ACCOUNT_ADDRESS
     assert created["meta"] == _meta_and_contexts()[0]
+    assert created["perp_dexs"] == ["", "io"]
+
+
+def test_info_factory_receives_default_perp_dex_configuration() -> None:
+    """读取 SDK 默认同时装载主永续与 Entropy io dex。"""
+    created: dict[str, object] = {}
+
+    def info_factory(**kwargs):
+        created.update(kwargs)
+        return FakeInfo()
+
+    client = _client_class()(
+        account_address=ACCOUNT_ADDRESS,
+        info_factory=info_factory,
+    )
+
+    asyncio.run(client.connect())
+
+    assert created["perp_dexs"] == ["", "io"]
+
+
+def test_from_env_reads_explicit_perp_dex_configuration(monkeypatch) -> None:
+    """环境配置可覆盖默认 dex 列表，并能明确保留主永续空名称。"""
+    monkeypatch.setenv("HYPERLIQUID_PERP_DEXS", '["", "io", "custom"]')
+
+    client = _client_class().from_env(info=FakeInfo())
+
+    assert client._perp_dexs == ("", "io", "custom")
 
 
 def test_credential_doc_names_agent_wallet_environment_without_vault_claim() -> None:
