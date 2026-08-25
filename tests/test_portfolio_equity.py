@@ -255,16 +255,19 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
 ) -> None:
     """单个账户读取失败时仍写部分记录，且单次进程正常返回。"""
 
+    # 币种集合由 DEFAULT_VOLUME_INSTANCES 推导，会随配对调整变化，
+    # 因此断言「与推导结果一致」而不是写死某组币种。
+    expected = portfolio_equity.strategy_symbols_by_source()
+
     async def lighter_reader(symbols: tuple[str, ...]) -> Decimal:
-        assert symbols == ("BTC", "ETH")
+        assert symbols == expected["lighter"]
         return Decimal("561.49")
 
     async def variational_reader(symbols: tuple[str, ...]) -> Decimal:
-        assert symbols == ("BTC", "ETH")
+        assert symbols == expected["variational"]
         raise RuntimeError("临时不可用")
 
     async def hyperliquid_reader(symbols: tuple[str, ...]) -> Decimal:
-        assert symbols == ("BTC",)
         return Decimal("572.20")
 
     output = tmp_path / "portfolio_equity.jsonl"
@@ -273,7 +276,7 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
             {
                 "lighter": lighter_reader,
                 "variational": variational_reader,
-                "hyperliquid": hyperliquid_reader,
+                "hyperliquid_var": hyperliquid_reader,
             },
             output,
             timestamp=1787590000.0,
@@ -283,19 +286,15 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
     written = json.loads(output.read_text(encoding="utf-8"))
     assert snapshot == written
     assert written["schema"] == 4
-    assert written["symbols"] == {
-        "lighter": ["BTC", "ETH"],
-        "variational": ["BTC", "ETH"],
-        "hyperliquid": ["BTC"],
-    }
+    assert written["symbols"]["lighter"] == list(expected["lighter"])
     assert written["accounts"] == {
         "lighter": "561.49",
-        "hyperliquid": "572.20",
+        "hyperliquid_var": "572.20",
     }
     assert written["sources"] == {
         "lighter": "platform",
         "variational": "computed",
-        "hyperliquid": "platform",
+        "hyperliquid_var": "platform",
     }
     assert "total_equity" not in written, "不同口径的绝对值不得直接相加"
     assert "variational" not in written["accounts"]

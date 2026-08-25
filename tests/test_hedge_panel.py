@@ -746,14 +746,16 @@ def test_overview_counts_follow_actual_instance_count(tmp_path) -> None:
         assert f"{count} 对合计盈亏" in html
 
 
-def test_default_instances_cover_all_running_pairs() -> None:
-    """默认实例清单要覆盖三对，且各自路径互不相同。
+def test_default_instances_have_unique_paths() -> None:
+    """默认实例清单的各路径必须互不相同。
 
     路径写重了会让两张卡片显示同一份数据，而页面上看不出异常。
+    这里刻意**不锁死实例数量**——配对会随策略调整增减
+    （2026-08-25 就从三对变成两对），锁数量只会让正确的变更被判成错误。
     """
     configs = hedge_panel.DEFAULT_INSTANCES
 
-    assert len(configs) == 3
+    assert configs, "至少要有一个实例"
     for attr in ("key", "heartbeat_path", "state_path", "lock_path"):
         values = [getattr(c, attr) for c in configs]
         assert len(set(values)) == len(values), f"{attr} 存在重复"

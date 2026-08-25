@@ -100,33 +100,27 @@ class InstanceSnapshot:
         return combined
 
 
+#: ⚠️ 这份清单必须与实际启动参数的 --heartbeat-path / --state-path 一致。
+#: 改了实例配对或标的却忘了改这里，面板会静默显示陈旧或空白数据——
+#: 2026-08-25 就发生过：A/B 停用、C 从 ETH 改成 BTC 后面板仍指向旧路径。
 DEFAULT_INSTANCES = (
     InstanceConfig(
-        key="lighter_entropy",
-        name="实例 A · Lighter × Entropy",
-        primary_exchange="Lighter",
-        hedge_exchange="Entropy",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume.jsonl",
-        state_path=PROJECT_ROOT / "data" / "timed_volume" / "state.json",
-        lock_path=PROJECT_ROOT / "data" / "timed_volume" / "state.json.lock",
-    ),
-    InstanceConfig(
-        key="variational_entropy",
-        name="实例 B · Variational × Entropy",
+        key="variational_entropy_sndk",
+        name="Variational × Entropy（SNDK）",
         primary_exchange="Variational",
         hedge_exchange="Entropy",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_var.jsonl",
-        state_path=PROJECT_ROOT / "data" / "timed_volume_var" / "state.json",
-        lock_path=PROJECT_ROOT / "data" / "timed_volume_var" / "state.json.lock",
+        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_sndk.jsonl",
+        state_path=PROJECT_ROOT / "data" / "timed_volume_sndk" / "state.json",
+        lock_path=PROJECT_ROOT / "data" / "timed_volume_sndk" / "state.json.lock",
     ),
     InstanceConfig(
-        key="lighter_variational_eth",
-        name="实例 C · Lighter × Variational（ETH）",
+        key="lighter_variational_btc",
+        name="Lighter × Variational（BTC）",
         primary_exchange="Lighter",
         hedge_exchange="Variational",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_eth.jsonl",
-        state_path=PROJECT_ROOT / "data" / "timed_volume_eth" / "state.json",
-        lock_path=PROJECT_ROOT / "data" / "timed_volume_eth" / "state.json.lock",
+        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_btc.jsonl",
+        state_path=PROJECT_ROOT / "data" / "timed_volume_btc" / "state.json",
+        lock_path=PROJECT_ROOT / "data" / "timed_volume_btc" / "state.json.lock",
     ),
 )
 

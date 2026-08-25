@@ -49,25 +49,20 @@ class VolumeInstanceConfig:
     hedge_source: str
 
 
+#: ⚠️ 必须与实际启动参数一致（标的、心跳路径、两腿来源）。
+#: 配对变更后忘了同步这里，成交量会静默统计错标的。
 DEFAULT_VOLUME_INSTANCES = (
     VolumeInstanceConfig(
-        key="lighter_entropy",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume.jsonl",
-        symbol="BTC",
-        primary_source="lighter",
-        hedge_source="hyperliquid",
-    ),
-    VolumeInstanceConfig(
-        key="variational_entropy",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_var.jsonl",
-        symbol="BTC",
+        key="variational_entropy_sndk",
+        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_sndk.jsonl",
+        symbol="SNDK",
         primary_source="variational",
         hedge_source="hyperliquid_var",
     ),
     VolumeInstanceConfig(
-        key="lighter_variational_eth",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_eth.jsonl",
-        symbol="ETH",
+        key="lighter_variational_btc",
+        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_btc.jsonl",
+        symbol="BTC",
         primary_source="lighter",
         hedge_source="variational",
     ),
