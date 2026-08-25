@@ -11,50 +11,111 @@ from tools import portfolio_equity
 
 
 class FakeHyperliquidClient:
-    """返回固定清算状态和 Spot 状态的只读客户端。"""
+    """返回固定平台组合历史的只读客户端。"""
+
+    class Info:
+        """模拟 Hyperliquid 官方 Info 客户端。"""
+
+        def portfolio(self, user: str) -> list:
+            """返回 allTime 平台累计盈亏。"""
+            assert user == "0xaccount"
+            return [
+                ["day", {"pnlHistory": [[1000, "1.25"]], "vlm": "10"}],
+                [
+                    "allTime",
+                    {
+                        "pnlHistory": [
+                            [1000, "-10.000000000000000001"],
+                            [2000, "-12.345678901234567891"],
+                        ],
+                        "accountValueHistory": [
+                            [1000, "557.34"],
+                            [2000, "552.34"],
+                        ],
+                        "vlm": "123456.78",
+                    },
+                ],
+            ]
+
+    def _require_info(self) -> "FakeHyperliquidClient.Info":
+        """返回模拟官方读取客户端。"""
+        return self.Info()
+
+    def _require_account_address(self) -> str:
+        """返回公开账户地址。"""
+        return "0xaccount"
 
     async def _user_state(self) -> dict:
-        """返回同时含策略仓位和人工仓位的清算状态。"""
-        return {
-            "marginSummary": {"accountValue": "62.00"},
-            "assetPositions": [
-                {"position": {"coin": "BTC", "unrealizedPnl": "-5.00"}},
-                {"position": {"coin": "SOL", "unrealizedPnl": "17.25"}},
-            ],
-        }
+        """旧的自算权益分支不得再被调用。"""
+        raise AssertionError("不得读取 spot 或未实现盈亏拼装累计值")
 
     async def _spot_user_state(self) -> dict:
-        """返回 Spot USDC 余额。"""
-        return {"balances": [{"coin": "USDC", "total": "557.34"}]}
+        """旧的 Spot 权益分支不得再被调用。"""
+        raise AssertionError("不得读取 spot 或未实现盈亏拼装累计值")
 
 
 class FakeLighterClient:
-    """返回固定账户详情的只读 Lighter 客户端。"""
+    """返回固定平台累计盈亏的只读 Lighter 客户端。"""
+
+    def __init__(self) -> None:
+        """记录每次请求使用的短期 token。"""
+        self.auth_count = 0
+        self.headers: list[dict[str, str]] = []
 
     def _require_account_index(self) -> int:
         """返回测试账户索引。"""
         return 7
 
-    async def _get_json(self, path: str, *, params: dict) -> dict:
-        """返回抵押品及全部持仓。"""
-        assert path == "/api/v1/account"
-        assert params == {"by": "index", "value": "7"}
+    def _auth_headers(self) -> dict[str, str]:
+        """每次调用生成不同 token，模拟十分钟有效期。"""
+        self.auth_count += 1
+        return {"Authorization": f"token-{self.auth_count}"}
+
+    async def _get_json(
+        self,
+        path: str,
+        *,
+        params: dict,
+        headers: dict[str, str],
+    ) -> dict:
+        """返回平台 PnL 历史并记录鉴权头。"""
+        assert path == "/api/v1/pnl"
+        assert params["by"] == "index"
+        assert params["value"] == "7"
+        assert params["resolution"] == "1h"
+        # 窗口必须有界：start=0 会被接口以 400 拒绝（实测）。
+        start = int(params["start_timestamp"])
+        end = int(params["end_timestamp"])
+        assert start > 0, "start_timestamp 不能为 0"
+        assert 0 < end - start <= 7 * 24 * 60 * 60 * 1000, "窗口须落在 7 天内"
+        assert params["count_back"] == "200"
+        self.headers.append(headers)
         return {
-            "accounts": [
+            "code": 200,
+            "resolution": "1h",
+            "pnl": [
                 {
-                    "collateral": "579.037583",
-                    "total_asset_value": "546.757606",
-                    "positions": [
-                        {"symbol": "BTC", "unrealized_pnl": "3.285513"},
-                        {"symbol": "SOL", "unrealized_pnl": "-35.565490"},
-                    ],
-                }
-            ]
+                    "timestamp": 1000,
+                    "trade_pnl": "-400.000000",
+                    "volume": "1000",
+                    "inflow": "967.789164",
+                    "outflow": "0",
+                    "total_asset_value": "567.789164",
+                },
+                {
+                    "timestamp": 2000,
+                    "trade_pnl": "-436.500513",
+                    "volume": "2000",
+                    "inflow": "967.789164",
+                    "outflow": "0",
+                    "total_asset_value": "531.288651",
+                },
+            ],
         }
 
     def _raise_api_error(self, data: dict, *, context: str) -> None:
         """测试响应固定成功。"""
-        assert context == "账户详情查询"
+        assert context == "累计盈亏查询"
 
 
 class FakeVariationalClient:
@@ -79,40 +140,65 @@ class FakeVariationalClient:
         ]
 
 
-def test_hyperliquid_equity_filters_manual_symbol_and_ignores_account_value() -> None:
-    """Hyperliquid 权益 = Spot 减去非策略币种浮盈亏。
-
-    Spot USDC **本身已含**全部未实现（实测 Δspot == Δupnl），
-    所以策略币种的浮盈亏不能再加一遍，人工币种的则要减掉。
-    """
-    equity = asyncio.run(
+def test_hyperliquid_uses_latest_platform_pnl_instead_of_spot_formula() -> None:
+    """Hyperliquid 必须取 allTime pnlHistory 末值，不得拼装 Spot 权益。"""
+    cumulative_pnl = asyncio.run(
         portfolio_equity.read_hyperliquid_equity(
             FakeHyperliquidClient(),
             ("BTC",),
         )
     )
 
-    assert isinstance(equity, Decimal)
-    # spot 557.34 已含 BTC(-5) 与 SOL(+17.25)；只需减掉人工的 SOL。
-    assert equity == Decimal("557.34") - Decimal("17.25")
-    assert equity != Decimal("557.34") + Decimal("-5.00"), "不得再叠加策略币种浮盈亏"
-    assert equity != Decimal("557.34"), "不得忽略人工币种"
-    assert equity != Decimal("557.34") + Decimal("62.00"), "不得使用 accountValue"
-
-
-def test_lighter_equity_uses_collateral_plus_filtered_unrealized_pnl() -> None:
-    """Lighter 排除人工 SOL，结果必须不同于抵押品加全量浮盈亏。"""
-    equity = asyncio.run(
-        portfolio_equity.read_lighter_equity(FakeLighterClient(), ("BTC",))
+    assert isinstance(cumulative_pnl, Decimal)
+    assert cumulative_pnl == Decimal("-12.345678901234567891")
+    assert cumulative_pnl != Decimal("552.34"), "不得把 Spot 余额当累计盈亏"
+    assert cumulative_pnl != Decimal("552.34") + Decimal("-5.00"), (
+        "不得用 Spot 加未实现盈亏拼装累计值"
     )
 
-    assert isinstance(equity, Decimal)
-    assert equity == Decimal("579.037583") + Decimal("3.285513")
-    assert equity != (
-        Decimal("579.037583")
-        + Decimal("3.285513")
-        + Decimal("-35.565490")
+
+def test_lighter_uses_trade_pnl_and_platform_equity_identity() -> None:
+    """Lighter 必须取 trade_pnl，并钉住平台已验证的权益恒等式。"""
+    client = FakeLighterClient()
+    cumulative_pnl = asyncio.run(
+        portfolio_equity.read_lighter_equity(client, ("BTC",))
     )
+    latest = asyncio.run(
+        client._get_json(
+            "/api/v1/pnl",
+            params={
+                "by": "index",
+                "value": "7",
+                "resolution": "1h",
+                "start_timestamp": "1",
+                "end_timestamp": "2",
+                "count_back": "200",
+            },
+            headers={"authorization": "test-only"},
+        )
+    )["pnl"][-1]
+
+    assert isinstance(cumulative_pnl, Decimal)
+    assert cumulative_pnl == Decimal("-436.500513")
+    assert (
+        Decimal(latest["inflow"])
+        - Decimal(latest["outflow"])
+        + Decimal(latest["trade_pnl"])
+        == Decimal(latest["total_asset_value"])
+    )
+
+
+def test_lighter_generates_fresh_auth_token_before_every_fetch() -> None:
+    """连续取数必须生成新 token，不能复用已经可能过期的请求头。"""
+    client = FakeLighterClient()
+
+    asyncio.run(portfolio_equity.read_lighter_equity(client, ("BTC",)))
+    asyncio.run(portfolio_equity.read_lighter_equity(client, ("BTC",)))
+
+    assert client.headers == [
+        {"authorization": "token-1"},
+        {"authorization": "token-2"},
+    ]
 
 
 def test_variational_equity_excludes_manual_symbol_without_float_conversion() -> None:
@@ -196,7 +282,7 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
 
     written = json.loads(output.read_text(encoding="utf-8"))
     assert snapshot == written
-    assert written["schema"] == 3
+    assert written["schema"] == 4
     assert written["symbols"] == {
         "lighter": ["BTC", "ETH"],
         "variational": ["BTC", "ETH"],
@@ -206,7 +292,12 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
         "lighter": "561.49",
         "hyperliquid": "572.20",
     }
-    assert written["total_equity"] == "1133.69"
+    assert written["sources"] == {
+        "lighter": "platform",
+        "variational": "computed",
+        "hyperliquid": "platform",
+    }
+    assert "total_equity" not in written, "不同口径的绝对值不得直接相加"
     assert "variational" not in written["accounts"]
     assert written["errors"]["variational"].endswith("临时不可用")
 
@@ -222,6 +313,7 @@ def test_cli_defaults_to_fifteen_minutes_and_two_hyperliquid_prefixes() -> None:
     assert args.hyperliquid_prefix == "HYPERLIQUID"
     assert args.hyperliquid_var_prefix == "HYPERLIQUID_VAR"
     assert set(portfolio_equity.build_default_volume_readers()) == {
+        "lighter",
         "hyperliquid",
         "hyperliquid_var",
         "variational",
@@ -257,6 +349,114 @@ def test_hyperliquid_volume_filters_start_and_instance_symbol() -> None:
 
     assert calls == [1000, 1005]
     assert amount == Decimal("10.0")
+
+
+def test_lighter_volume_uses_usd_amount_and_fresh_auth_per_page() -> None:
+    """Lighter 成交额直接取 usd_amount，翻页时也不得复用 token。"""
+
+    class Client:
+        """模拟带游标的 Lighter 成交接口。"""
+
+        def __init__(self) -> None:
+            self.auth_count = 0
+            self.requests: list[tuple[dict, dict]] = []
+
+        def _require_account_index(self) -> int:
+            """返回账户索引。"""
+            return 7
+
+        def _auth_headers(self) -> dict[str, str]:
+            """为每页生成不同 token。"""
+            self.auth_count += 1
+            return {"Authorization": f"token-{self.auth_count}"}
+
+        def _raise_api_error(self, data: dict, *, context: str) -> None:
+            """测试响应固定成功。"""
+            assert data["code"] == 200
+            assert context == "成交查询"
+
+        async def _get_json(
+            self,
+            path: str,
+            *,
+            params: dict,
+            headers: dict,
+        ) -> dict:
+            """返回两页成交，其中 size×price 故意不等于 usd_amount。"""
+            assert path == "/api/v1/trades"
+            self.requests.append((params, headers))
+            if "cursor" not in params:
+                return {
+                    "code": 200,
+                    "next_cursor": "page-2",
+                    "trades": [
+                        {
+                            "timestamp": 2000,
+                            "market_id": 1,
+                            "size": "999",
+                            "price": "999",
+                            "usd_amount": "10.000000000000000001",
+                            "ask_account_id": 70,
+                            "bid_account_id": 80,
+                        },
+                        {
+                            "timestamp": 1999,
+                            "market_id": 2,
+                            "size": "1",
+                            "price": "500",
+                            "usd_amount": "500",
+                            "ask_account_id": 70,
+                            "bid_account_id": 80,
+                        },
+                    ],
+                }
+            return {
+                "code": 200,
+                "next_cursor": "",
+                "trades": [
+                    {
+                        "timestamp": 1500,
+                        "market_id": 1,
+                        "size": "888",
+                        "price": "888",
+                        "usd_amount": "20.000000000000000002",
+                        "ask_account_id": 70,
+                        "bid_account_id": 80,
+                    },
+                    {
+                        "timestamp": 999,
+                        "market_id": 1,
+                        "size": "777",
+                        "price": "777",
+                        "usd_amount": "30",
+                        "ask_account_id": 70,
+                        "bid_account_id": 80,
+                    },
+                ],
+            }
+
+    client = Client()
+    amount = asyncio.run(
+        portfolio_equity.read_lighter_volume(
+            client,
+            start_time_ms=1000,
+            market_id=1,
+        )
+    )
+
+    assert amount == Decimal("30.000000000000000003")
+    assert isinstance(amount, Decimal)
+    assert [request[1] for request in client.requests] == [
+        {"authorization": "token-1"},
+        {"authorization": "token-2"},
+    ]
+    assert client.requests[0][0] == {
+        "sort_by": "timestamp",
+        "sort_dir": "desc",
+        "limit": "100",
+        "account_index": "7",
+    }
+    assert client.requests[1][0]["cursor"] == "page-2"
 
 
 def test_hyperliquid_volume_follows_time_cursor_until_all_pages_are_read() -> None:
@@ -369,10 +569,10 @@ def test_volume_amounts_keep_decimal_precision_without_float_rounding() -> None:
     assert isinstance(amount, Decimal)
 
 
-def test_volume_snapshot_uses_heartbeat_start_and_same_instance_estimates(
+def test_volume_snapshot_uses_each_platform_reader_without_estimates(
     tmp_path,
 ) -> None:
-    """每实例从心跳首行起算，Lighter 只复制本实例对手腿并显式标记。"""
+    """每实例从心跳首行起算，Lighter 必须走自己的实测成交接口。"""
     starts = {
         "lighter_entropy": Decimal("1787383380.25"),
         "variational_entropy": Decimal("1787475540.5"),
@@ -403,6 +603,10 @@ def test_volume_snapshot_uses_heartbeat_start_and_same_instance_estimates(
 
     calls: list[tuple[str, Decimal, str]] = []
 
+    async def lighter_reader(since: Decimal, symbol: str) -> Decimal:
+        calls.append(("lighter", since, symbol))
+        return Decimal("111") if symbol == "BTC" else Decimal("50")
+
     async def hyperliquid_reader(since: Decimal, symbol: str) -> Decimal:
         calls.append(("hyperliquid", since, symbol))
         return Decimal("100")
@@ -418,6 +622,7 @@ def test_volume_snapshot_uses_heartbeat_start_and_same_instance_estimates(
     snapshot = asyncio.run(
         portfolio_equity.collect_volume_snapshot(
             {
+                "lighter": lighter_reader,
                 "hyperliquid": hyperliquid_reader,
                 "hyperliquid_var": hyperliquid_var_reader,
                 "variational": variational_reader,
@@ -432,35 +637,34 @@ def test_volume_snapshot_uses_heartbeat_start_and_same_instance_estimates(
     expected_since = {key: value - margin for key, value in starts.items()}
 
     assert calls == [
+        ("lighter", expected_since["lighter_entropy"], "BTC"),
         ("hyperliquid", expected_since["lighter_entropy"], "BTC"),
         ("variational", expected_since["variational_entropy"], "BTC"),
         ("hyperliquid_var", expected_since["variational_entropy"], "BTC"),
+        ("lighter", expected_since["lighter_variational_eth"], "ETH"),
         ("variational", expected_since["lighter_variational_eth"], "ETH"),
     ]
     assert snapshot["instances"] == {
         "lighter_entropy": {
             "symbol": "BTC",
             "since": float(expected_since["lighter_entropy"]),
-            "primary": "100",
+            "primary": "111",
             "hedge": "100",
-            "estimated": ["primary"],
         },
         "variational_entropy": {
             "symbol": "BTC",
             "since": float(expected_since["variational_entropy"]),
             "primary": "300",
             "hedge": "200",
-            "estimated": [],
         },
         "lighter_variational_eth": {
             "symbol": "ETH",
             "since": float(expected_since["lighter_variational_eth"]),
-            "primary": "40",
+            "primary": "50",
             "hedge": "40",
-            "estimated": ["primary"],
         },
     }
-    assert snapshot["totals_by_symbol"] == {"BTC": "700", "ETH": "80"}
+    assert snapshot["totals_by_symbol"] == {"BTC": "711", "ETH": "90"}
 
 
 def test_failed_volume_source_is_skipped_and_partial_record_is_written(
@@ -491,6 +695,9 @@ def test_failed_volume_source_is_skipped_and_partial_record_is_written(
     async def hyperliquid_reader(since: Decimal, symbol: str) -> Decimal:
         return Decimal("100")
 
+    async def lighter_reader(since: Decimal, symbol: str) -> Decimal:
+        return Decimal("120")
+
     async def variational_reader(since: Decimal, symbol: str) -> Decimal:
         return Decimal("300")
 
@@ -501,6 +708,7 @@ def test_failed_volume_source_is_skipped_and_partial_record_is_written(
     snapshot = asyncio.run(
         portfolio_equity.record_volume_once(
             {
+                "lighter": lighter_reader,
                 "hyperliquid": hyperliquid_reader,
                 "hyperliquid_var": hyperliquid_var_reader,
                 "variational": variational_reader,
@@ -518,18 +726,16 @@ def test_failed_volume_source_is_skipped_and_partial_record_is_written(
         "lighter_entropy": {
             "symbol": "BTC",
             "since": 1000.0 - margin,
-            "primary": "100",
+            "primary": "120",
             "hedge": "100",
-            "estimated": ["primary"],
         },
         "variational_entropy": {
             "symbol": "BTC",
             "since": 2000.0 - margin,
             "primary": "300",
-            "estimated": [],
         },
     }
-    assert written["totals_by_symbol"] == {"BTC": "500"}
+    assert written["totals_by_symbol"] == {"BTC": "520"}
     assert written["errors"]["variational_entropy|hedge"].endswith(
         "成交查询暂不可用"
     )
@@ -565,3 +771,15 @@ def test_start_never_later_than_first_fill(tmp_path) -> None:
 
     assert fallback == heartbeat_ts - portfolio_equity.HEARTBEAT_START_MARGIN_SECONDS
     assert fallback < heartbeat_ts - Decimal("21"), "余量要覆盖实测最大的落盘延迟"
+
+
+def test_lighter_pnl_window_is_bounded() -> None:
+    """Lighter 盈亏查询窗口必须有界。
+
+    实测 resolution=1h 时 start_timestamp=0 与 30 天前都返回 400，7 天可用。
+    早期实现写死 start_timestamp="0"，导致该账户每次取数都失败、
+    在快照里只留一条 errors，而累计盈亏静默少算一个账户。
+    """
+    window_days = portfolio_equity.LIGHTER_PNL_WINDOW_MS / (24 * 60 * 60 * 1000)
+
+    assert 0 < window_days <= 7, "窗口需落在接口允许的范围内"

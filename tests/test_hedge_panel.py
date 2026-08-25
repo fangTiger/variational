@@ -223,8 +223,8 @@ def test_panel_source_keeps_zero_credential_boundary() -> None:
         assert forbidden not in source
 
 
-def test_portfolio_cumulative_pnl_uses_first_and_last_with_decimal(tmp_path) -> None:
-    """组合累计盈亏必须用首末总权益的 Decimal 差值，不能经过 float。"""
+def test_portfolio_cumulative_pnl_sums_each_account_delta_with_sources(tmp_path) -> None:
+    """累计盈亏按账户分别做首末差，并提示本地计算口径。"""
     instance = _write_instance(
         tmp_path,
         name="cumulative",
@@ -234,14 +234,39 @@ def test_portfolio_cumulative_pnl_uses_first_and_last_with_decimal(tmp_path) -> 
         tmp_path,
         [
             {
+                "schema": 4,
                 "ts": "1787481600.1",
-                "accounts": {"lighter": "561.49", "variational": "552.34"},
-                "total_equity": "1113.830000000000000001",
+                "accounts": {
+                    "lighter": "100.000000000000000001",
+                    "variational": "500",
+                    "hyperliquid": "-10",
+                },
+                "sources": {
+                    "lighter": "platform",
+                    "variational": "computed",
+                    "hyperliquid": "platform",
+                },
             },
             {
+                "schema": 4,
                 "ts": "1787485200.2",
-                "accounts": {"lighter": "561.72", "variational": "552.34"},
-                "total_equity": "1114.060000000000000003",
+                "accounts": {"variational": "502", "hyperliquid": "-12"},
+                "sources": {
+                    "variational": "computed",
+                    "hyperliquid": "platform",
+                },
+            },
+            {
+                "schema": 4,
+                "ts": "1787488800.3",
+                "accounts": {
+                    "lighter": "104.000000000000000003",
+                    "hyperliquid": "-11",
+                },
+                "sources": {
+                    "lighter": "platform",
+                    "hyperliquid": "platform",
+                },
             },
         ],
     )
@@ -253,34 +278,45 @@ def test_portfolio_cumulative_pnl_uses_first_and_last_with_decimal(tmp_path) -> 
         now=NOW,
     )
 
-    assert summary.cumulative_pnl == Decimal("0.230000000000000002")
-    assert summary.first_equity == Decimal("1113.830000000000000001")
-    assert summary.latest_equity == Decimal("1114.060000000000000003")
+    assert summary.cumulative_pnl == Decimal("5.000000000000000002")
+    assert summary.first_equity == Decimal("590.000000000000000001")
+    assert summary.latest_equity == Decimal("595.000000000000000003")
+    assert summary.computed_accounts == frozenset({"variational"})
     assert "本对盈亏" in html
     assert "累计盈亏" in html
-    assert "+$0.23" in html
-    assert "自 08-23 18:40 起 · 权益 $1,113.83 → $1,114.06" in html
-    assert 'class="portfolio-pnl-value mono pnl-positive">+$0.23</' in html
+    assert "+$5.00" in html
+    assert "自 08-23 18:40 起" in html
+    assert "本地计算口径：variational" in html
+    assert "平台官方口径" in html
+    assert 'class="portfolio-pnl-value mono pnl-positive">+$5.00</' in html
     assert "全部实例累计盈亏" not in html
     assert "cumulative-pnl-block" not in html
 
 
-def test_portfolio_cumulative_pnl_uses_only_latest_snapshot_schema(tmp_path) -> None:
-    """新旧权益口径混合时，只从最新 schema 的首条开始累计。"""
+def test_portfolio_cumulative_pnl_uses_only_schema_four_snapshots(tmp_path) -> None:
+    """schema 4 上线后不得混入旧权益公式的历史快照。"""
     portfolio_path = _write_portfolio_equity(
         tmp_path,
         [
-            {"schema": 1, "ts": "1000.1", "total_equity": "900.00"},
-            {"schema": 1, "ts": "1001.1", "total_equity": "950.00"},
+            {"schema": 3, "ts": "1000.1", "total_equity": "900.00"},
+            {"schema": 3, "ts": "1001.1", "total_equity": "950.00"},
             {
-                "schema": 2,
+                "schema": 4,
                 "ts": "1002.1",
-                "total_equity": "1000.000000000000000001",
+                "accounts": {
+                    "lighter": "10.000000000000000001",
+                    "variational": "100",
+                },
+                "sources": {"lighter": "platform", "variational": "computed"},
             },
             {
-                "schema": 2,
+                "schema": 4,
                 "ts": "1003.1",
-                "total_equity": "1001.230000000000000003",
+                "accounts": {
+                    "lighter": "12.000000000000000003",
+                    "variational": "101",
+                },
+                "sources": {"lighter": "platform", "variational": "computed"},
             },
         ],
     )
@@ -289,9 +325,9 @@ def test_portfolio_cumulative_pnl_uses_only_latest_snapshot_schema(tmp_path) -> 
 
     assert summary.snapshot_count == 2
     assert summary.started_at == Decimal("1002.1")
-    assert summary.first_equity == Decimal("1000.000000000000000001")
-    assert summary.latest_equity == Decimal("1001.230000000000000003")
-    assert summary.cumulative_pnl == Decimal("1.230000000000000002")
+    assert summary.first_equity == Decimal("110.000000000000000001")
+    assert summary.latest_equity == Decimal("113.000000000000000003")
+    assert summary.cumulative_pnl == Decimal("3.000000000000000002")
 
 
 def test_fewer_than_two_portfolio_snapshots_show_accumulating(tmp_path) -> None:
@@ -301,9 +337,10 @@ def test_fewer_than_two_portfolio_snapshots_show_accumulating(tmp_path) -> None:
         tmp_path,
         [
             {
+                "schema": 4,
                 "ts": "1787481600.1",
                 "accounts": {"lighter": "561.49"},
-                "total_equity": "561.49",
+                "sources": {"lighter": "platform"},
             }
         ],
     )
@@ -319,8 +356,8 @@ def test_fewer_than_two_portfolio_snapshots_show_accumulating(tmp_path) -> None:
     assert "portfolio-pnl-value mono pnl-missing" in html
 
 
-def test_portfolio_volume_marks_estimated_symbols_with_approximately(tmp_path) -> None:
-    """累计成交量含 Lighter 推算腿时必须显示约等号，不能伪装实测。"""
+def test_portfolio_volume_does_not_show_approximation_for_lighter(tmp_path) -> None:
+    """Lighter 已用官方成交额，面板不得再显示约等号或推算提示。"""
     instance = _write_instance(tmp_path, name="volume", heartbeat=_heartbeat())
     volume_path = _write_portfolio_volume(
         tmp_path,
@@ -369,11 +406,15 @@ def test_portfolio_volume_marks_estimated_symbols_with_approximately(tmp_path) -
         "BTC": Decimal("358895.64"),
         "ETH": Decimal("3872.00"),
     }
-    assert summary.estimated_symbols == frozenset({"BTC", "ETH"})
+    assert summary.estimated_symbols == frozenset()
     assert "累计成交量" in html
-    assert "BTC ≈$358,896 · ETH ≈$3,872" in html
-    assert "合计 ≈$362,768" in html
-    assert "≈ 表示含 Lighter 对手腿推算值" in html
+    assert "BTC $358,896 · ETH $3,872" in html
+    assert "合计 $362,768" in html
+    assert "BTC ≈$" not in html
+    assert "ETH ≈$" not in html
+    assert "合计 ≈$" not in html
+    assert "≈ 表示含 Lighter 对手腿推算值" not in html
+    assert "全部金额均来自交易所成交记录" in html
 
 
 def test_missing_portfolio_volume_shows_collecting_instead_of_zero(tmp_path) -> None:
@@ -778,3 +819,37 @@ def test_total_run_days_sum_across_instances(tmp_path) -> None:
     html = hedge_panel.build_page(instances=(first, second), now=NOW)
 
     assert "3.0 实例·天" in html
+
+
+def test_cumulative_sums_deltas_across_mixed_sources(tmp_path) -> None:
+    """平台口径与自算口径可以混用，因为累计取的是各账户的**差值**。
+
+    平台账户记录的是「累计盈亏」，自算账户记录的是「权益」——绝对值含义不同，
+    但两者的差值都等于该窗口内的盈亏，所以求和有意义。
+    这条断言锁住这个前提；若改成先求和再作差，结果将毫无意义。
+    """
+    path = tmp_path / "portfolio_equity.jsonl"
+    rows = [
+        {
+            "schema": 4,
+            "ts": 1000,
+            "accounts": {"a": "-436.00", "b": "561.00", "c": "7.00"},
+            "sources": {"a": "platform", "b": "computed", "c": "platform"},
+        },
+        {
+            "schema": 4,
+            "ts": 2000,
+            "accounts": {"a": "-440.00", "b": "558.00", "c": "9.00"},
+            "sources": {"a": "platform", "b": "computed", "c": "platform"},
+        },
+    ]
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    summary = hedge_panel.read_portfolio_equity_summary(path)
+
+    # -4（平台）+ -3（自算）+ +2（平台）
+    assert summary.cumulative_pnl == Decimal("-5.00")
+    assert summary.computed_accounts == frozenset({"b"})

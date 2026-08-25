@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -93,6 +94,25 @@ class LighterClient(ExchangeAdapter):
         response = await self._http.get(path, params=params, headers=headers)
         response.raise_for_status()
         data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"Lighter {path} 响应不是 JSON 对象")
+        return data
+
+    async def _get_json_decimal(
+        self,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict:
+        """为只读统计请求解析 Decimal，避免金额先经过二进制浮点数。"""
+        response = await self._http.get(path, params=params, headers=headers)
+        response.raise_for_status()
+        data = json.loads(
+            response.text,
+            parse_float=Decimal,
+            parse_int=int,
+        )
         if not isinstance(data, dict):
             raise ValueError(f"Lighter {path} 响应不是 JSON 对象")
         return data
@@ -408,8 +428,11 @@ class LighterClient(ExchangeAdapter):
 
     def _auth_headers(self) -> dict[str, str]:
         """为必须鉴权的只读接口生成短期 Authorization 头。"""
+        import lighter
+
         signer = self._require_signer()
         token, err = signer.create_auth_token_with_expiry(
+            lighter.SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY,
             api_key_index=self._api_key_index
         )
         self._raise_tx_error(err, context="生成鉴权 token")

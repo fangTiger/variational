@@ -24,6 +24,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "portfolio_equity.jsonl"
 DEFAULT_VOLUME_OUTPUT = PROJECT_ROOT / "data" / "portfolio_volume.jsonl"
 DEFAULT_INTERVAL_SECONDS = 900.0
+PORTFOLIO_SCHEMA = 4
+ACCOUNT_SOURCES = {
+    "lighter": "platform",
+    "hyperliquid": "platform",
+    "hyperliquid_var": "platform",
+    "variational": "computed",
+}
 
 EquityReader = Callable[[tuple[str, ...]], Awaitable[Decimal]]
 VolumeReader = Callable[[Decimal, str], Awaitable[Decimal]]
@@ -83,6 +90,35 @@ def _decimal(value: object, *, label: str) -> Decimal:
 def _decimal_text(value: Decimal) -> str:
     """把 Decimal 保存为不经过浮点数的十进制字符串。"""
     return format(value, "f")
+
+
+def _lighter_auth_headers(client: Any) -> dict[str, str]:
+    """即时生成 Lighter 短期 token，并规范成接口要求的小写请求头。"""
+    raw_headers = client._auth_headers()
+    if not isinstance(raw_headers, Mapping):
+        raise ValueError("Lighter 鉴权头不是对象")
+    for name, value in raw_headers.items():
+        if isinstance(name, str) and name.lower() == "authorization" and value:
+            return {"authorization": str(value)}
+    raise ValueError("Lighter 鉴权头缺少 authorization token")
+
+
+async def _lighter_get_json(
+    client: Any,
+    path: str,
+    *,
+    params: dict[str, str],
+) -> Mapping[str, object]:
+    """在每次 Lighter 取数前重新生成 token，再执行只读请求。"""
+    reader = getattr(client, "_get_json_decimal", client._get_json)
+    data = await reader(
+        path,
+        params=params,
+        headers=_lighter_auth_headers(client),
+    )
+    if not isinstance(data, Mapping):
+        raise ValueError(f"Lighter {path} 响应不是对象")
+    return data
 
 
 def _symbol(value: object, *, label: str) -> str:
@@ -154,6 +190,10 @@ def _timestamp(value: object, *, label: str) -> Decimal:
 #: 余量取 5 分钟：足以覆盖开仓延迟，又远小于与上一次人工/验证交易的间隔。
 HEARTBEAT_START_MARGIN_SECONDS = Decimal("300")
 
+#: Lighter /api/v1/pnl 在 resolution=1h 下的最大可查窗口（毫秒）。
+#: 实测 start_timestamp=0 与 30 天前均返回 400，7 天正常。取 6 天留余量。
+LIGHTER_PNL_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
+
 
 def read_heartbeat_start(path: Path | str) -> Decimal:
     """只读心跳文件首行，返回该实例的成交统计起点。
@@ -198,6 +238,91 @@ def read_heartbeat_start(path: Path | str) -> Decimal:
                     return opened_at
 
     return heartbeat_ts - HEARTBEAT_START_MARGIN_SECONDS
+
+
+async def read_lighter_volume(
+    client: Any,
+    *,
+    start_time_ms: int,
+    market_id: int,
+) -> Decimal:
+    """翻页读取 Lighter 账户成交，并直接累计官方 ``usd_amount``。"""
+    first_timestamp = _integer(start_time_ms, label="Lighter 起始时间")
+    target_market = _integer(market_id, label="Lighter 市场编号")
+    account_index = _integer(
+        client._require_account_index(),
+        label="Lighter 账户索引",
+    )
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    total = Decimal("0")
+
+    while True:
+        params = {
+            "sort_by": "timestamp",
+            "sort_dir": "desc",
+            "limit": "100",
+            "account_index": str(account_index),
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+
+        data = await _lighter_get_json(
+            client,
+            "/api/v1/trades",
+            params=params,
+        )
+        client._raise_api_error(data, context="成交查询")
+        trades = data.get("trades")
+        if not isinstance(trades, list):
+            raise ValueError("Lighter 成交响应缺少 trades 数组")
+        if not trades:
+            return total
+
+        oldest_timestamp: int | None = None
+        for index, trade in enumerate(trades):
+            if not isinstance(trade, Mapping):
+                raise ValueError(f"Lighter 第 {index + 1} 条成交不是对象")
+            trade_timestamp = _integer(
+                trade.get("timestamp"),
+                label="Lighter 成交时间",
+            )
+            oldest_timestamp = (
+                trade_timestamp
+                if oldest_timestamp is None
+                else min(oldest_timestamp, trade_timestamp)
+            )
+            if trade_timestamp < first_timestamp:
+                continue
+            trade_market = _integer(
+                trade.get("market_id"),
+                label="Lighter 成交市场编号",
+            )
+            if trade_market != target_market:
+                continue
+            amount = _decimal(
+                trade.get("usd_amount"),
+                label="Lighter 成交额",
+            )
+            if amount < 0:
+                raise ValueError("Lighter 成交额不能为负数")
+            total += amount
+
+        # 接口按时间倒序返回；一旦本页跨过起点，后续页只会更早。
+        if oldest_timestamp is not None and oldest_timestamp < first_timestamp:
+            return total
+
+        raw_cursor = data.get("next_cursor")
+        if raw_cursor in (None, ""):
+            return total
+        if not isinstance(raw_cursor, str):
+            raise ValueError("Lighter 下一页 cursor 不是字符串")
+        cursor = raw_cursor.strip()
+        if not cursor:
+            return total
+        if cursor in seen_cursors:
+            raise ValueError("Lighter 分页 cursor 重复，无法继续推进")
+        seen_cursors.add(cursor)
 
 
 async def read_hyperliquid_volume(
@@ -350,44 +475,39 @@ async def read_lighter_equity(
     client: Any,
     symbols: Sequence[str],
 ) -> Decimal:
-    """读取 Lighter 抵押品，并只叠加策略币种的未实现盈亏。"""
-    targets = {_symbol(symbol, label="Lighter 策略币种") for symbol in symbols}
+    """读取 Lighter 官方累计盈亏 ``trade_pnl`` 的最新值。"""
+    for symbol in symbols:
+        _symbol(symbol, label="Lighter 策略币种")
     account_index = client._require_account_index()
-    data = await client._get_json(
-        "/api/v1/account",
-        params={"by": "index", "value": str(account_index)},
+    data = await _lighter_get_json(
+        client,
+        "/api/v1/pnl",
+        params={
+            "by": "index",
+            "value": str(account_index),
+            "resolution": "1h",
+            # ⚠️ resolution=1h 时窗口不能过长：实测 start=0 与 start=30 天前
+            # 都返回 400，7 天可用。这里只取最新一点的累计值，
+            # 窗口够覆盖到「有数据的最近一小时」即可。
+            "start_timestamp": str(
+                time.time_ns() // 1_000_000 - LIGHTER_PNL_WINDOW_MS
+            ),
+            "end_timestamp": str(time.time_ns() // 1_000_000),
+            "count_back": "200",
+        },
     )
-    if not isinstance(data, Mapping):
-        raise ValueError("Lighter 账户详情响应不是对象")
-    client._raise_api_error(data, context="账户详情查询")
-    accounts = data.get("accounts")
-    if (
-        not isinstance(accounts, list)
-        or not accounts
-        or not isinstance(accounts[0], Mapping)
-    ):
-        raise ValueError("Lighter 账户详情响应缺少 accounts")
-    account = accounts[0]
-    collateral = _decimal(account.get("collateral"), label="Lighter 抵押品")
-    positions = account.get("positions")
-    if not isinstance(positions, list):
-        raise ValueError("Lighter 账户详情响应缺少 positions 数组")
-
-    unrealized_pnl = Decimal("0")
-    for index, position in enumerate(positions):
-        if not isinstance(position, Mapping):
-            raise ValueError(f"Lighter 第 {index + 1} 条持仓不是对象")
-        symbol = _symbol(
-            position.get("symbol"),
-            label=f"Lighter 第 {index + 1} 条持仓币种",
-        )
-        if symbol not in targets:
-            continue
-        unrealized_pnl += _decimal(
-            position.get("unrealized_pnl"),
-            label=f"Lighter {symbol} 未实现盈亏",
-        )
-    return collateral + unrealized_pnl
+    client._raise_api_error(data, context="累计盈亏查询")
+    pnl_history = data.get("pnl")
+    if not isinstance(pnl_history, list) or not pnl_history:
+        raise ValueError("Lighter 累计盈亏响应缺少 pnl 数组")
+    latest = pnl_history[-1]
+    if not isinstance(latest, Mapping):
+        raise ValueError("Lighter 最新累计盈亏不是对象")
+    _integer(latest.get("timestamp"), label="Lighter 累计盈亏时间")
+    return _decimal(
+        latest.get("trade_pnl"),
+        label="Lighter 平台累计盈亏",
+    )
 
 
 async def read_variational_equity(
@@ -442,58 +562,39 @@ async def read_hyperliquid_equity(
     client: Any,
     symbols: Sequence[str],
 ) -> Decimal:
-    """读取 Hyperliquid 权益：Spot USDC **已包含**未实现盈亏，故不再叠加。
+    """读取 Hyperliquid ``allTime`` 的官方累计盈亏末值。"""
+    for symbol in symbols:
+        _symbol(symbol, label="Hyperliquid 策略币种")
+    info = client._require_info()
+    address = client._require_account_address()
+    payload = await asyncio.to_thread(info.portfolio, address)
+    if not isinstance(payload, list):
+        raise ValueError("Hyperliquid portfolio 响应不是数组")
 
-    实测（2026-08-25，8 秒间隔三次采样）：``Δspot`` 与 ``ΔunrealizedPnl``
-    逐次完全相等，证明 Spot USDC 实时反映永续未实现盈亏。
-    早期实现写成 ``spot + 未实现``，把未实现算了两遍，误差随行情来回摆动，
-    在面板上表现为「越刷亏损越大」的假象。
-
-    非策略币种（用户手工开的仓位）的未实现已含在 spot 里，需要**减掉**。
-    此处仍不读取 ``marginSummary.accountValue``——那是占用记账，不可加。
-    """
-    targets = {_symbol(symbol, label="Hyperliquid 策略币种") for symbol in symbols}
-    state = await client._user_state()
-    if not isinstance(state, Mapping) or not isinstance(
-        state.get("assetPositions"), list
-    ):
-        raise ValueError("Hyperliquid 账户状态缺少 assetPositions 数组")
-
-    # spot 已含全部币种的未实现，这里累计的是**非策略币种**的部分，稍后减掉。
-    foreign_unrealized_pnl = Decimal("0")
-    for index, raw_position in enumerate(state["assetPositions"]):
-        if not isinstance(raw_position, Mapping) or not isinstance(
-            raw_position.get("position"), Mapping
+    all_time: Mapping[str, object] | None = None
+    for index, period_entry in enumerate(payload):
+        if (
+            not isinstance(period_entry, (list, tuple))
+            or len(period_entry) != 2
         ):
-            raise ValueError(f"Hyperliquid 第 {index + 1} 条持仓结构无效")
-        position = raw_position["position"]
-        symbol = _symbol(
-            position.get("coin"),
-            label=f"Hyperliquid 第 {index + 1} 条持仓币种",
-        )
-        if symbol in targets:
-            continue
-        foreign_unrealized_pnl += _decimal(
-            position.get("unrealizedPnl"),
-            label=f"Hyperliquid {symbol} 未实现盈亏",
-        )
+            raise ValueError(f"Hyperliquid 第 {index + 1} 个周期结构无效")
+        period, data = period_entry
+        if period == "allTime":
+            if not isinstance(data, Mapping):
+                raise ValueError("Hyperliquid allTime 数据不是对象")
+            all_time = data
+            break
+    if all_time is None:
+        raise ValueError("Hyperliquid portfolio 缺少 allTime 周期")
 
-    spot_state = await client._spot_user_state()
-    if not isinstance(spot_state, Mapping) or not isinstance(
-        spot_state.get("balances"), list
-    ):
-        raise ValueError("Hyperliquid Spot 账户状态缺少 balances 数组")
-    spot = Decimal("0")
-    for index, balance in enumerate(spot_state["balances"]):
-        if not isinstance(balance, Mapping):
-            raise ValueError(f"Hyperliquid Spot 第 {index + 1} 条余额不是对象")
-        if balance.get("coin") != "USDC":
-            continue
-        spot += _decimal(
-            balance.get("total"),
-            label="Hyperliquid Spot USDC",
-        )
-    return spot - foreign_unrealized_pnl
+    history = all_time.get("pnlHistory")
+    if not isinstance(history, list) or not history:
+        raise ValueError("Hyperliquid allTime 缺少 pnlHistory")
+    latest = history[-1]
+    if not isinstance(latest, (list, tuple)) or len(latest) != 2:
+        raise ValueError("Hyperliquid 最新累计盈亏结构无效")
+    _integer(latest[0], label="Hyperliquid 累计盈亏时间")
+    return _decimal(latest[1], label="Hyperliquid 平台累计盈亏")
 
 
 async def _read_lighter_from_env(symbols: tuple[str, ...]) -> Decimal:
@@ -503,10 +604,58 @@ async def _read_lighter_from_env(symbols: tuple[str, ...]) -> Decimal:
     address = (os.getenv("LIGHTER_RH_L1_ADDRESS") or "").strip()
     if not address:
         raise RuntimeError("缺少 LIGHTER_RH_L1_ADDRESS 环境变量")
-    client = LighterClient(l1_address=address)
+    private_key = (os.getenv("LIGHTER_API_PRIVATE_KEY") or "").strip()
+    if not private_key:
+        raise RuntimeError("缺少 LIGHTER_API_PRIVATE_KEY 环境变量")
+    client = LighterClient(
+        l1_address=address,
+        api_private_key=private_key,
+        api_key_index=_integer(
+            os.getenv("LIGHTER_API_KEY_INDEX", "255"),
+            label="Lighter API 密钥索引",
+        ),
+    )
     try:
         await client.connect()
         return await read_lighter_equity(client, symbols)
+    finally:
+        await client.close()
+
+
+async def _read_lighter_volume_from_env(
+    start_time: Decimal,
+    symbol: str,
+) -> Decimal:
+    """用鉴权只读客户端采集 Lighter 官方成交额。"""
+    from adapters.lighter_client import LighterClient
+
+    address = (os.getenv("LIGHTER_RH_L1_ADDRESS") or "").strip()
+    if not address:
+        raise RuntimeError("缺少 LIGHTER_RH_L1_ADDRESS 环境变量")
+    private_key = (os.getenv("LIGHTER_API_PRIVATE_KEY") or "").strip()
+    if not private_key:
+        raise RuntimeError("缺少 LIGHTER_API_PRIVATE_KEY 环境变量")
+    client = LighterClient(
+        l1_address=address,
+        api_private_key=private_key,
+        api_key_index=_integer(
+            os.getenv("LIGHTER_API_KEY_INDEX", "255"),
+            label="Lighter API 密钥索引",
+        ),
+    )
+    try:
+        await client.connect()
+        market = await client._load_market_meta(
+            _symbol(symbol, label="Lighter 实例币种")
+        )
+        return await read_lighter_volume(
+            client,
+            start_time_ms=int(start_time * Decimal("1000")),
+            market_id=_integer(
+                market.get("market_id"),
+                label="Lighter 市场编号",
+            ),
+        )
     finally:
         await client.close()
 
@@ -615,8 +764,9 @@ def build_default_volume_readers(
     hyperliquid_prefix: str = "HYPERLIQUID",
     hyperliquid_var_prefix: str = "HYPERLIQUID_VAR",
 ) -> dict[str, VolumeReader]:
-    """创建三个支持实例起点与币种过滤的只读成交采集函数。"""
+    """创建四个支持实例起点与币种过滤的只读成交采集函数。"""
     return {
+        "lighter": _read_lighter_volume_from_env,
         "hyperliquid": _hyperliquid_volume_reader(hyperliquid_prefix),
         "hyperliquid_var": _hyperliquid_volume_reader(hyperliquid_var_prefix),
         "variational": _read_variational_volume_from_env,
@@ -646,26 +796,27 @@ async def collect_snapshot(
     )
     accounts: dict[str, str] = {}
     errors: dict[str, str] = {}
-    total = Decimal("0")
     for name, result in zip(names, results, strict=True):
         if isinstance(result, BaseException):
             errors[name] = f"{type(result).__name__}: {result}"
             continue
         accounts[name] = _decimal_text(result)
-        total += result
 
     snapshot: dict[str, object] = {
-        # schema 3：修正 Hyperliquid 与 Variational 的重复计算
-        # （spot / balance 本就含未实现，此前又叠加了一次）。
-        # 面板只用同一 schema 的快照算累计，避免新旧公式混用得出无意义的差值。
-        "schema": 3,
+        # schema 4：Lighter 与 Hyperliquid 改用平台累计盈亏；Variational
+        # 保留 balance 减非策略币种未实现的本地计算口径。绝对值口径不同，
+        # 因此不再相加；面板按账户分别做最新值减首条值后再汇总。
+        "schema": PORTFOLIO_SCHEMA,
         "ts": time.time() if timestamp is None else timestamp,
         "accounts": accounts,
+        "sources": {
+            name: ACCOUNT_SOURCES.get(name, "computed")
+            for name in names
+        },
         "symbols": {
             name: list(symbols_by_source.get(name, ()))
             for name in names
         },
-        "total_equity": _decimal_text(total),
     }
     if errors:
         snapshot["errors"] = errors
@@ -714,8 +865,7 @@ async def collect_volume_snapshot(
             ("primary", config.primary_source),
             ("hedge", config.hedge_source),
         ):
-            if source != "lighter":
-                jobs.append((config.key, leg, source, since, symbol))
+            jobs.append((config.key, leg, source, since, symbol))
 
     results = await asyncio.gather(
         *(read_leg(source, since, symbol) for _, _, source, since, symbol in jobs),
@@ -730,20 +880,6 @@ async def collect_volume_snapshot(
             errors[f"{key}|{leg}"] = f"{type(result).__name__}: {result}"
             continue
         decimal_instances[key][leg] = result
-
-    estimated_legs: dict[str, list[str]] = {
-        key: [] for key in decimal_instances
-    }
-    for config in instances:
-        legs = decimal_instances.get(config.key)
-        if legs is None:
-            continue
-        if config.primary_source == "lighter" and "hedge" in legs:
-            legs["primary"] = legs["hedge"]
-            estimated_legs[config.key].append("primary")
-        if config.hedge_source == "lighter" and "primary" in legs:
-            legs["hedge"] = legs["primary"]
-            estimated_legs[config.key].append("hedge")
 
     totals_by_symbol: dict[str, Decimal] = {}
     serialized_instances: dict[str, dict[str, object]] = {}
@@ -765,7 +901,6 @@ async def collect_volume_snapshot(
             totals_by_symbol[symbol] = (
                 totals_by_symbol.get(symbol, Decimal("0")) + amount
             )
-        serialized["estimated"] = estimated_legs[key]
         serialized_instances[key] = serialized
 
     snapshot: dict[str, object] = {
@@ -828,11 +963,7 @@ def _print_result(snapshot: Mapping[str, object]) -> None:
     """输出一条不含凭据的中文采集摘要。"""
     accounts = snapshot.get("accounts")
     count = len(accounts) if isinstance(accounts, dict) else 0
-    print(
-        f"组合权益已记录：成功 {count} 个账户，总权益 "
-        f"{snapshot.get('total_equity', '—')}",
-        flush=True,
-    )
+    print(f"组合盈亏基准已记录：成功 {count} 个账户", flush=True)
     errors = snapshot.get("errors")
     if isinstance(errors, dict):
         for name, message in errors.items():
@@ -883,8 +1014,8 @@ def _positive_interval(value: str) -> float:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """解析组合权益记录器命令行参数。"""
-    parser = argparse.ArgumentParser(description="周期性记录组合级账户权益")
+    """解析组合盈亏基准记录器命令行参数。"""
+    parser = argparse.ArgumentParser(description="周期性记录组合级盈亏基准")
     parser.add_argument(
         "--interval",
         type=_positive_interval,

@@ -42,13 +42,14 @@ class InstanceConfig:
 
 @dataclass(frozen=True)
 class PortfolioEquitySummary:
-    """整个账户组合从首条到末条权益快照的统计。"""
+    """各账户在同一 schema 内分别做首末差后的组合统计。"""
 
     cumulative_pnl: Decimal | None = None
     started_at: Decimal | None = None
     first_equity: Decimal | None = None
     latest_equity: Decimal | None = None
     snapshot_count: int = 0
+    computed_accounts: frozenset[str] = frozenset()
 
     @property
     def ready(self) -> bool:
@@ -156,8 +157,9 @@ def read_last_jsonl(path: Path | str) -> dict:
 
 
 def read_portfolio_equity_summary(path: Path | str) -> PortfolioEquitySummary:
-    """按最新快照 schema 读取组合权益，并以 Decimal 计算首末差值。"""
-    by_schema: dict[int, list[object]] = {}
+    """按最新 schema 为每个账户计算最新值减首条值，再做汇总。"""
+    legacy_by_schema: dict[int, list[object]] = {}
+    account_by_schema: dict[int, dict[str, object]] = {}
     latest_schema: int | None = None
     try:
         stream = Path(path).open("r", encoding="utf-8")
@@ -176,21 +178,114 @@ def read_portfolio_equity_summary(path: Path | str) -> PortfolioEquitySummary:
                 if not isinstance(payload, dict):
                     continue
                 timestamp = _to_decimal(payload.get("ts"))
-                total_equity = _to_decimal(payload.get("total_equity"))
                 schema = _portfolio_equity_schema(payload.get("schema"))
-                if timestamp is None or total_equity is None or schema is None:
+                if timestamp is None or schema is None:
                     continue
-                snapshot = (timestamp, total_equity)
-                state = by_schema.setdefault(schema, [snapshot, snapshot, 0])
-                state[1] = snapshot
-                state[2] = int(state[2]) + 1
+
+                if schema >= 4:
+                    raw_accounts = payload.get("accounts")
+                    raw_sources = payload.get("sources")
+                    if not isinstance(raw_accounts, dict) or not isinstance(
+                        raw_sources, dict
+                    ):
+                        continue
+                    parsed_accounts: dict[str, tuple[Decimal, str]] = {}
+                    for raw_name, raw_value in raw_accounts.items():
+                        if not isinstance(raw_name, str) or not raw_name.strip():
+                            continue
+                        name = raw_name.strip()
+                        value = _to_decimal(raw_value)
+                        source = raw_sources.get(raw_name)
+                        if value is None or source not in {"platform", "computed"}:
+                            continue
+                        parsed_accounts[name] = (value, source)
+                    if not parsed_accounts:
+                        continue
+
+                    state = account_by_schema.setdefault(
+                        schema,
+                        {"snapshot_count": 0, "accounts": {}},
+                    )
+                    state["snapshot_count"] = int(state["snapshot_count"]) + 1
+                    account_states = state["accounts"]
+                    if not isinstance(account_states, dict):
+                        continue
+                    for name, (value, source) in parsed_accounts.items():
+                        account_state = account_states.get(name)
+                        if not isinstance(account_state, list):
+                            account_states[name] = [
+                                timestamp,
+                                value,
+                                value,
+                                1,
+                                source,
+                            ]
+                            continue
+                        account_state[2] = value
+                        account_state[3] = int(account_state[3]) + 1
+                        if source == "computed":
+                            account_state[4] = source
+                else:
+                    total_equity = _to_decimal(payload.get("total_equity"))
+                    if total_equity is None:
+                        continue
+                    snapshot = (timestamp, total_equity)
+                    state = legacy_by_schema.setdefault(
+                        schema,
+                        [snapshot, snapshot, 0],
+                    )
+                    state[1] = snapshot
+                    state[2] = int(state[2]) + 1
                 latest_schema = schema
         except (OSError, UnicodeDecodeError):
             return PortfolioEquitySummary()
 
     if latest_schema is None:
         return PortfolioEquitySummary()
-    first, latest, raw_count = by_schema[latest_schema]
+
+    if latest_schema >= 4:
+        state = account_by_schema.get(latest_schema)
+        if not isinstance(state, dict):
+            return PortfolioEquitySummary()
+        raw_count = int(state.get("snapshot_count", 0))
+        raw_accounts = state.get("accounts")
+        if not isinstance(raw_accounts, dict):
+            return PortfolioEquitySummary(snapshot_count=raw_count)
+
+        eligible: list[list[object]] = []
+        computed_accounts: set[str] = set()
+        for name, account_state in raw_accounts.items():
+            if not isinstance(account_state, list) or len(account_state) != 5:
+                continue
+            if int(account_state[3]) < 2:
+                continue
+            eligible.append(account_state)
+            if account_state[4] == "computed":
+                computed_accounts.add(str(name))
+        if not eligible:
+            return PortfolioEquitySummary(snapshot_count=raw_count)
+
+        first_equity = sum(
+            (state[1] for state in eligible if isinstance(state[1], Decimal)),
+            Decimal("0"),
+        )
+        latest_equity = sum(
+            (state[2] for state in eligible if isinstance(state[2], Decimal)),
+            Decimal("0"),
+        )
+        started_at = min(
+            state[0] for state in eligible if isinstance(state[0], Decimal)
+        )
+        return PortfolioEquitySummary(
+            cumulative_pnl=latest_equity - first_equity,
+            started_at=started_at,
+            first_equity=first_equity,
+            latest_equity=latest_equity,
+            snapshot_count=raw_count,
+            computed_accounts=frozenset(computed_accounts),
+        )
+
+    first, latest, raw_count = legacy_by_schema[latest_schema]
     if not isinstance(first, tuple) or not isinstance(latest, tuple):
         return PortfolioEquitySummary()
     snapshot_count = int(raw_count)
@@ -217,7 +312,7 @@ def _portfolio_equity_schema(value: object) -> int | None:
 
 
 def read_portfolio_volume_summary(path: Path | str) -> PortfolioVolumeSummary:
-    """从最近的有效本地快照读取按币种累计成交量和推算标记。"""
+    """从最近的有效本地快照读取按币种官方成交量。"""
     for line in _read_recent_jsonl_lines(
         path,
         max_lines=PREVIOUS_READING_MAX_LINES,
@@ -247,31 +342,8 @@ def read_portfolio_volume_summary(path: Path | str) -> PortfolioVolumeSummary:
         if not valid or not totals:
             continue
 
-        estimated_symbols: set[str] = set()
-        raw_instances = payload.get("instances")
-        if isinstance(raw_instances, dict):
-            for raw_instance in raw_instances.values():
-                if not isinstance(raw_instance, dict):
-                    continue
-                raw_symbol = raw_instance.get("symbol")
-                if not isinstance(raw_symbol, str):
-                    continue
-                symbol = raw_symbol.strip().upper()
-                if symbol not in totals:
-                    continue
-                raw_estimated = raw_instance.get("estimated")
-                if not isinstance(raw_estimated, list):
-                    continue
-                for leg in raw_estimated:
-                    if leg not in {"primary", "hedge"}:
-                        continue
-                    amount = _to_decimal(raw_instance.get(leg))
-                    if amount is not None and amount >= 0:
-                        estimated_symbols.add(symbol)
-                        break
         return PortfolioVolumeSummary(
             totals_by_symbol=totals,
-            estimated_symbols=frozenset(estimated_symbols),
         )
     return PortfolioVolumeSummary()
 
@@ -711,10 +783,15 @@ def _render_portfolio_pnl(summary: PortfolioEquitySummary) -> str:
     if summary.ready:
         value_text = _money_text(summary.cumulative_pnl)
         value_class = _pnl_class(summary.cumulative_pnl)
+        source_hint = (
+            "平台官方口径与本地计算口径分开统计；本地计算口径："
+            + "、".join(sorted(summary.computed_accounts))
+            if summary.computed_accounts
+            else "全部账户均使用平台官方口径"
+        )
         hint = (
-            f"自 {_equity_start_time(summary.started_at)} 起 · 权益 "
-            f"{_equity_text(summary.first_equity)} → "
-            f"{_equity_text(summary.latest_equity)}"
+            f"自 {_equity_start_time(summary.started_at)} 起 · "
+            f"各账户最新累计值减首条累计值后汇总 · {source_hint}"
         )
     else:
         value_text = "累计中…"
@@ -743,21 +820,14 @@ def _render_portfolio_volume(summary: PortfolioVolumeSummary) -> str:
     parts: list[str] = []
     for symbol in sorted(summary.totals_by_symbol):
         amount = summary.totals_by_symbol[symbol]
-        approximate = "≈" if symbol in summary.estimated_symbols else ""
-        parts.append(f"{symbol} {approximate}${amount:,.0f}")
+        parts.append(f"{symbol} ${amount:,.0f}")
     total = sum(summary.totals_by_symbol.values(), Decimal("0"))
-    total_approximate = "≈" if summary.estimated_symbols else ""
-    hint = (
-        "≈ 表示含 Lighter 对手腿推算值"
-        if summary.estimated_symbols
-        else "全部金额均来自交易所成交记录"
-    )
     return (
         '  <section class="portfolio-volume-block" aria-label="组合累计成交量">\n'
         "    <span>累计成交量</span>\n"
         f'    <strong class="portfolio-volume-value mono">{_text(" · ".join(parts))}</strong>\n'
-        f'    <b class="portfolio-volume-total mono">合计 {total_approximate}${total:,.0f}</b>\n'
-        f"    <small>{_text(hint)}</small>\n"
+        f'    <b class="portfolio-volume-total mono">合计 ${total:,.0f}</b>\n'
+        "    <small>全部金额均来自交易所成交记录</small>\n"
         "  </section>"
     )
 
