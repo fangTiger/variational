@@ -872,9 +872,19 @@ class HyperliquidClient(ExchangeAdapter):
         )
 
     async def get_price_tick_size(self, market: str) -> Decimal:
-        """按当前标记价返回实际有效 tick；Hyperliquid tick 随价位变化。"""
+        """按当前标记价返回实际有效 tick；Hyperliquid tick 随价位变化。
+
+        dex 前缀标的（如 ``io:SNDK``）不在默认 universe 的标记价表里，
+        必须走盘口中价——与 ``get_min_order_size`` 同样的处理。
+        早先只改了后者，此处遗漏，导致跟价重挂读 tick 失败后降级为
+        「最优价严格变化」判断，maker 效率打折。
+        """
         meta = await self._market(market)
-        mark_price = await self.get_mark_price(market)
+        dex = self._market_dex(meta.coin)
+        if dex:
+            mark_price = (await self.get_market_price(market)).mid
+        else:
+            mark_price = await self.get_mark_price(market)
         return self._price_quantum(mark_price, meta.sz_decimals)
 
     async def get_min_order_size(self, market: str) -> Decimal:
