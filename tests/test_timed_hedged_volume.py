@@ -1959,3 +1959,109 @@ def test_default_interlock_blocks_open_when_extended_market_is_unavailable(
     assert result.hedge_available is False
     assert "行情不可用" in result.interlock_reason
     assert executor.calls == []
+
+
+def _closed_result():
+    """构造一个 action=closed 的最小结果对象。"""
+    from timed_volume.strategy import TimedVolumeResult
+
+    return TimedVolumeResult(
+        action="closed",
+        round_index=1,
+        direction=None,
+        due_at=None,
+        primary_size=Decimal("0"),
+        hedge_size=Decimal("0"),
+        net_exposure=Decimal("0"),
+        hedge_available=True,
+        interlock_reason="",
+        warnings=[],
+        notional_usd=2000,
+    )
+
+
+def _ledger_context():
+    """构造一个字段齐全的台账上下文。"""
+    from timed_volume.strategy import _RoundLedgerContext, RoundDirection
+
+    return _RoundLedgerContext(
+        round_index=1,
+        direction=RoundDirection.LONG,
+        notional_usd=2000,
+        opened_at=0.0,
+        primary_entry=Decimal("100"),
+        hedge_entry=Decimal("100"),
+        primary_size=Decimal("20"),
+        hedge_size=Decimal("-20"),
+    )
+
+
+def test_ledger_retries_when_fills_not_yet_indexed(tmp_path, monkeypatch) -> None:
+    """成交查询有索引延迟时应重试，而不是丢掉整条台账。
+
+    实测：Hyperliquid 在平仓刚完成时查 userFillsByTime 可能查不到成交，
+    日志为「平仓成交尚未完整出现在时间窗内」。不重试的话台账随机缺条，
+    就失去了作为成本量尺的意义——而它正是用来验证各项优化的。
+    """
+    from timed_volume import strategy as strategy_module
+
+    monkeypatch.setattr(strategy_module, "LEDGER_FILL_RETRY_DELAY_SECONDS", 0.0)
+
+    lighter = _LighterAdapter("lighter")
+    extended = _ExtendedAdapter("extended")
+    _, strategy, _, _ = _build_strategy(
+        tmp_path, lighter=lighter, extended=extended, executor=_ScriptedExecutor()
+    )
+    strategy.config.ledger_path = tmp_path / "ledger.jsonl"
+
+    attempts: list[int] = []
+
+    async def flaky(result, context, *, now):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise ValueError("Hyperliquid 平仓成交尚未完整出现在时间窗内")
+
+    monkeypatch.setattr(
+        strategy, "_build_and_write_round_ledger", flaky, raising=True
+    )
+
+    asyncio.run(
+        strategy._record_round_ledger(
+            _closed_result(), _ledger_context(), now=0.0
+        )
+    )
+
+    assert len(attempts) == 3, "应重试到成功，而不是首次失败就放弃"
+
+
+def test_ledger_does_not_retry_unrecoverable_errors(tmp_path, monkeypatch) -> None:
+    """非时序类错误重试也没用，应立即抛出而不是空转。"""
+    from timed_volume import strategy as strategy_module
+
+    monkeypatch.setattr(strategy_module, "LEDGER_FILL_RETRY_DELAY_SECONDS", 0.0)
+
+    lighter = _LighterAdapter("lighter")
+    extended = _ExtendedAdapter("extended")
+    _, strategy, _, _ = _build_strategy(
+        tmp_path, lighter=lighter, extended=extended, executor=_ScriptedExecutor()
+    )
+    strategy.config.ledger_path = tmp_path / "ledger.jsonl"
+
+    attempts: list[int] = []
+
+    async def broken(result, context, *, now):
+        attempts.append(1)
+        raise ValueError("轮次台账缺少开仓时间或数量")
+
+    monkeypatch.setattr(
+        strategy, "_build_and_write_round_ledger", broken, raising=True
+    )
+
+    with pytest.raises(ValueError, match="缺少开仓时间"):
+        asyncio.run(
+            strategy._record_round_ledger(
+                _closed_result(), _ledger_context(), now=0.0
+            )
+        )
+
+    assert len(attempts) == 1, "不可自愈的错误不该重试"

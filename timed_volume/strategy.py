@@ -22,6 +22,12 @@ from engine.hedge_engine import HedgeFillResult, maker_first_hedge
 
 logger = logging.getLogger(__name__)
 
+#: 台账读取成交明细的重试次数与间隔。
+#: 交易所成交查询有索引延迟，平仓刚完成时查不到，实测 Hyperliquid 会漏记。
+#: 不重试的话台账随机缺条，就失去了作为成本量尺的意义。
+LEDGER_FILL_RETRIES = 4
+LEDGER_FILL_RETRY_DELAY_SECONDS = 3.0
+
 
 class RoundDirection(Enum):
     """Lighter 主腿的轮次方向。"""
@@ -1570,9 +1576,43 @@ class TimedHedgedVolumeStrategy:
         *,
         now: float | None,
     ) -> None:
-        """仅在平仓完成后按成交台账计算本轮成本归因。"""
+        """仅在平仓完成后按成交台账计算本轮成本归因。
+
+        交易所的成交查询接口存在索引延迟：平仓刚完成时去查，
+        成交可能尚未出现（实测 Hyperliquid 会漏，日志为
+        「平仓成交尚未完整出现在时间窗内」）。此处做有界重试，
+        否则台账会随机漏记而失去作为成本量尺的价值。
+
+        重试期间不持有任何锁、不影响交易——本方法整体已被
+        ``run_once`` 包在 try/except 中。
+        """
         if self.config.ledger_path is None or result.action != "closed":
             return
+
+        last_error: Exception | None = None
+        for attempt in range(LEDGER_FILL_RETRIES):
+            try:
+                await self._build_and_write_round_ledger(result, context, now=now)
+                return
+            except ValueError as exc:
+                # 只对「成交尚未出现」这类可自愈的时序问题重试；
+                # 其余数据缺失重试也没用，直接抛给上层记警告。
+                if "尚未完整出现" not in str(exc):
+                    raise
+                last_error = exc
+                if attempt < LEDGER_FILL_RETRIES - 1:
+                    await asyncio.sleep(LEDGER_FILL_RETRY_DELAY_SECONDS)
+        if last_error is not None:
+            raise last_error
+
+    async def _build_and_write_round_ledger(
+        self,
+        result: TimedVolumeResult,
+        context: _RoundLedgerContext,
+        *,
+        now: float | None,
+    ) -> None:
+        """构建并落盘单轮台账；成交未就绪时抛出以便上层重试。"""
         required = (
             context.direction,
             context.notional_usd,
