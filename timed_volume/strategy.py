@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import random
 import time
 from dataclasses import asdict, dataclass, replace
@@ -27,6 +28,23 @@ logger = logging.getLogger(__name__)
 #: 不重试的话台账随机缺条，就失去了作为成本量尺的意义。
 LEDGER_FILL_RETRIES = 4
 LEDGER_FILL_RETRY_DELAY_SECONDS = 3.0
+
+#: 基差门控只使用单实例最近的有限轮次，避免陈旧结构变化稀释当前分布。
+BASIS_GATE_HISTORY_ROUNDS = 20
+#: 少于五轮无法可靠估计分布，必须直接放行。
+BASIS_GATE_MIN_HISTORY = 5
+#: 低于该标准差的配对视为稳定结构性基差，门控直接放行。
+#:
+#: 这条放行分支是必需的：实例 C（Lighter×Variational ETH）的基差是
+#: **结构性持久**的（恒为 +0.124%，实测标准差 0.0188%），
+#: 等待再久也不会回归。若被门控拦下，只会一路等到 max_wait 强制开仓，
+#: 白白推迟每一轮、拉长持仓时间。
+#:
+#: ⚠️ C 的 0.0188% 距此下限只有 0.0012% 余量，多跑几轮就可能越过。
+#: 越过后该实例会被自己的窄门限反复拦截——**这是已知隐患**。
+#: 缓解办法是给 C 显式传 `--basis-gate-sigma 0` 关闭门控，
+#: 而不是调高本下限（调高会让 A/B 的门控一并失效）。
+BASIS_GATE_STD_FLOOR_PCT = Decimal("0.02")
 
 
 class RoundDirection(Enum):
@@ -62,7 +80,10 @@ class TimedVolumeConfig:
     convergence_attempts: int = 3
     equity_path: Path | str | None = None
     ledger_path: Path | str | None = None
+    heartbeat_path: Path | str | None = None
     instance: str | None = None
+    basis_gate_sigma: Decimal = Decimal("0")
+    basis_gate_max_wait_s: float = 1800.0
 
     def __post_init__(self) -> None:
         """归一化配置并拒绝无法安全运行的数值。"""
@@ -80,6 +101,9 @@ class TimedVolumeConfig:
             self.equity_path = Path(self.equity_path)
         if self.ledger_path is not None:
             self.ledger_path = Path(self.ledger_path)
+        if self.heartbeat_path is not None:
+            self.heartbeat_path = Path(self.heartbeat_path)
+        self.basis_gate_sigma = Decimal(str(self.basis_gate_sigma))
         if self.instance is not None:
             self.instance = str(self.instance).strip() or None
         if self.ledger_path is not None and self.instance is None:
@@ -101,6 +125,13 @@ class TimedVolumeConfig:
             raise ValueError("持仓容差不得为负")
         if self.convergence_attempts <= 0:
             raise ValueError("收敛尝试次数必须大于零")
+        if not self.basis_gate_sigma.is_finite() or self.basis_gate_sigma < 0:
+            raise ValueError("基差门控标准差倍数必须为有限非负数")
+        if (
+            not math.isfinite(self.basis_gate_max_wait_s)
+            or self.basis_gate_max_wait_s < 0
+        ):
+            raise ValueError("基差门控最长等待秒数必须为有限非负数")
 
     @staticmethod
     def _normalize_notional_bound(value: object, label: str) -> int:
@@ -128,6 +159,7 @@ class TimedVolumeState:
     ledger_hedge_entry: Decimal | None = None
     ledger_primary_size: Decimal | None = None
     ledger_hedge_size: Decimal | None = None
+    basis_gate_wait_started_at: float | None = None
 
     @property
     def is_open(self) -> bool:
@@ -155,6 +187,9 @@ class TimedVolumeResult:
     primary_entry: Decimal | None = None
     hedge_entry: Decimal | None = None
     pair_pnl: Decimal | None = None
+    basis_gate_deviation: Decimal | None = None
+    basis_gate_waited_seconds: float = 0.0
+    basis_gate_state: str = "open"
 
 
 TradeExecutor = Callable[..., Awaitable[HedgeFillResult]]
@@ -235,6 +270,9 @@ class TimedHedgedVolumeStrategy:
         self._hedge_auth_interlock_active = False
         self.hedge_tolerance: Decimal | None = None
         self._order_limits: _OrderLimits | None = None
+        self._basis_gate_deviation: Decimal | None = None
+        self._basis_gate_waited_seconds = 0.0
+        self._basis_gate_state = "open"
 
     def _load_state(self) -> TimedVolumeState:
         """读取轮次记录；损坏记录失败关闭为无记录，后续以实仓恢复。"""
@@ -280,6 +318,16 @@ class TimedHedgedVolumeStrategy:
         except (TypeError, ValueError, KeyError) as exc:
             logger.warning("轮次状态字段无效，将以实际持仓恢复：%s", exc)
             return TimedVolumeState()
+
+        wait_started_raw = raw.get("basis_gate_wait_started_at")
+        if wait_started_raw is not None:
+            try:
+                wait_started = float(wait_started_raw)
+                if not math.isfinite(wait_started):
+                    raise ValueError("等待起点必须为有限时间戳")
+                state.basis_gate_wait_started_at = wait_started
+            except (TypeError, ValueError) as exc:
+                logger.warning("基差门控等待状态无效，仅清除等待计时：%s", exc)
 
         if self.config.ledger_path is None:
             return state
@@ -931,6 +979,184 @@ class TimedHedgedVolumeStrategy:
             self._save_state()
         return primary_size, hedge_size, True
 
+    @staticmethod
+    def _basis_from_heartbeat(payload: dict) -> Decimal | None:
+        """从开仓心跳提取实际入场基差，兼容显式基差与双腿入场价。"""
+        if payload.get("action") != "opened":
+            return None
+        explicit = payload.get("entry_basis_pct")
+        if explicit is not None:
+            basis = Decimal(str(explicit))
+        else:
+            primary_entry = payload.get("primary_entry")
+            hedge_entry = payload.get("hedge_entry")
+            if primary_entry is None or hedge_entry is None:
+                return None
+            primary = Decimal(str(primary_entry))
+            hedge = Decimal(str(hedge_entry))
+            if not primary.is_finite() or not hedge.is_finite() or hedge <= 0:
+                return None
+            basis = (primary - hedge) / hedge * Decimal(100)
+        return basis if basis.is_finite() else None
+
+    def _read_basis_values(self, path: Path, *, ledger: bool) -> list[Decimal]:
+        """读取单个 JSONL 来源中的有效入场基差，损坏行只做隔离跳过。"""
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        except (OSError, UnicodeError) as exc:
+            logger.warning("基差门控历史读取失败，将按样本不足放行：%s", exc)
+            return []
+
+        values: list[Decimal] = []
+        for line in lines:
+            try:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    continue
+                if ledger:
+                    row_instance = payload.get("instance")
+                    if (
+                        self.config.instance is not None
+                        and row_instance is not None
+                        and str(row_instance) != self.config.instance
+                    ):
+                        continue
+                    raw_basis = payload.get("entry_basis_pct")
+                    if raw_basis is None:
+                        continue
+                    basis = Decimal(str(raw_basis))
+                    if not basis.is_finite():
+                        continue
+                else:
+                    basis = self._basis_from_heartbeat(payload)
+                    if basis is None:
+                        continue
+            except (ArithmeticError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            values.append(basis)
+        return values[-BASIS_GATE_HISTORY_ROUNDS:]
+
+    def _read_basis_history(self) -> list[Decimal]:
+        """从台账或心跳选择样本更完整的最近开仓基差序列。"""
+        ledger_values = (
+            self._read_basis_values(self.config.ledger_path, ledger=True)
+            if self.config.ledger_path is not None
+            else []
+        )
+        heartbeat_values = (
+            self._read_basis_values(self.config.heartbeat_path, ledger=False)
+            if self.config.heartbeat_path is not None
+            else []
+        )
+        return (
+            heartbeat_values
+            if len(heartbeat_values) > len(ledger_values)
+            else ledger_values
+        )
+
+    @staticmethod
+    def _basis_statistics(values: list[Decimal]) -> tuple[Decimal, Decimal]:
+        """用 Decimal 计算历史中位数与总体标准差，避免浮点阈值漂移。"""
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        median = (
+            ordered[middle]
+            if len(ordered) % 2
+            else (ordered[middle - 1] + ordered[middle]) / Decimal(2)
+        )
+        count = Decimal(len(values))
+        mean = sum(values, Decimal(0)) / count
+        variance = sum(
+            ((value - mean) ** 2 for value in values),
+            Decimal(0),
+        ) / count
+        return median, variance.sqrt()
+
+    @staticmethod
+    def _basis_mid(quote: object, role: str) -> Decimal:
+        """从盘口提取用于开仓门控的有限正中价。"""
+        mid = Decimal(str(getattr(quote, "mid")))
+        if not mid.is_finite() or mid <= 0:
+            raise ValueError(f"{role}开仓中价必须为有限正数")
+        return mid
+
+    async def _current_basis(self) -> Decimal:
+        """并发读取两腿中价并计算百分比基差。"""
+        quotes = await asyncio.gather(
+            self.primary.get_market_price(self.config.primary_market),
+            self.hedge.get_market_price(self.config.hedge_market),
+            return_exceptions=True,
+        )
+        for leg, quote in zip(("primary", "hedge"), quotes, strict=True):
+            if isinstance(quote, Exception) and self._is_auth_error(quote):
+                raise _LegAuthFailure(leg, quote)
+        for quote in quotes:
+            if isinstance(quote, Exception):
+                raise quote
+        primary_mid = self._basis_mid(quotes[0], "主腿")
+        hedge_mid = self._basis_mid(quotes[1], "对冲腿")
+        return (primary_mid - hedge_mid) / hedge_mid * Decimal(100)
+
+    def _clear_basis_gate_wait(self) -> None:
+        """清除已结束的门控等待；没有等待时不产生额外状态写盘。"""
+        if self.state.basis_gate_wait_started_at is None:
+            return
+        self.state.basis_gate_wait_started_at = None
+        self._save_state()
+
+    async def _basis_gate_allows_open(self, now: float) -> bool:
+        """评估开仓门控并更新本节拍观测字段。"""
+        if self.config.basis_gate_sigma == 0:
+            self._clear_basis_gate_wait()
+            return True
+
+        history = self._read_basis_history()
+        if len(history) < BASIS_GATE_MIN_HISTORY:
+            self._clear_basis_gate_wait()
+            return True
+
+        current_basis = await self._current_basis()
+        median, standard_deviation = self._basis_statistics(history)
+        deviation = current_basis - median
+        self._basis_gate_deviation = deviation
+
+        wait_started = self.state.basis_gate_wait_started_at
+        if wait_started is not None:
+            self._basis_gate_waited_seconds = max(0.0, now - wait_started)
+
+        if standard_deviation < BASIS_GATE_STD_FLOOR_PCT:
+            self._clear_basis_gate_wait()
+            return True
+
+        threshold = self.config.basis_gate_sigma * standard_deviation
+        if abs(deviation) <= threshold:
+            self._clear_basis_gate_wait()
+            return True
+
+        if wait_started is None or now < wait_started:
+            self.state.basis_gate_wait_started_at = now
+            self._basis_gate_waited_seconds = 0.0
+            self._save_state()
+        if self._basis_gate_waited_seconds >= self.config.basis_gate_max_wait_s:
+            self._basis_gate_state = "forced"
+            logger.warning(
+                "基差门控等待达到上限，强制开仓：偏离=%s%%，已等待=%.1f秒",
+                deviation,
+                self._basis_gate_waited_seconds,
+            )
+            return True
+
+        self._basis_gate_state = "waiting"
+        logger.info(
+            "基差相对偏离超过门限，延迟开仓：偏离=%s%%，门限=%s%%，已等待=%.1f秒",
+            deviation,
+            threshold,
+            self._basis_gate_waited_seconds,
+        )
+        return False
+
     async def _open_round(
         self,
         now: float,
@@ -1105,6 +1331,7 @@ class TimedHedgedVolumeStrategy:
         self.state.current_direction = direction
         self.state.opened_at = now
         self.state.due_at = now + self.config.cycle_seconds
+        self.state.basis_gate_wait_started_at = None
         self._save_state()
         return self._result("opened", primary_size, hedge_size, warnings)
 
@@ -1128,6 +1355,7 @@ class TimedHedgedVolumeStrategy:
             self.state.current_notional_usd = None
             self.state.opened_at = None
             self.state.due_at = None
+            self.state.basis_gate_wait_started_at = None
             self._clear_ledger_state(self.state)
             self._save_state()
             return self._result("closed", primary_size, hedge_size, warnings)
@@ -1164,11 +1392,17 @@ class TimedHedgedVolumeStrategy:
             interlock_reason=self.hedge_interlock_reason,
             notional_usd=self.state.current_notional_usd,
             warnings=tuple(warnings),
+            basis_gate_deviation=self._basis_gate_deviation,
+            basis_gate_waited_seconds=self._basis_gate_waited_seconds,
+            basis_gate_state=self._basis_gate_state,
         )
 
     async def _run_trading_once(self, *, now: float | None = None) -> TimedVolumeResult:
         """推进一次状态机；到期平仓与下一轮开仓分属相邻的无等待节拍。"""
         current_time = time.time() if now is None else float(now)
+        self._basis_gate_deviation = None
+        self._basis_gate_waited_seconds = 0.0
+        self._basis_gate_state = "open"
         warnings: list[str] = []
         blocked_leg = (
             "primary"
@@ -1235,6 +1469,13 @@ class TimedHedgedVolumeStrategy:
             if not hedge_available:
                 self._warn(warnings, "Extended 侧不可用，对冲互锁跳过新开仓")
                 return self._result("interlocked", primary_size, hedge_size, warnings)
+            if not await self._basis_gate_allows_open(current_time):
+                return self._result(
+                    "basis_waiting",
+                    primary_size,
+                    hedge_size,
+                    warnings,
+                )
             return await self._open_round(current_time, warnings, limits)
         except _LegAuthFailure as exc:
             reloaded = await self._try_reload_leg(exc.leg, warnings)

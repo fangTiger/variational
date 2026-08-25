@@ -126,6 +126,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="空闲状态检查与心跳间隔秒数（默认 30）",
     )
     parser.add_argument(
+        "--basis-gate-sigma",
+        type=Decimal,
+        default=Decimal("0"),
+        help="开仓基差相对偏离门限的标准差倍数；0 关闭（默认 0）",
+    )
+    parser.add_argument(
+        "--basis-gate-max-wait",
+        type=float,
+        default=1800.0,
+        help="基差门控最长等待秒数，达到后强制开仓（默认 1800）",
+    )
+    parser.add_argument(
         "--position-tolerance",
         type=Decimal,
         default=Decimal("0.000001"),
@@ -556,7 +568,10 @@ def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
             if ledger_path == ""
             else Path(ledger_path)
         ),
+        heartbeat_path=Path(args.heartbeat_path),
         instance=_instance_from_heartbeat(args.heartbeat_path),
+        basis_gate_sigma=args.basis_gate_sigma,
+        basis_gate_max_wait_s=args.basis_gate_max_wait,
     )
 
 
@@ -596,6 +611,8 @@ def startup_summary(
         f"单边名义额区间：{args.notional_min}~{args.notional_max} USD",
         f"初始方向：{args.initial_direction}",
         f"maker 优先等待：{args.maker_timeout:g} 秒",
+        f"基差门控：{args.basis_gate_sigma} 倍标准差",
+        f"基差门控最长等待：{args.basis_gate_max_wait:g} 秒",
         f"轮次状态：{args.state_path}",
         f"独立心跳：{args.heartbeat_path}",
         f"权益快照：{effective_equity_path}",
@@ -633,6 +650,9 @@ def heartbeat_payload(
         "primary_entry": decimal_text(result.primary_entry),
         "hedge_entry": decimal_text(result.hedge_entry),
         "pair_pnl": decimal_text(result.pair_pnl),
+        "basis_gate_deviation": decimal_text(result.basis_gate_deviation),
+        "basis_gate_waited_seconds": result.basis_gate_waited_seconds,
+        "basis_gate_state": result.basis_gate_state,
         "hedge_available": result.hedge_available,
         "hedge_interlock_active": not result.hedge_available,
         "hedge_interlock_reason": result.interlock_reason,
@@ -665,12 +685,14 @@ async def run_loop(
         except Exception as exc:  # noqa: BLE001 心跳失败不得中断风险收敛
             logger.error("定时策略心跳写入失败（不停止收敛）：%s", exc)
         logger.info(
-            "定时轮次动作=%s，轮次=%d，方向=%s，到期=%s，净敞口=%s，互锁=%s",
+            "定时轮次动作=%s，轮次=%d，方向=%s，到期=%s，净敞口=%s，"
+            "基差门控=%s，互锁=%s",
             result.action,
             result.round_index,
             result.direction.value if result.direction is not None else "无",
             result.due_at,
             result.net_exposure,
+            result.basis_gate_state,
             result.interlock_reason,
         )
         if result.action == "closed":

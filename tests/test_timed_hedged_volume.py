@@ -323,7 +323,10 @@ def _build_strategy(
     on_hedge_auth_error=None,
     equity_path=None,
     ledger_path=None,
+    heartbeat_path=None,
     instance="test_instance",
+    basis_gate_sigma: Decimal = Decimal("0"),
+    basis_gate_max_wait_s: float = 1800.0,
 ):
     api = _api()
     lighter = lighter or _LighterAdapter("lighter")
@@ -341,7 +344,10 @@ def _build_strategy(
         state_path=tmp_path / state_name,
         equity_path=equity_path,
         ledger_path=ledger_path,
+        heartbeat_path=heartbeat_path,
         instance=instance,
+        basis_gate_sigma=basis_gate_sigma,
+        basis_gate_max_wait_s=basis_gate_max_wait_s,
     )
     strategy = api.TimedHedgedVolumeStrategy(
         lighter,
@@ -354,6 +360,44 @@ def _build_strategy(
         on_hedge_auth_error=on_hedge_auth_error,
     )
     return api, strategy, lighter, extended
+
+
+_HIGH_VARIANCE_BASIS_HISTORY = (
+    Decimal("-0.12"),
+    Decimal("-0.08"),
+    Decimal("-0.04"),
+    Decimal("0"),
+    Decimal("0.04"),
+    Decimal("0.08"),
+    Decimal("0.12"),
+)
+
+
+def _write_basis_history(
+    path,
+    values: tuple[Decimal, ...],
+    *,
+    heartbeat: bool = False,
+) -> None:
+    """写入测试专用基差历史，并区分台账与心跳格式。"""
+    rows = [
+        (
+            {
+                "action": "opened",
+                "entry_basis_pct": str(value),
+            }
+            if heartbeat
+            else {
+                "instance": "test_instance",
+                "entry_basis_pct": str(value),
+            }
+        )
+        for value in values
+    ]
+    path.write_text(
+        "".join(f"{json.dumps(row, ensure_ascii=False)}\n" for row in rows),
+        encoding="utf-8",
+    )
 
 
 class _LedgerLighter(_LighterAdapter):
@@ -771,6 +815,310 @@ def test_missing_ledger_path_preserves_existing_behavior(tmp_path) -> None:
     assert hedge.fill_reads == 0
     state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
     assert not any(key.startswith("ledger_") for key in state)
+
+
+def test_basis_gate_waits_when_relative_deviation_exceeds_threshold(
+    tmp_path,
+) -> None:
+    """相对偏离超过 1.5 倍标准差时不得调用执行器。"""
+    ledger_path = tmp_path / "basis_ledger.jsonl"
+    _write_basis_history(ledger_path, _HIGH_VARIANCE_BASIS_HISTORY)
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100160")),
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100000")),
+        executor=executor,
+        ledger_path=ledger_path,
+        basis_gate_sigma=Decimal("1.5"),
+    )
+
+    _, standard_deviation = strategy._basis_statistics(
+        list(_HIGH_VARIANCE_BASIS_HISTORY)
+    )
+    result = asyncio.run(strategy.run_once(now=100.0))
+
+    assert standard_deviation == Decimal("0.08")
+    assert result.action == "basis_waiting"
+    assert result.basis_gate_state == "waiting"
+    assert result.basis_gate_deviation == Decimal("0.16")
+    assert result.basis_gate_waited_seconds == 0.0
+    assert strategy.state.basis_gate_wait_started_at == 100.0
+    assert executor.calls == []
+
+
+def test_basis_gate_opens_after_deviation_returns_inside_threshold(tmp_path) -> None:
+    """等待中的偏离回到 1.5 倍标准差内后应正常开仓。"""
+    ledger_path = tmp_path / "basis_ledger.jsonl"
+    _write_basis_history(ledger_path, _HIGH_VARIANCE_BASIS_HISTORY)
+    lighter = _LedgerLighter(mid_price=Decimal("100160"))
+    executor = _ScriptedExecutor()
+    _, strategy, _, hedge = _build_strategy(
+        tmp_path,
+        lighter=lighter,
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100000")),
+        executor=executor,
+        ledger_path=ledger_path,
+        basis_gate_sigma=Decimal("1.5"),
+    )
+
+    waiting = asyncio.run(strategy.run_once(now=100.0))
+    assert executor.calls == []
+    lighter.mid_price = Decimal("100080")
+    opened = asyncio.run(strategy.run_once(now=130.0))
+
+    _, standard_deviation = strategy._basis_statistics(
+        list(_HIGH_VARIANCE_BASIS_HISTORY)
+    )
+    assert standard_deviation == Decimal("0.08")
+    assert waiting.action == "basis_waiting"
+    assert executor.calls
+    assert opened.action == "opened"
+    assert opened.basis_gate_state == "open"
+    assert opened.basis_gate_deviation == Decimal("0.08")
+    assert opened.basis_gate_waited_seconds == 30.0
+    assert strategy.state.basis_gate_wait_started_at is None
+    assert lighter.position == -hedge.position != 0
+
+
+def test_basis_gate_forces_open_after_max_wait(tmp_path) -> None:
+    """异常基差累计等待达到上限后应强制开仓并标记 forced。"""
+    ledger_path = tmp_path / "basis_ledger.jsonl"
+    _write_basis_history(ledger_path, _HIGH_VARIANCE_BASIS_HISTORY)
+    executor = _ScriptedExecutor()
+    _, strategy, lighter, hedge = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100160")),
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100000")),
+        executor=executor,
+        ledger_path=ledger_path,
+        basis_gate_sigma=Decimal("1.5"),
+        basis_gate_max_wait_s=60.0,
+    )
+
+    waiting = asyncio.run(strategy.run_once(now=100.0))
+    assert executor.calls == []
+    forced = asyncio.run(strategy.run_once(now=160.0))
+
+    _, standard_deviation = strategy._basis_statistics(
+        list(_HIGH_VARIANCE_BASIS_HISTORY)
+    )
+    assert standard_deviation == Decimal("0.08")
+    assert waiting.action == "basis_waiting"
+    assert forced.action == "opened"
+    assert forced.basis_gate_state == "forced"
+    assert forced.basis_gate_deviation == Decimal("0.16")
+    assert forced.basis_gate_waited_seconds == 60.0
+    assert strategy.state.basis_gate_wait_started_at is None
+    assert executor.calls
+    assert lighter.position == -hedge.position != 0
+
+
+def test_basis_gate_allows_low_standard_deviation_history(tmp_path) -> None:
+    """结构性持久基差的历史波动低于下限时应直接放行。"""
+    low_variance_history = (
+        Decimal("0.104"),
+        Decimal("0.114"),
+        Decimal("0.124"),
+        Decimal("0.134"),
+        Decimal("0.144"),
+    )
+    ledger_path = tmp_path / "basis_ledger.jsonl"
+    _write_basis_history(ledger_path, low_variance_history)
+    executor = _ScriptedExecutor()
+    api, strategy, lighter, hedge = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100400")),
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100000")),
+        executor=executor,
+        ledger_path=ledger_path,
+        basis_gate_sigma=Decimal("1.5"),
+    )
+
+    _, standard_deviation = strategy._basis_statistics(list(low_variance_history))
+    result = asyncio.run(strategy.run_once(now=100.0))
+
+    assert standard_deviation == Decimal("0.0002").sqrt()
+    assert standard_deviation < api.BASIS_GATE_STD_FLOOR_PCT
+    assert abs(Decimal("0.4") - Decimal("0.124")) > (
+        strategy.config.basis_gate_sigma * standard_deviation
+    )
+    assert result.action == "opened"
+    assert result.basis_gate_state == "open"
+    assert result.basis_gate_deviation == Decimal("0.276")
+    assert executor.calls
+    assert lighter.position == -hedge.position != 0
+
+
+def test_basis_gate_allows_insufficient_history(tmp_path) -> None:
+    """历史样本少于最小数量时即使偏离很大也应直接放行。"""
+    insufficient_history = (
+        Decimal("-0.12"),
+        Decimal("-0.04"),
+        Decimal("0.04"),
+        Decimal("0.12"),
+    )
+    ledger_path = tmp_path / "basis_ledger.jsonl"
+    _write_basis_history(ledger_path, insufficient_history)
+    executor = _ScriptedExecutor()
+    api, strategy, lighter, hedge = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100200")),
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100000")),
+        executor=executor,
+        ledger_path=ledger_path,
+        basis_gate_sigma=Decimal("1.5"),
+    )
+
+    _, standard_deviation = strategy._basis_statistics(list(insufficient_history))
+    result = asyncio.run(strategy.run_once(now=100.0))
+
+    assert len(insufficient_history) == api.BASIS_GATE_MIN_HISTORY - 1
+    assert standard_deviation == Decimal("0.008").sqrt()
+    assert standard_deviation > api.BASIS_GATE_STD_FLOOR_PCT
+    assert Decimal("0.2") > strategy.config.basis_gate_sigma * standard_deviation
+    assert result.action == "opened"
+    assert result.basis_gate_state == "open"
+    assert result.basis_gate_deviation is None
+    assert executor.calls
+    assert lighter.position == -hedge.position != 0
+
+
+def test_basis_gate_falls_back_to_heartbeat_when_ledger_is_missing(
+    tmp_path,
+) -> None:
+    """台账文件不存在时应从心跳读取足量开仓基差。"""
+    ledger_path = tmp_path / "missing_ledger.jsonl"
+    heartbeat_path = tmp_path / "heartbeat.jsonl"
+    _write_basis_history(
+        heartbeat_path,
+        _HIGH_VARIANCE_BASIS_HISTORY,
+        heartbeat=True,
+    )
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100160")),
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100000")),
+        executor=executor,
+        ledger_path=ledger_path,
+        heartbeat_path=heartbeat_path,
+        basis_gate_sigma=Decimal("1.5"),
+    )
+
+    history = strategy._read_basis_history()
+    _, standard_deviation = strategy._basis_statistics(history)
+    result = asyncio.run(strategy.run_once(now=100.0))
+
+    assert not ledger_path.exists()
+    assert history == list(_HIGH_VARIANCE_BASIS_HISTORY)
+    assert standard_deviation == Decimal("0.08")
+    assert result.action == "basis_waiting"
+    assert result.basis_gate_state == "waiting"
+    assert result.basis_gate_deviation == Decimal("0.16")
+    assert executor.calls == []
+
+
+def test_zero_basis_gate_sigma_matches_disabled_gate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """sigma 为零时不读取门控历史，开仓结果与未配置历史完全一致。"""
+    heartbeat_path = tmp_path / "heartbeat.jsonl"
+    _write_basis_history(
+        heartbeat_path,
+        _HIGH_VARIANCE_BASIS_HISTORY,
+        heartbeat=True,
+    )
+    baseline_executor = _ScriptedExecutor()
+    _, baseline, baseline_lighter, baseline_hedge = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100160")),
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100000")),
+        executor=baseline_executor,
+        state_name="baseline_state.json",
+    )
+    disabled_executor = _ScriptedExecutor()
+    _, disabled, disabled_lighter, disabled_hedge = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100160")),
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100000")),
+        executor=disabled_executor,
+        state_name="disabled_state.json",
+        heartbeat_path=heartbeat_path,
+        basis_gate_sigma=Decimal("0"),
+    )
+    disabled.state.basis_gate_wait_started_at = 50.0
+    disabled._save_state()
+
+    def fail_if_history_is_read():
+        raise AssertionError("sigma 为零时不得读取基差历史")
+
+    monkeypatch.setattr(disabled, "_read_basis_history", fail_if_history_is_read)
+    _, standard_deviation = baseline._basis_statistics(
+        list(_HIGH_VARIANCE_BASIS_HISTORY)
+    )
+    baseline_result = asyncio.run(baseline.run_once(now=100.0))
+    disabled_result = asyncio.run(disabled.run_once(now=100.0))
+
+    assert standard_deviation == Decimal("0.08")
+    assert disabled_result == baseline_result
+    assert disabled_executor.calls == baseline_executor.calls
+    assert disabled_lighter.position == baseline_lighter.position
+    assert disabled_hedge.position == baseline_hedge.position
+    assert disabled.state.basis_gate_wait_started_at is None
+
+
+def test_basis_gate_wait_does_not_block_expired_position_close(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """门控已进入等待时，后来发现的到期持仓仍必须优先平仓。"""
+    heartbeat_path = tmp_path / "heartbeat.jsonl"
+    _write_basis_history(
+        heartbeat_path,
+        _HIGH_VARIANCE_BASIS_HISTORY,
+        heartbeat=True,
+    )
+    executor = _ScriptedExecutor()
+    api, strategy, lighter, hedge = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100160")),
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100000")),
+        executor=executor,
+        heartbeat_path=heartbeat_path,
+        basis_gate_sigma=Decimal("1.5"),
+    )
+
+    waiting = asyncio.run(strategy.run_once(now=100.0))
+    lighter.position = Decimal("0.020")
+    hedge.position = Decimal("-0.020")
+    strategy.state.round_index = 1
+    strategy.state.current_direction = api.RoundDirection.LONG
+    strategy.state.current_notional_usd = 2000
+    strategy.state.opened_at = 100.0
+    strategy.state.due_at = 200.0
+    strategy._save_state()
+
+    async def fail_if_gate_is_evaluated(now: float):
+        del now
+        raise AssertionError("到期平仓不得评估开仓基差门控")
+
+    monkeypatch.setattr(strategy, "_basis_gate_allows_open", fail_if_gate_is_evaluated)
+    closed = asyncio.run(strategy.run_once(now=200.0))
+
+    _, standard_deviation = strategy._basis_statistics(
+        list(_HIGH_VARIANCE_BASIS_HISTORY)
+    )
+    assert standard_deviation == Decimal("0.08")
+    assert waiting.action == "basis_waiting"
+    assert waiting.basis_gate_state == "waiting"
+    assert waiting.basis_gate_deviation == Decimal("0.16")
+    assert closed.action == "closed"
+    assert closed.basis_gate_deviation is None
+    assert [call["reduce_only"] for call in executor.calls] == [True, True]
+    assert lighter.position == 0
+    assert hedge.position == 0
 
 
 def test_primary_auth_error_reloads_client_and_skips_round(tmp_path) -> None:

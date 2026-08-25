@@ -36,6 +36,8 @@ def test_parser_defaults_match_two_hour_randomized_notional_plan() -> None:
     assert args.notional_max == 2300
     assert args.initial_direction == "long"
     assert args.maker_timeout == 300.0
+    assert args.basis_gate_sigma == Decimal("0")
+    assert args.basis_gate_max_wait == 1800.0
     assert args.primary_venue == "lighter"
     assert args.hedge_env_prefix == "HYPERLIQUID"
     assert config.cycle_seconds == 7200.0
@@ -43,6 +45,8 @@ def test_parser_defaults_match_two_hour_randomized_notional_plan() -> None:
     assert config.notional_max_usd == 2300
     assert config.initial_direction is RoundDirection.LONG
     assert config.maker_timeout_s == 300.0
+    assert config.basis_gate_sigma == Decimal("0")
+    assert config.basis_gate_max_wait_s == 1800.0
     assert config.equity_path == cli._DEFAULT_HEARTBEAT.with_name(
         "timed_volume_equity.jsonl"
     )
@@ -553,6 +557,9 @@ def test_heartbeat_contains_round_direction_due_net_and_interlock() -> None:
         primary_entry=Decimal("77299.300000000000000001"),
         hedge_entry=Decimal("77301.1"),
         pair_pnl=Decimal("-1.240000000000000001"),
+        basis_gate_deviation=Decimal("0.0712"),
+        basis_gate_waited_seconds=45.5,
+        basis_gate_state="waiting",
     )
 
     payload = cli.heartbeat_payload(result, now=1234.5)
@@ -571,6 +578,9 @@ def test_heartbeat_contains_round_direction_due_net_and_interlock() -> None:
         "primary_entry": "77299.300000000000000001",
         "hedge_entry": "77301.1",
         "pair_pnl": "-1.240000000000000001",
+        "basis_gate_deviation": "0.0712",
+        "basis_gate_waited_seconds": 45.5,
+        "basis_gate_state": "waiting",
         "hedge_available": False,
         "hedge_interlock_active": True,
         "hedge_interlock_reason": "Extended 侧不可用",
