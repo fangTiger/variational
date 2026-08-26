@@ -45,14 +45,14 @@ case "$instance" in
             --hedge-venue hyperliquid
             --hedge-env-prefix HYPERLIQUID_VAR
             --hedge-market io:SNDK
-            --notional-min 1000
-            --notional-max 1500
-            --cycle-hours 4
+            --notional-min 1500
+            --notional-max 2000
+            --cycle-hours 8
             --initial-direction long
             --maker-timeout 30
             --poll-interval 10
             --basis-gate-sigma 1.5
-            # 4 小时周期下等待的机会成本极低，放宽到 30 分钟换更好的入场基差；
+            # 8 小时周期下等待的机会成本极低，放宽到 30 分钟换更好的入场基差；
             # 此前 240 秒是为配合 10 分钟验证周期才压低的。
             --basis-gate-max-wait 1800
             --state-path data/timed_volume_sndk/state.json
@@ -69,9 +69,9 @@ case "$instance" in
             --market BTC
             --hedge-venue variational
             --hedge-market BTC
-            --notional-min 2500
-            --notional-max 3000
-            --cycle-hours 4
+            --notional-min 3500
+            --notional-max 4000
+            --cycle-hours 8
             --initial-direction long
             --maker-timeout 300
             --poll-interval 30
