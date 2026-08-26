@@ -47,6 +47,11 @@ class VolumeInstanceConfig:
     symbol: str
     primary_source: str
     hedge_source: str
+    #: 对冲腿在其所属场馆的真实标的名。HL 的 HIP-3 dex 会给成交记录里的
+    #: ``coin`` 加 dex 前缀（如 ``io:SNDK``），与主腿的 ``SNDK`` 不是同一个
+    #: 字符串；两者混用会让该腿累计成交量恒为 0，且不报错——2026-08-26
+    #: 就是这样漏掉了赚 Entropy 积分的整条 io:SNDK 腿。留空表示与主腿同名。
+    hedge_symbol: str | None = None
 
 
 #: ⚠️ 必须与实际启动参数一致（标的、心跳路径、两腿来源）。
@@ -58,6 +63,7 @@ DEFAULT_VOLUME_INSTANCES = (
         symbol="SNDK",
         primary_source="variational",
         hedge_source="hyperliquid_var",
+        hedge_symbol="io:SNDK",
     ),
     VolumeInstanceConfig(
         key="lighter_variational_btc",
@@ -853,14 +859,23 @@ async def collect_volume_snapshot(
         except (OSError, ValueError) as exc:
             errors[f"{config.key}|heartbeat"] = f"{type(exc).__name__}: {exc}"
             continue
+        try:
+            hedge_symbol = (
+                _symbol(config.hedge_symbol, label=f"实例 {config.key} 对冲腿币种")
+                if config.hedge_symbol is not None
+                else symbol
+            )
+        except ValueError as exc:
+            errors[f"{config.key}|heartbeat"] = f"{type(exc).__name__}: {exc}"
+            continue
         starts[config.key] = since
         symbols[config.key] = symbol
         decimal_instances[config.key] = {}
-        for leg, source in (
-            ("primary", config.primary_source),
-            ("hedge", config.hedge_source),
+        for leg, source, leg_symbol in (
+            ("primary", config.primary_source, symbol),
+            ("hedge", config.hedge_source, hedge_symbol),
         ):
-            jobs.append((config.key, leg, source, since, symbol))
+            jobs.append((config.key, leg, source, since, leg_symbol))
 
     results = await asyncio.gather(
         *(read_leg(source, since, symbol) for _, _, source, since, symbol in jobs),
