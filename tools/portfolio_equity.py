@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "portfolio_equity.jsonl"
 DEFAULT_VOLUME_OUTPUT = PROJECT_ROOT / "data" / "portfolio_volume.jsonl"
 DEFAULT_INTERVAL_SECONDS = 900.0
-PORTFOLIO_SCHEMA = 5
+PORTFOLIO_SCHEMA = 6
 ACCOUNT_SOURCES = {
     "lighter": "platform",
     "hyperliquid": "platform",
@@ -472,8 +472,18 @@ async def read_variational_volume(
         )
 
 
-async def read_variational_pnl(fetch_page: VariationalPageReader) -> Decimal:
-    """翻页汇总 Variational 平台流水盈亏，并排除充值与提现。"""
+async def read_variational_pnl(
+    fetch_page: VariationalPageReader,
+    unrealized: Decimal = Decimal("0"),
+) -> Decimal:
+    """翻页汇总 Variational 平台流水盈亏，排除充值与提现，并叠加当前未实现。
+
+    ⚠️ ``unrealized`` 必须传入，口径才与另外两个平台一致。实测确认
+    Hyperliquid 的 ``allTime`` 与 Lighter 的 ``trade_pnl`` **都含未实现盈亏**
+    （无成交时数值随价格漂移）。而 ``/transfers`` 流水只记已实现，
+    若不补上未实现，持仓期间对冲两腿的浮动就无法相互抵消——
+    2026-08-26 就因此把 6 小时内的盈亏显示成 +$14.36，实际台账是 -$0.29。
+    """
     pnl_types = {"realized_pnl", "funding", "fee", "referral_reward"}
     cash_types = {"deposit", "withdrawal"}
     known_types = pnl_types | cash_types
@@ -521,7 +531,7 @@ async def read_variational_pnl(fetch_page: VariationalPageReader) -> Decimal:
 
         fetched_count += len(result)
         if object_count is not None and fetched_count >= object_count:
-            return total
+            return total + unrealized
         if not result:
             raise ValueError("Variational 流水未取满总数，分页无法继续推进")
         offset += limit
@@ -728,7 +738,9 @@ async def _read_variational_pnl_from_env(
         return await client.raw(f"/transfers?limit={limit}&offset={offset}")
 
     try:
-        return await read_variational_pnl(fetch_page)
+        balance = await client.get_balance()
+        unrealized = _decimal(balance.upnl, label="Variational 未实现盈亏")
+        return await read_variational_pnl(fetch_page, unrealized)
     finally:
         await client.close()
 

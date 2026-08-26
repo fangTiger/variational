@@ -302,10 +302,10 @@ def test_variational_pnl_paginates_by_one_hundred_until_all_rows_are_read() -> N
     assert pnl == Decimal("205")
 
 
-def test_variational_pnl_uses_platform_source_and_schema_five() -> None:
+def test_variational_pnl_uses_platform_source_and_current_schema() -> None:
     """Variational 切换平台流水口径后必须启用独立的新基准分组。"""
     assert portfolio_equity.ACCOUNT_SOURCES["variational"] == "platform"
-    assert portfolio_equity.PORTFOLIO_SCHEMA == 5
+    assert portfolio_equity.PORTFOLIO_SCHEMA == 6
 
 
 def test_strategy_symbols_are_derived_from_volume_instance_configs() -> None:
@@ -369,7 +369,7 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
 
     written = json.loads(output.read_text(encoding="utf-8"))
     assert snapshot == written
-    assert written["schema"] == 5
+    assert written["schema"] == 6
     assert written["symbols"]["lighter"] == list(expected["lighter"])
     assert written["accounts"] == {
         "lighter": "561.49",
@@ -870,3 +870,29 @@ def test_lighter_pnl_window_is_bounded() -> None:
     window_days = portfolio_equity.LIGHTER_PNL_WINDOW_MS / (24 * 60 * 60 * 1000)
 
     assert 0 < window_days <= 7, "窗口需落在接口允许的范围内"
+
+
+def test_variational_pnl_adds_unrealized_to_match_other_platforms() -> None:
+    """Variational 必须叠加未实现，否则与另外两个平台口径不一致。
+
+    实测确认 Hyperliquid 的 allTime 与 Lighter 的 trade_pnl 都含未实现
+    （无成交时随价格漂移）。若 Variational 只报已实现，持仓期间对冲两腿
+    的浮动无法相互抵消，会凭空显示出盈利——2026-08-26 实际发生过。
+    """
+
+    async def fetch_page(limit: int | None, offset: int | None) -> object:
+        return {
+            "pagination": {"object_count": 2},
+            "result": [
+                {"transfer_type": "realized_pnl", "qty": "10", "asset": "USDC"},
+                {"transfer_type": "deposit", "qty": "500", "asset": "USDC"},
+            ],
+        }
+
+    without = asyncio.run(portfolio_equity.read_variational_pnl(fetch_page))
+    assert without == Decimal("10"), "充值必须被排除"
+
+    with_upnl = asyncio.run(
+        portfolio_equity.read_variational_pnl(fetch_page, Decimal("-3.5"))
+    )
+    assert with_upnl == Decimal("6.5"), "未实现必须叠加进累计盈亏"
