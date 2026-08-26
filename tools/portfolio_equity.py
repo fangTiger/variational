@@ -24,12 +24,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "portfolio_equity.jsonl"
 DEFAULT_VOLUME_OUTPUT = PROJECT_ROOT / "data" / "portfolio_volume.jsonl"
 DEFAULT_INTERVAL_SECONDS = 900.0
-PORTFOLIO_SCHEMA = 4
+PORTFOLIO_SCHEMA = 5
 ACCOUNT_SOURCES = {
     "lighter": "platform",
     "hyperliquid": "platform",
     "hyperliquid_var": "platform",
-    "variational": "computed",
+    "variational": "platform",
 }
 
 EquityReader = Callable[[tuple[str, ...]], Awaitable[Decimal]]
@@ -472,6 +472,61 @@ async def read_variational_volume(
         )
 
 
+async def read_variational_pnl(fetch_page: VariationalPageReader) -> Decimal:
+    """翻页汇总 Variational 平台流水盈亏，并排除充值与提现。"""
+    pnl_types = {"realized_pnl", "funding", "fee", "referral_reward"}
+    cash_types = {"deposit", "withdrawal"}
+    known_types = pnl_types | cash_types
+    limit = 100
+    offset = 0
+    fetched_count = 0
+    object_count: int | None = None
+    total = Decimal("0")
+
+    while True:
+        payload = await fetch_page(limit, offset)
+        if not isinstance(payload, Mapping):
+            raise ValueError("Variational 流水响应不是对象")
+        result = payload.get("result")
+        pagination = payload.get("pagination")
+        if not isinstance(result, list):
+            raise ValueError("Variational 流水响应缺少 result 数组")
+        if not isinstance(pagination, Mapping):
+            raise ValueError("Variational 流水响应缺少 pagination 对象")
+
+        current_object_count = _integer(
+            pagination.get("object_count"),
+            label="Variational 流水总数",
+        )
+        if object_count is None:
+            object_count = current_object_count
+        elif current_object_count != object_count:
+            object_count = max(object_count, current_object_count)
+
+        for index, transfer in enumerate(result):
+            if not isinstance(transfer, Mapping):
+                raise ValueError(f"Variational 第 {index + 1} 条流水不是对象")
+            transfer_type = transfer.get("transfer_type")
+            if not isinstance(transfer_type, str) or transfer_type not in known_types:
+                raise ValueError(f"Variational 未知流水类型：{transfer_type}")
+            asset = transfer.get("asset")
+            if asset != "USDC":
+                raise ValueError(f"Variational 流水资产仅支持 USDC，实际为：{asset}")
+            quantity = _decimal(
+                transfer.get("qty"),
+                label=f"Variational {transfer_type} 流水数量",
+            )
+            if transfer_type in pnl_types:
+                total += quantity
+
+        fetched_count += len(result)
+        if object_count is not None and fetched_count >= object_count:
+            return total
+        if not result:
+            raise ValueError("Variational 流水未取满总数，分页无法继续推进")
+        offset += limit
+
+
 async def read_lighter_equity(
     client: Any,
     symbols: Sequence[str],
@@ -661,13 +716,19 @@ async def _read_lighter_volume_from_env(
         await client.close()
 
 
-async def _read_variational_from_env(symbols: tuple[str, ...]) -> Decimal:
-    """用只读 Variational 客户端采集默认实盘账户。"""
+async def _read_variational_pnl_from_env(
+    _symbols: tuple[str, ...],
+) -> Decimal:
+    """用只读 Variational 会话采集平台累计盈亏流水。"""
     from adapters.variational_client import Session, VariationalClient
 
     client = VariationalClient(Session.from_env())
+
+    async def fetch_page(limit: int | None, offset: int | None) -> object:
+        return await client.raw(f"/transfers?limit={limit}&offset={offset}")
+
     try:
-        return await read_variational_equity(client, symbols)
+        return await read_variational_pnl(fetch_page)
     finally:
         await client.close()
 
@@ -754,7 +815,7 @@ def build_default_readers(
     """创建四个账户互相隔离的默认只读采集函数。"""
     return {
         "lighter": _read_lighter_from_env,
-        "variational": _read_variational_from_env,
+        "variational": _read_variational_pnl_from_env,
         "hyperliquid": _hyperliquid_reader(hyperliquid_prefix),
         "hyperliquid_var": _hyperliquid_reader(hyperliquid_var_prefix),
     }
@@ -804,9 +865,8 @@ async def collect_snapshot(
         accounts[name] = _decimal_text(result)
 
     snapshot: dict[str, object] = {
-        # schema 4：Lighter 与 Hyperliquid 改用平台累计盈亏；Variational
-        # 保留 balance 减非策略币种未实现的本地计算口径。绝对值口径不同，
-        # 因此不再相加；面板按账户分别做最新值减首条值后再汇总。
+        # schema 5：Variational 从账户权益切换为剔除出入金的平台累计盈亏。
+        # 面板按 schema 独立建立首条基准，避免与旧权益口径混算。
         "schema": PORTFOLIO_SCHEMA,
         "ts": time.time() if timestamp is None else timestamp,
         "accounts": accounts,

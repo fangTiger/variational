@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass
 from decimal import Decimal
 
+import pytest
+
 from tools import portfolio_equity
 
 
@@ -224,6 +226,88 @@ def test_variational_equity_excludes_manual_symbol_without_float_conversion() ->
     assert equity != Decimal("552.340000000000000001"), "不得忽略人工币种"
 
 
+def test_variational_pnl_excludes_deposits_and_withdrawals() -> None:
+    """累计盈亏只包含交易流水，充值和提现不得改变面板盈利。"""
+
+    async def fetch_page(limit: int | None, offset: int | None) -> object:
+        assert (limit, offset) == (100, 0)
+        return {
+            "pagination": {"object_count": 6, "next_page": None},
+            "result": [
+                {"transfer_type": "realized_pnl", "qty": "12.5", "asset": "USDC"},
+                {"transfer_type": "funding", "qty": "-1.25", "asset": "USDC"},
+                {"transfer_type": "fee", "qty": "-0.5", "asset": "USDC"},
+                {"transfer_type": "referral_reward", "qty": "0.25", "asset": "USDC"},
+                {"transfer_type": "deposit", "qty": "228.20", "asset": "USDC"},
+                {"transfer_type": "withdrawal", "qty": "-50", "asset": "USDC"},
+            ],
+        }
+
+    pnl = asyncio.run(portfolio_equity.read_variational_pnl(fetch_page))
+
+    assert pnl == Decimal("11.00")
+    assert pnl != Decimal("189.20"), "出入金不得计入累计盈亏"
+
+
+def test_variational_pnl_rejects_unknown_transfer_type_with_its_name() -> None:
+    """平台新增流水类型时必须显式失败，避免盈亏悄悄漏算。"""
+
+    async def fetch_page(limit: int | None, offset: int | None) -> object:
+        return {
+            "pagination": {"object_count": 1, "next_page": None},
+            "result": [
+                {"transfer_type": "insurance_rebate", "qty": "1", "asset": "USDC"}
+            ],
+        }
+
+    with pytest.raises(ValueError, match="insurance_rebate"):
+        asyncio.run(portfolio_equity.read_variational_pnl(fetch_page))
+
+
+def test_variational_pnl_rejects_non_usdc_asset() -> None:
+    """暂不支持的流水资产必须显式失败，避免跨币种直接相加。"""
+
+    async def fetch_page(limit: int | None, offset: int | None) -> object:
+        return {
+            "pagination": {"object_count": 1, "next_page": None},
+            "result": [
+                {"transfer_type": "realized_pnl", "qty": "1", "asset": "USDT"}
+            ],
+        }
+
+    with pytest.raises(ValueError, match="USDT"):
+        asyncio.run(portfolio_equity.read_variational_pnl(fetch_page))
+
+
+def test_variational_pnl_paginates_by_one_hundred_until_all_rows_are_read() -> None:
+    """流水超过单页上限时必须按 offset 继续取满 object_count。"""
+    transfers = [
+        {"transfer_type": "realized_pnl", "qty": "1", "asset": "USDC"}
+        for _ in range(205)
+    ]
+    calls: list[tuple[int | None, int | None]] = []
+
+    async def fetch_page(limit: int | None, offset: int | None) -> object:
+        calls.append((limit, offset))
+        assert limit == 100
+        assert offset is not None
+        return {
+            "pagination": {"object_count": len(transfers), "next_page": None},
+            "result": transfers[offset : offset + limit],
+        }
+
+    pnl = asyncio.run(portfolio_equity.read_variational_pnl(fetch_page))
+
+    assert calls == [(100, 0), (100, 100), (100, 200)]
+    assert pnl == Decimal("205")
+
+
+def test_variational_pnl_uses_platform_source_and_schema_five() -> None:
+    """Variational 切换平台流水口径后必须启用独立的新基准分组。"""
+    assert portfolio_equity.ACCOUNT_SOURCES["variational"] == "platform"
+    assert portfolio_equity.PORTFOLIO_SCHEMA == 5
+
+
 def test_strategy_symbols_are_derived_from_volume_instance_configs() -> None:
     """账户币种集合必须随成交量实例配置变化，不维护第二份固定表。"""
     instances = (
@@ -285,7 +369,7 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
 
     written = json.loads(output.read_text(encoding="utf-8"))
     assert snapshot == written
-    assert written["schema"] == 4
+    assert written["schema"] == 5
     assert written["symbols"]["lighter"] == list(expected["lighter"])
     assert written["accounts"] == {
         "lighter": "561.49",
@@ -293,7 +377,7 @@ def test_failed_account_is_skipped_annotated_and_record_is_still_written(
     }
     assert written["sources"] == {
         "lighter": "platform",
-        "variational": "computed",
+        "variational": "platform",
         "hyperliquid_var": "platform",
     }
     assert "total_equity" not in written, "不同口径的绝对值不得直接相加"
@@ -317,6 +401,10 @@ def test_cli_defaults_to_fifteen_minutes_and_two_hyperliquid_prefixes() -> None:
         "hyperliquid_var",
         "variational",
     }
+    assert (
+        portfolio_equity.build_default_readers()["variational"]
+        is portfolio_equity._read_variational_pnl_from_env
+    )
 
 
 def test_hyperliquid_volume_filters_start_and_instance_symbol() -> None:
