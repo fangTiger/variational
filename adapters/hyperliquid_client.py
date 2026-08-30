@@ -45,7 +45,8 @@ logger = get_logger("hyperliquid_client")
 
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_MARKET_ORDER_SLIPPAGE = Decimal("0.05")
-DEFAULT_PERP_DEXS = ("", "io")
+# xyz 是 HL 上 fullName 为 "XYZ" 的 builder dex，与 io 共用账户和保证金池。
+DEFAULT_PERP_DEXS = ("", "io", "xyz")
 # Hyperliquid 永续当前按最小 10 USDC 名义额校验，SDK 元数据不返回数量下限。
 MIN_ORDER_NOTIONAL_USD = Decimal("10")
 PERP_MAX_PRICE_DECIMALS = 6

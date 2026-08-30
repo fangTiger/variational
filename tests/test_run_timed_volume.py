@@ -83,7 +83,10 @@ def test_parser_defaults_match_two_hour_randomized_notional_plan() -> None:
     assert args.basis_gate_sigma == Decimal("0")
     assert args.basis_gate_max_wait == 1800.0
     assert args.primary_venue == "lighter"
+    assert args.primary_env_prefix == "HYPERLIQUID"
     assert args.hedge_env_prefix == "HYPERLIQUID"
+    assert args.close_and_exit is False
+    assert cli.build_parser().parse_args(["--close-and-exit"]).close_and_exit is True
     assert config.cycle_seconds == 7200.0
     assert config.notional_min_usd == 2000
     assert config.notional_max_usd == 2300
@@ -179,6 +182,44 @@ def test_build_primary_client_supports_variational(monkeypatch) -> None:
 
     assert isinstance(client, FakeVariational)
     assert captured["session"] is session
+
+
+def test_build_hyperliquid_primary_uses_selected_prefix_and_account(
+    monkeypatch,
+) -> None:
+    """Hyperliquid 主腿按独立前缀装配，并以对应账户地址建立身份。"""
+    cli = _cli()
+    captured = {}
+
+    class FakeHyperliquid:
+        @classmethod
+        def from_env(cls, prefix, *, trading_enabled):
+            captured["prefix"] = prefix
+            captured["trading_enabled"] = trading_enabled
+            return object()
+
+    monkeypatch.setattr(cli, "HyperliquidClient", FakeHyperliquid)
+    monkeypatch.setenv(
+        "HYPERLIQUID_XYZ_ACCOUNT_ADDRESS",
+        "0x1234567890abcdef",
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "--primary-venue",
+            "hyperliquid",
+            "--primary-env-prefix",
+            "HYPERLIQUID_XYZ",
+        ]
+    )
+
+    client = cli._build_primary_client(args)
+
+    assert client is not None
+    assert captured == {
+        "prefix": "HYPERLIQUID_XYZ",
+        "trading_enabled": True,
+    }
+    assert cli._primary_account_identity(args) == "0x1234567890abcdef"
 
 
 def test_build_hyperliquid_hedge_uses_selected_env_prefix(monkeypatch) -> None:
@@ -404,6 +445,48 @@ def test_live_market_lock_allows_same_account_on_different_market(tmp_path) -> N
         btc.release()
 
 
+def test_hyperliquid_io_and_xyz_same_account_do_not_conflict(tmp_path) -> None:
+    """同一 HL 账户的 io:SNDK 与 xyz:SNDK 是不同市场，不得误判重复占用。"""
+    cli = _cli()
+    data_path = tmp_path / "data"
+    account = "0x1234567890abcdef"
+    cli._validate_account_pair(
+        primary_venue="hyperliquid",
+        primary_account=account,
+        primary_market="xyz:SNDK",
+        hedge_venue="hyperliquid",
+        hedge_account=account,
+        hedge_market="io:SNDK",
+    )
+    fingerprint = cli._account_fingerprint(account)
+    io_lease = cli._acquire_state_path_lease(
+        data_path / "io.state.json",
+        legs=[
+            {
+                "venue": "hyperliquid",
+                "account_fingerprint": fingerprint,
+                "market": "io:SNDK",
+            }
+        ],
+        scan_root=data_path,
+    )
+    try:
+        xyz_lease = cli._acquire_state_path_lease(
+            data_path / "xyz.state.json",
+            legs=[
+                {
+                    "venue": "hyperliquid",
+                    "account_fingerprint": fingerprint,
+                    "market": "xyz:SNDK",
+                }
+            ],
+            scan_root=data_path,
+        )
+        xyz_lease.release()
+    finally:
+        io_lease.release()
+
+
 def test_stale_market_lock_does_not_block_live_instance(tmp_path) -> None:
     """PID 已死的跨实例市场锁必须自动忽略。"""
     cli = _cli()
@@ -541,6 +624,28 @@ def test_dry_run_summary_masks_accounts_and_prints_instance_boundaries(
     assert f"轮次状态：{state_path}" in summary
     assert "单边名义额区间：2100~2200 USD" in summary
     assert "周期：3 小时" in summary
+
+
+def test_hyperliquid_primary_summary_prints_venue_and_env_prefix(monkeypatch) -> None:
+    """启动摘要必须同时暴露 Hyperliquid 主腿场馆与凭据前缀。"""
+    cli = _cli()
+    monkeypatch.setenv(
+        "HYPERLIQUID_XYZ_ACCOUNT_ADDRESS",
+        "0x1234567890abcdef",
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "--primary-venue",
+            "hyperliquid",
+            "--primary-env-prefix",
+            "HYPERLIQUID_XYZ",
+        ]
+    )
+
+    summary = cli.startup_summary(args, TimedVolumeState())
+
+    assert "主腿：hyperliquid，账户：0x12…cdef" in summary
+    assert "主腿环境变量前缀：HYPERLIQUID_XYZ" in summary
 
 
 def test_startup_summary_contains_parameters_and_current_round() -> None:
@@ -714,6 +819,205 @@ def test_run_loop_starts_next_round_without_sleep_after_close(
     assert sleeps == [30.0]
 
 
+class _FakeLeg:
+    """带挂单簿的交易腿桩：记录撤单调用，用于锁住「退出前必须撤单」。"""
+
+    def __init__(self, market: str, orders=None) -> None:
+        self.market = market
+        self.orders = list(orders or [])
+        self.cancelled: list[object] = []
+
+    async def get_open_orders(self, market: str):
+        assert market == self.market
+        return list(self.orders)
+
+    async def cancel_order(self, market: str, order_id) -> None:
+        assert market == self.market
+        self.cancelled.append(order_id)
+        self.orders = [o for o in self.orders if getattr(o, "id", None) != order_id]
+
+
+def test_close_and_exit_calls_run_once_only_once_after_success(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
+    """平仓成功后必须直接退出，不能因 continue 再调用一次并打开新轮。"""
+    cli = _cli()
+
+    class FakeStrategy:
+        config = SimpleNamespace(
+            position_tolerance=Decimal("0.000001"),
+            primary_market="io:SNDK",
+            hedge_market="xyz:SNDK",
+        )
+        primary = _FakeLeg("io:SNDK")
+        hedge = _FakeLeg("xyz:SNDK")
+
+        def __init__(self):
+            self.state = TimedVolumeState(
+                round_index=1,
+                current_direction=RoundDirection.LONG,
+                opened_at=100.0,
+                due_at=9999.0,
+            )
+            self.calls = 0
+            self.saved_due_at = []
+
+        def _save_state(self):
+            self.saved_due_at.append(self.state.due_at)
+
+        async def run_once(self):
+            self.calls += 1
+            if self.calls > 1:
+                raise AssertionError("平仓成功后不得再次调用 run_once")
+            assert self.state.due_at == 1000.0
+            self.state.current_direction = None
+            self.state.due_at = None
+            return TimedVolumeResult(
+                action="closed",
+                round_index=1,
+                direction=None,
+                due_at=None,
+                primary_size=Decimal("0"),
+                hedge_size=Decimal("0"),
+                net_exposure=Decimal("0"),
+                hedge_available=True,
+                interlock_reason="两腿已平",
+            )
+
+    monkeypatch.setattr(cli.time, "time", lambda: 1000.0)
+    strategy = FakeStrategy()
+
+    asyncio.run(
+        cli.run_loop(
+            strategy,
+            poll_interval=30.0,
+            heartbeat_path=tmp_path / "heartbeat.jsonl",
+            close_and_exit=True,
+        )
+    )
+
+    assert strategy.calls == 1
+    assert strategy.saved_due_at == [1000.0]
+    assert "平仓退出摘要：主腿持仓=0，对冲腿持仓=0，净敞口=0" in caplog.text
+
+
+def test_close_and_exit_does_not_run_once_when_initially_flat(
+    tmp_path,
+    caplog,
+) -> None:
+    """启动时状态已平应零次推进状态机，避免意外开新轮。"""
+    cli = _cli()
+
+    class FakeStrategy:
+        config = SimpleNamespace(
+            position_tolerance=Decimal("0.000001"),
+            primary_market="io:SNDK",
+            hedge_market="xyz:SNDK",
+        )
+        primary = _FakeLeg("io:SNDK")
+        hedge = _FakeLeg("xyz:SNDK")
+        state = TimedVolumeState()
+        calls = 0
+
+        def _save_state(self):
+            raise AssertionError("已平状态不得改写到期时间")
+
+        async def run_once(self):
+            self.calls += 1
+            raise AssertionError("已平状态不得调用 run_once")
+
+    strategy = FakeStrategy()
+
+    asyncio.run(
+        cli.run_loop(
+            strategy,
+            poll_interval=30.0,
+            heartbeat_path=tmp_path / "heartbeat.jsonl",
+            close_and_exit=True,
+        )
+    )
+
+    assert strategy.calls == 0
+    assert "当前没有进行中的轮次，无需平仓" in caplog.text
+    assert "平仓退出摘要：主腿持仓=0，对冲腿持仓=0，净敞口=0" in caplog.text
+
+
+def test_close_and_exit_retries_failed_close_without_opening_new_round(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """平仓失败与退避状态会继续重试，成功后绝不触达预置的新开仓结果。"""
+    cli = _cli()
+    actions = ["close_failed_neutral", "close_halted", "closed", "opened"]
+
+    class FakeStrategy:
+        config = SimpleNamespace(
+            position_tolerance=Decimal("0.000001"),
+            primary_market="io:SNDK",
+            hedge_market="xyz:SNDK",
+        )
+        primary = _FakeLeg("io:SNDK")
+        hedge = _FakeLeg("xyz:SNDK")
+
+        def __init__(self):
+            self.state = TimedVolumeState(
+                round_index=1,
+                current_direction=RoundDirection.LONG,
+                opened_at=100.0,
+                due_at=9999.0,
+            )
+            self.calls = []
+
+        def _save_state(self):
+            return None
+
+        async def run_once(self):
+            action = actions[len(self.calls)]
+            self.calls.append(action)
+            if action == "closed":
+                self.state.current_direction = None
+                self.state.due_at = None
+                primary_size = hedge_size = net_exposure = Decimal("0")
+            else:
+                primary_size = Decimal("10")
+                hedge_size = Decimal("-10")
+                net_exposure = Decimal("0")
+            return TimedVolumeResult(
+                action=action,
+                round_index=1,
+                direction=self.state.current_direction,
+                due_at=self.state.due_at,
+                primary_size=primary_size,
+                hedge_size=hedge_size,
+                net_exposure=net_exposure,
+                hedge_available=True,
+                interlock_reason="测试状态",
+            )
+
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+    strategy = FakeStrategy()
+
+    asyncio.run(
+        cli.run_loop(
+            strategy,
+            poll_interval=30.0,
+            heartbeat_path=tmp_path / "heartbeat.jsonl",
+            close_and_exit=True,
+        )
+    )
+
+    assert strategy.calls == ["close_failed_neutral", "close_halted", "closed"]
+    assert "opened" not in strategy.calls
+    assert sleeps == [1.0, 30.0]
+
+
 def test_non_live_run_prints_summary_without_constructing_clients(
     monkeypatch,
     capsys,
@@ -811,6 +1115,7 @@ def test_live_run_connects_both_clients_and_closes_them(monkeypatch, tmp_path) -
     assert captured["primary"].closed is True
     assert captured["extended"].closed is True
     assert captured["loop_kwargs"]["poll_interval"] == 30.0
+    assert captured["loop_kwargs"]["close_and_exit"] is False
     assert captured["strategy_kwargs"] == {}
 
 
@@ -1030,7 +1335,13 @@ def test_run_loop_uses_emergency_retry_for_unknown_or_naked_state(
     ]
 
     class FakeStrategy:
-        config = SimpleNamespace(position_tolerance=Decimal("0.000001"))
+        config = SimpleNamespace(
+            position_tolerance=Decimal("0.000001"),
+            primary_market="io:SNDK",
+            hedge_market="xyz:SNDK",
+        )
+        primary = _FakeLeg("io:SNDK")
+        hedge = _FakeLeg("xyz:SNDK")
 
         async def run_once(self):
             return results.pop(0)
@@ -1092,7 +1403,13 @@ def test_heartbeat_write_failure_does_not_stop_safety_convergence(
     ]
 
     class FakeStrategy:
-        config = SimpleNamespace(position_tolerance=Decimal("0.000001"))
+        config = SimpleNamespace(
+            position_tolerance=Decimal("0.000001"),
+            primary_market="io:SNDK",
+            hedge_market="xyz:SNDK",
+        )
+        primary = _FakeLeg("io:SNDK")
+        hedge = _FakeLeg("xyz:SNDK")
         calls = 0
 
         async def run_once(self):
@@ -1121,6 +1438,7 @@ def test_heartbeat_write_failure_does_not_stop_safety_convergence(
         return iterations > 2
 
     strategy = FakeStrategy()
+    cli = _cli()
     asyncio.run(
         cli.run_loop(
             strategy,
@@ -1142,7 +1460,13 @@ def test_tolerance_metadata_interlock_uses_normal_poll_interval(
     cli = _cli()
 
     class FakeStrategy:
-        config = SimpleNamespace(position_tolerance=Decimal("0.000001"))
+        config = SimpleNamespace(
+            position_tolerance=Decimal("0.000001"),
+            primary_market="io:SNDK",
+            hedge_market="xyz:SNDK",
+        )
+        primary = _FakeLeg("io:SNDK")
+        hedge = _FakeLeg("xyz:SNDK")
         hedge_tolerance = None
 
         async def run_once(self):
@@ -1181,3 +1505,99 @@ def test_tolerance_metadata_interlock_uses_normal_poll_interval(
     )
 
     assert sleeps == [30.0]
+
+
+def test_close_and_exit_cancels_resting_orders_on_both_legs(tmp_path, monkeypatch):
+    """平仓退出前必须撤销两腿挂单。
+
+    2026-08-30 真实事故：杀进程不会撤销已挂出的限价单，io:SNDK 上残留的
+    maker 买单在进程死后 3 分钟被动成交，凭空造出反向裸仓。只平仓不撤单
+    等于留了一颗定时炸弹。
+    """
+    order_a = SimpleNamespace(id=111)
+    order_b = SimpleNamespace(id=222)
+
+    class FakeStrategy:
+        config = SimpleNamespace(
+            position_tolerance=Decimal("0.000001"),
+            primary_market="io:SNDK",
+            hedge_market="xyz:SNDK",
+        )
+        primary = _FakeLeg("io:SNDK", [order_a])
+        hedge = _FakeLeg("xyz:SNDK", [order_b])
+        state = SimpleNamespace(is_open=False)
+
+    strategy = FakeStrategy()
+    cli = _cli()
+    asyncio.run(
+        cli.run_loop(
+            strategy,
+            poll_interval=30.0,
+            heartbeat_path=tmp_path / "hb.jsonl",
+            close_and_exit=True,
+        )
+    )
+
+    assert strategy.primary.cancelled == [111], "主腿挂单未被撤销"
+    assert strategy.hedge.cancelled == [222], "对冲腿挂单未被撤销"
+    assert strategy.primary.orders == []
+    assert strategy.hedge.orders == []
+
+
+def test_close_and_exit_cancels_orders_after_closing_an_open_round(
+    tmp_path,
+    monkeypatch,
+):
+    """有进行中的轮次时，平仓后退出前同样必须撤单。
+
+    与 test_close_and_exit_cancels_resting_orders_on_both_legs 互补：
+    那条走「开始就是平的」提前返回路径，这条走「平仓后循环结束」路径。
+    两条路径都要撤单，缺一条就会留下残留挂单——变异测试证明只测一条会漏。
+    """
+    order_a = SimpleNamespace(id=333)
+    order_b = SimpleNamespace(id=444)
+    saved = []
+
+    class FakeStrategy:
+        config = SimpleNamespace(
+            position_tolerance=Decimal("0.000001"),
+            primary_market="io:SNDK",
+            hedge_market="xyz:SNDK",
+        )
+        primary = _FakeLeg("io:SNDK", [order_a])
+        hedge = _FakeLeg("xyz:SNDK", [order_b])
+
+        def __init__(self):
+            self.state = SimpleNamespace(is_open=True, due_at=None)
+
+        def _save_state(self):
+            saved.append(True)
+
+        async def run_once(self):
+            self.state.is_open = False
+            return SimpleNamespace(
+                action="closed",
+                round_index=7,
+                direction=None,
+                due_at=None,
+                net_exposure=Decimal("0"),
+                basis_gate_state="open",
+                interlock_reason="",
+                primary_size=Decimal("0"),
+                hedge_size=Decimal("0"),
+            )
+
+    strategy = FakeStrategy()
+    cli = _cli()
+    asyncio.run(
+        cli.run_loop(
+            strategy,
+            poll_interval=30.0,
+            heartbeat_path=tmp_path / "hb2.jsonl",
+            close_and_exit=True,
+        )
+    )
+
+    assert saved, "应把 due_at 提前并落盘"
+    assert strategy.primary.cancelled == [333], "平仓后主腿挂单未撤销"
+    assert strategy.hedge.cancelled == [444], "平仓后对冲腿挂单未撤销"

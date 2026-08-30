@@ -1185,11 +1185,11 @@ def test_agent_wallet_connects_without_main_wallet_private_key() -> None:
     assert created["account_address"] == ACCOUNT_ADDRESS
     assert created["wallet"].address != ACCOUNT_ADDRESS
     assert created["meta"] == _meta_and_contexts()[0]
-    assert created["perp_dexs"] == ["", "io"]
+    assert created["perp_dexs"] == ["", "io", "xyz"]
 
 
 def test_info_factory_receives_default_perp_dex_configuration() -> None:
-    """读取 SDK 默认同时装载主永续与 Entropy io dex。"""
+    """读取 SDK 默认同时装载主永续、Entropy io 与 XYZ builder dex。"""
     created: dict[str, object] = {}
 
     def info_factory(**kwargs):
@@ -1203,7 +1203,14 @@ def test_info_factory_receives_default_perp_dex_configuration() -> None:
 
     asyncio.run(client.connect())
 
-    assert created["perp_dexs"] == ["", "io"]
+    assert created["perp_dexs"] == ["", "io", "xyz"]
+
+
+def test_default_perp_dexs_contains_xyz() -> None:
+    """默认 dex 列表必须包含 xyz，确保 xyz: 前缀标的进入元数据解析。"""
+    module = importlib.import_module("adapters.hyperliquid_client")
+
+    assert "xyz" in module.DEFAULT_PERP_DEXS
 
 
 def test_from_env_reads_explicit_perp_dex_configuration(monkeypatch) -> None:

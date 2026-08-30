@@ -21,7 +21,7 @@ import time  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import Callable  # noqa: E402
+from typing import Any, Callable  # noqa: E402
 
 from adapters.extended_client import ExtendedClient  # noqa: E402
 from adapters.hyperliquid_client import HyperliquidClient  # noqa: E402
@@ -101,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--live",
         action="store_true",
         help="真实连接并下单；默认只打印离线配置摘要",
+    )
+    parser.add_argument(
+        "--close-and-exit",
+        action="store_true",
+        help="立即平掉当前轮次并退出，绝不开新轮",
     )
     parser.add_argument("--market", default="BTC", help="主腿标的（默认 BTC）")
     parser.add_argument(
@@ -203,9 +208,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--primary-venue",
-        choices=("lighter", "variational"),
+        choices=("lighter", "variational", "hyperliquid"),
         default="lighter",
         help="主腿交易所（默认 lighter）",
+    )
+    parser.add_argument(
+        "--primary-env-prefix",
+        default="HYPERLIQUID",
+        help="主腿 Hyperliquid 环境变量前缀（默认 HYPERLIQUID）",
     )
     parser.add_argument(
         "--account",
@@ -228,6 +238,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _build_primary_client(args: argparse.Namespace):
     """按 --primary-venue 装配可交易主腿。"""
+    if args.primary_venue == "hyperliquid":
+        return HyperliquidClient.from_env(
+            prefix=args.primary_env_prefix,
+            trading_enabled=True,
+        )
     if args.primary_venue == "variational":
         return VariationalClient(Session.from_env())
     if not str(args.lighter_address or "").strip():
@@ -273,6 +288,8 @@ def _reload_variational_primary() -> VariationalClient:
 
 def _primary_account_identity(args: argparse.Namespace) -> str | None:
     """从离线配置解析主腿公开账户标识。"""
+    if args.primary_venue == "hyperliquid":
+        return os.environ.get(f"{args.primary_env_prefix}_ACCOUNT_ADDRESS")
     if args.primary_venue == "variational":
         return os.environ.get("VARIATIONAL_WALLET_ADDRESS") or None
     return str(args.lighter_address).strip() if args.lighter_address else None
@@ -630,6 +647,8 @@ def startup_summary(
     lines = [
         "定时定量对冲配置",
         f"主腿：{args.primary_venue}，账户：{_mask_account(_primary_account_identity(args))}",
+        "主腿环境变量前缀："
+        f"{args.primary_env_prefix if args.primary_venue == 'hyperliquid' else '不适用'}",
         f"对冲腿：{args.hedge_venue}，账户：{_mask_account(_hedge_account_identity(args))}",
         f"标的：{args.market} → {args.hedge_market}",
         f"周期：{args.cycle_hours:g} 小时",
@@ -646,6 +665,7 @@ def startup_summary(
         f"当前方向：{current_direction}",
         f"当前轮名义额：{current_notional}",
         f"到期时刻：{state.due_at}",
+        f"平仓退出模式：{args.close_and_exit}",
         f"dry_run：{not args.live}",
     ]
     return "\n".join(lines)
@@ -694,17 +714,108 @@ def append_heartbeat(payload: dict, path: Path | str = _DEFAULT_HEARTBEAT) -> No
         stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _print_close_and_exit_summary(
+    primary_size: Decimal | None,
+    hedge_size: Decimal | None,
+    net_exposure: Decimal | None,
+) -> None:
+    """把平仓退出时的最终双腿持仓同时写到终端与日志。"""
+
+    def display(value: Decimal | None) -> str:
+        return str(value) if value is not None else "未知"
+
+    summary = (
+        "平仓退出摘要："
+        f"主腿持仓={display(primary_size)}，"
+        f"对冲腿持仓={display(hedge_size)}，"
+        f"净敞口={display(net_exposure)}"
+    )
+    print(summary)
+    logger.info(summary)
+
+
+async def _cancel_leg_orders(client: Any, market: str, label: str) -> int:
+    """撤销该腿在指定市场的全部挂单，返回撤单笔数。
+
+    ⚠️ 杀进程**不会**撤销已挂出的限价单。2026-08-30 就因此出过事：
+    进程被杀时 io:SNDK 上还挂着一张 maker 买单，进程死后 3 分钟它被动
+    成交，凭空造出一个反向裸仓；而当时查持仓看到的是「另一条腿有仓」，
+    据此平仓反而把敞口做反了。所以平仓退出前必须先撤单，
+    且顺序是「先撤单，再查持仓，最后才平仓」。
+
+    Variational 是 RFQ 模式没有挂单簿，其 ``get_open_orders`` 不接受市场
+    参数且返回历史订单，这里按「不支持逐市场挂单查询」处理并跳过。
+    """
+    lister = getattr(client, "get_open_orders", None)
+    canceller = getattr(client, "cancel_order", None)
+    if lister is None or canceller is None:
+        return 0
+    try:
+        orders = await lister(market)
+    except TypeError:
+        logger.info("%s 不支持按市场查询挂单（RFQ 模式），跳过撤单", label)
+        return 0
+    except Exception as exc:  # noqa: BLE001 撤单失败必须让人看见，但不阻断退出
+        logger.error("%s 挂单查询失败，可能有残留挂单：%s", label, exc)
+        return 0
+    if not orders:
+        return 0
+    cancelled = 0
+    for order in orders:
+        order_id = getattr(order, "id", None)
+        if order_id is None:
+            logger.error("%s 有挂单但取不到订单号，无法撤销：%r", label, order)
+            continue
+        try:
+            await canceller(market, order_id)
+            cancelled += 1
+        except Exception as exc:  # noqa: BLE001 单笔失败继续撤其余的
+            logger.error("%s 撤单失败 order_id=%s：%s", label, order_id, exc)
+    logger.info("%s 已撤销 %d 笔挂单", label, cancelled)
+    return cancelled
+
+
+async def _cancel_all_legs(strategy: TimedHedgedVolumeStrategy) -> int:
+    """退出前撤销两腿的全部挂单，返回总撤单笔数。"""
+    total = 0
+    total += await _cancel_leg_orders(
+        strategy.primary, strategy.config.primary_market, "主腿"
+    )
+    total += await _cancel_leg_orders(
+        strategy.hedge, strategy.config.hedge_market, "对冲腿"
+    )
+    if total == 0:
+        logger.info("平仓退出模式：两腿均无残留挂单")
+    return total
+
+
 async def run_loop(
     strategy: TimedHedgedVolumeStrategy,
     *,
     poll_interval: float,
     heartbeat_path: Path | str,
     stop_requested: Callable[[], bool] | None = None,
+    close_and_exit: bool = False,
 ) -> None:
-    """运行策略循环；平仓后无等待推进下一轮，其余状态按配置轮询。"""
+    """运行策略循环；可选择只平当前轮并在确认后退出。"""
     should_stop = stop_requested or (lambda: False)
+    if close_and_exit and not strategy.state.is_open:
+        logger.info("平仓退出模式：当前没有进行中的轮次，无需平仓")
+        await _cancel_all_legs(strategy)
+        _print_close_and_exit_summary(Decimal("0"), Decimal("0"), Decimal("0"))
+        return
+    if close_and_exit:
+        strategy.state.due_at = time.time()
+        strategy._save_state()
+        logger.info(
+            "平仓退出模式：已把当前轮次到期时刻提前到 %s，开始立即平仓",
+            strategy.state.due_at,
+        )
+
+    last_result: TimedVolumeResult | None = None
     while not should_stop():
         result = await strategy.run_once()
+        last_result = result
         try:
             append_heartbeat(heartbeat_payload(result), heartbeat_path)
         except Exception as exc:  # noqa: BLE001 心跳失败不得中断风险收敛
@@ -720,6 +831,11 @@ async def run_loop(
             result.basis_gate_state,
             result.interlock_reason,
         )
+        if result.action == "closed" and close_and_exit:
+            break
+        if close_and_exit and not strategy.state.is_open:
+            logger.info("平仓退出模式：当前轮次状态已结束，不再推进下一节拍")
+            break
         if result.action == "closed":
             continue
         urgent_actions = {
@@ -741,6 +857,14 @@ async def run_loop(
         )
         delay = 1.0 if result.action in urgent_actions or net_is_unsafe else poll_interval
         await asyncio.sleep(delay)
+
+    if close_and_exit:
+        await _cancel_all_legs(strategy)
+        _print_close_and_exit_summary(
+            last_result.primary_size if last_result is not None else None,
+            last_result.hedge_size if last_result is not None else None,
+            last_result.net_exposure if last_result is not None else None,
+        )
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -782,6 +906,7 @@ async def run(args: argparse.Namespace) -> None:
             strategy,
             poll_interval=args.poll_interval,
             heartbeat_path=args.heartbeat_path,
+            close_and_exit=args.close_and_exit,
         )
     finally:
         close_calls = [
