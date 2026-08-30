@@ -156,6 +156,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="空闲状态检查与心跳间隔秒数（默认 30）",
     )
     parser.add_argument(
+        "--entry-mode",
+        choices=("timer", "signal"),
+        default="timer",
+        help="入场模式：timer 保持既有定时行为；signal 启用基差信号（默认 timer）",
+    )
+    parser.add_argument(
+        "--signal-sigma",
+        type=Decimal,
+        default=Decimal("2.0"),
+        help="基差信号入场阈值的标准差倍数（默认 2.0）",
+    )
+    parser.add_argument(
+        "--signal-lookback-hours",
+        type=float,
+        default=48.0,
+        help="Hyperliquid 历史 K 线滚动窗口小时数（默认 48）",
+    )
+    parser.add_argument(
+        "--signal-refresh-minutes",
+        type=float,
+        default=15.0,
+        help="基差信号统计刷新间隔分钟数（默认 15）",
+    )
+    parser.add_argument(
+        "--signal-min-samples",
+        type=int,
+        default=100,
+        help="对齐 K 线最少样本数，不足时拒绝开仓（默认 100）",
+    )
+    parser.add_argument(
+        "--max-hold-hours",
+        type=float,
+        default=8.0,
+        help="signal 模式最长持仓小时数（默认 8）",
+    )
+    parser.add_argument(
+        "--signal-fallback-hours",
+        type=float,
+        default=4.0,
+        help="signal 模式无信号兜底小时数；0 关闭（默认 4）",
+    )
+    parser.add_argument(
         "--basis-gate-sigma",
         type=Decimal,
         default=Decimal("0"),
@@ -614,6 +656,13 @@ def build_config(args: argparse.Namespace) -> TimedVolumeConfig:
         instance=_instance_from_heartbeat(args.heartbeat_path),
         basis_gate_sigma=args.basis_gate_sigma,
         basis_gate_max_wait_s=args.basis_gate_max_wait,
+        entry_mode=args.entry_mode,
+        signal_sigma=args.signal_sigma,
+        signal_lookback_hours=args.signal_lookback_hours,
+        signal_refresh_minutes=args.signal_refresh_minutes,
+        signal_min_samples=args.signal_min_samples,
+        max_hold_hours=args.max_hold_hours,
+        signal_fallback_hours=args.signal_fallback_hours,
     )
 
 
@@ -655,6 +704,13 @@ def startup_summary(
         f"单边名义额区间：{args.notional_min}~{args.notional_max} USD",
         f"初始方向：{args.initial_direction}",
         f"maker 优先等待：{args.maker_timeout:g} 秒",
+        f"入场模式：{args.entry_mode}",
+        f"信号阈值：{args.signal_sigma} 倍标准差",
+        f"信号回看窗口：{args.signal_lookback_hours:g} 小时",
+        f"信号刷新间隔：{args.signal_refresh_minutes:g} 分钟",
+        f"信号最少样本：{args.signal_min_samples}",
+        f"信号最长持仓：{args.max_hold_hours:g} 小时",
+        f"信号兜底等待：{args.signal_fallback_hours:g} 小时",
         f"基差门控：{args.basis_gate_sigma} 倍标准差",
         f"基差门控最长等待：{args.basis_gate_max_wait:g} 秒",
         f"轮次状态：{args.state_path}",
@@ -698,6 +754,14 @@ def heartbeat_payload(
         "basis_gate_deviation": decimal_text(result.basis_gate_deviation),
         "basis_gate_waited_seconds": result.basis_gate_waited_seconds,
         "basis_gate_state": result.basis_gate_state,
+        "signal_midline": decimal_text(result.signal_midline),
+        "signal_sigma": decimal_text(result.signal_sigma),
+        "signal_deviation": decimal_text(result.signal_deviation),
+        "signal_sample_count": result.signal_sample_count,
+        "signal_state": result.signal_state,
+        "signal_reason": result.signal_reason,
+        "entry_trigger": result.entry_trigger,
+        "close_reason": result.close_reason,
         "hedge_available": result.hedge_available,
         "hedge_interlock_active": not result.hedge_available,
         "hedge_interlock_reason": result.interlock_reason,

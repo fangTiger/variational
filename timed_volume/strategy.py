@@ -12,11 +12,13 @@ import logging
 import math
 import random
 import time
+from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Awaitable, Callable
+from urllib.request import Request, urlopen
 
 from adapters.base import PositionPnl
 from engine.hedge_engine import HedgeFillResult, maker_first_hedge
@@ -51,6 +53,11 @@ BASIS_GATE_MIN_HISTORY = 5
 #: 而不是调高本下限（调高会让 A/B 的门控一并失效）。
 BASIS_GATE_STD_FLOOR_PCT = Decimal("0.02")
 
+#: 信号统计固定使用 Hyperliquid 5 分钟 K 线，避免重启后重新积攒内存样本。
+HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+SIGNAL_CANDLE_INTERVAL = "5m"
+SIGNAL_HTTP_TIMEOUT_SECONDS = 20.0
+
 
 class RoundDirection(Enum):
     """Lighter 主腿的轮次方向。"""
@@ -66,6 +73,13 @@ class RoundDirection(Enum):
     def sign(self) -> Decimal:
         """返回用于有符号持仓的方向系数。"""
         return Decimal(1) if self is RoundDirection.LONG else Decimal(-1)
+
+
+class EntryMode(Enum):
+    """新轮次入场调度模式。"""
+
+    TIMER = "timer"
+    SIGNAL = "signal"
 
 
 @dataclass
@@ -89,6 +103,13 @@ class TimedVolumeConfig:
     instance: str | None = None
     basis_gate_sigma: Decimal = Decimal("0")
     basis_gate_max_wait_s: float = 1800.0
+    entry_mode: EntryMode = EntryMode.TIMER
+    signal_sigma: Decimal = Decimal("2.0")
+    signal_lookback_hours: float = 48.0
+    signal_refresh_minutes: float = 15.0
+    signal_min_samples: int = 100
+    max_hold_hours: float = 8.0
+    signal_fallback_hours: float = 4.0
 
     def __post_init__(self) -> None:
         """归一化配置并拒绝无法安全运行的数值。"""
@@ -109,6 +130,7 @@ class TimedVolumeConfig:
         if self.heartbeat_path is not None:
             self.heartbeat_path = Path(self.heartbeat_path)
         self.basis_gate_sigma = Decimal(str(self.basis_gate_sigma))
+        self.signal_sigma = Decimal(str(self.signal_sigma))
         if self.instance is not None:
             self.instance = str(self.instance).strip() or None
         if self.ledger_path is not None and self.instance is None:
@@ -118,6 +140,8 @@ class TimedVolumeConfig:
             )
         if not isinstance(self.initial_direction, RoundDirection):
             self.initial_direction = RoundDirection(str(self.initial_direction))
+        if not isinstance(self.entry_mode, EntryMode):
+            self.entry_mode = EntryMode(str(self.entry_mode))
         if self.notional_min_usd <= 0 or self.notional_max_usd <= 0:
             raise ValueError("单边名义额区间上下限必须大于零")
         if self.notional_min_usd > self.notional_max_usd:
@@ -137,6 +161,33 @@ class TimedVolumeConfig:
             or self.basis_gate_max_wait_s < 0
         ):
             raise ValueError("基差门控最长等待秒数必须为有限非负数")
+        if self.entry_mode is EntryMode.SIGNAL:
+            if not self.signal_sigma.is_finite() or self.signal_sigma <= 0:
+                raise ValueError("基差信号标准差倍数必须为有限正数")
+            for value, label, allow_zero in (
+                (self.signal_lookback_hours, "基差信号回看小时数", False),
+                (self.signal_refresh_minutes, "基差信号刷新分钟数", False),
+                (self.max_hold_hours, "基差信号最长持仓小时数", False),
+                (self.signal_fallback_hours, "基差信号兜底小时数", True),
+            ):
+                if (
+                    not math.isfinite(value)
+                    or value < 0
+                    or (not allow_zero and value == 0)
+                ):
+                    qualifier = "非负" if allow_zero else "正"
+                    raise ValueError(f"{label}必须为有限{qualifier}数")
+            try:
+                normalized_min_samples = int(self.signal_min_samples)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("基差信号最少样本必须为正整数") from exc
+            if (
+                isinstance(self.signal_min_samples, bool)
+                or normalized_min_samples != self.signal_min_samples
+                or normalized_min_samples <= 0
+            ):
+                raise ValueError("基差信号最少样本必须为正整数")
+            self.signal_min_samples = normalized_min_samples
 
     @staticmethod
     def _normalize_notional_bound(value: object, label: str) -> int:
@@ -168,6 +219,12 @@ class TimedVolumeState:
     consecutive_close_failures: int = 0
     close_halted_since: float | None = None
     close_halt_rehedged_since: float | None = None
+    last_closed_at: float | None = None
+    signal_entry_trigger: str | None = None
+    signal_entry_deviation: Decimal | None = None
+    signal_entry_midline: Decimal | None = None
+    signal_entry_sigma: Decimal | None = None
+    pending_close_reason: str | None = None
 
     @property
     def is_open(self) -> bool:
@@ -198,12 +255,21 @@ class TimedVolumeResult:
     basis_gate_deviation: Decimal | None = None
     basis_gate_waited_seconds: float = 0.0
     basis_gate_state: str = "open"
+    signal_midline: Decimal | None = None
+    signal_sigma: Decimal | None = None
+    signal_deviation: Decimal | None = None
+    signal_sample_count: int = 0
+    signal_state: str = "disabled"
+    signal_reason: str = "定时入场模式未启用基差信号"
+    entry_trigger: str | None = None
+    close_reason: str | None = None
 
 
 TradeExecutor = Callable[..., Awaitable[HedgeFillResult]]
 AvailabilityCheck = Callable[[], bool | Awaitable[bool]]
 RandomInt = Callable[[int, int], int]
 AuthReload = Callable[[], object | Awaitable[object]]
+CandleLoader = Callable[[str, str, int, int], Awaitable[list[dict]]]
 
 
 class _LegAuthFailure(Exception):
@@ -235,6 +301,10 @@ class _RoundLedgerContext:
     hedge_entry: Decimal | None
     primary_size: Decimal | None
     hedge_size: Decimal | None
+    entry_trigger: str | None = None
+    entry_deviation: Decimal | None = None
+    entry_midline: Decimal | None = None
+    entry_sigma: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -244,6 +314,61 @@ class _FillSummary:
     exit_price: Decimal | None
     exit_size: Decimal
     fee: Decimal
+
+
+@dataclass(frozen=True)
+class _SignalStatistics:
+    """一次历史 K 线刷新得到的基差统计快照。"""
+
+    midline: Decimal | None
+    sigma: Decimal | None
+    sample_count: int
+    refreshed_at: float
+
+
+def _load_hyperliquid_candles_sync(
+    coin: str,
+    interval: str,
+    start_time_ms: int,
+    end_time_ms: int,
+) -> list[dict]:
+    """直接调用 Hyperliquid ``candleSnapshot`` 公共接口读取 K 线。"""
+    payload = {
+        "type": "candleSnapshot",
+        "req": {
+            "coin": str(coin),
+            "interval": str(interval),
+            "startTime": int(start_time_ms),
+            "endTime": int(end_time_ms),
+        },
+    }
+    request = Request(
+        HYPERLIQUID_INFO_URL,
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with closing(urlopen(request, timeout=SIGNAL_HTTP_TIMEOUT_SECONDS)) as response:
+        raw = json.loads(response.read().decode("utf-8"))
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        raise ValueError(f"Hyperliquid {coin} K 线响应不是对象数组")
+    return raw
+
+
+async def load_hyperliquid_candles(
+    coin: str,
+    interval: str,
+    start_time_ms: int,
+    end_time_ms: int,
+) -> list[dict]:
+    """在线程中读取公共 K 线，避免阻塞策略事件循环。"""
+    return await asyncio.to_thread(
+        _load_hyperliquid_candles_sync,
+        coin,
+        interval,
+        start_time_ms,
+        end_time_ms,
+    )
 
 
 class TimedHedgedVolumeStrategy:
@@ -261,6 +386,7 @@ class TimedHedgedVolumeStrategy:
         auth_error_types: tuple[type[Exception], ...] = (),
         on_auth_error: AuthReload | None = None,
         on_hedge_auth_error: AuthReload | None = None,
+        candle_loader: CandleLoader | None = None,
     ) -> None:
         self.primary = primary
         self.hedge = hedge
@@ -271,6 +397,7 @@ class TimedHedgedVolumeStrategy:
         self._auth_error_types = tuple(auth_error_types)
         self._on_auth_error = on_auth_error
         self._on_hedge_auth_error = on_hedge_auth_error
+        self._candle_loader = candle_loader or load_hyperliquid_candles
         self.state = self._load_state()
         self.hedge_interlock_active = False
         self.hedge_interlock_reason = "尚未判定"
@@ -281,6 +408,20 @@ class TimedHedgedVolumeStrategy:
         self._basis_gate_deviation: Decimal | None = None
         self._basis_gate_waited_seconds = 0.0
         self._basis_gate_state = "open"
+        self._signal_statistics: _SignalStatistics | None = None
+        self._signal_midline: Decimal | None = None
+        self._signal_sigma: Decimal | None = None
+        self._signal_deviation: Decimal | None = None
+        self._signal_sample_count = 0
+        self._signal_state = (
+            "waiting" if self.config.entry_mode is EntryMode.SIGNAL else "disabled"
+        )
+        self._signal_reason = (
+            "等待首次基差信号评估"
+            if self.config.entry_mode is EntryMode.SIGNAL
+            else "定时入场模式未启用基差信号"
+        )
+        self._close_reason: str | None = None
 
     def _load_state(self) -> TimedVolumeState:
         """读取轮次记录；损坏记录失败关闭为无记录，后续以实仓恢复。"""
@@ -363,6 +504,45 @@ class TimedHedgedVolumeStrategy:
             except (TypeError, ValueError) as exc:
                 logger.warning("平仓退避再对冲状态无效，仅清除限次标记：%s", exc)
 
+        last_closed_raw = raw.get("last_closed_at")
+        if last_closed_raw is not None:
+            try:
+                last_closed_at = float(last_closed_raw)
+                if not math.isfinite(last_closed_at):
+                    raise ValueError("上次平仓时间必须为有限时间戳")
+                state.last_closed_at = last_closed_at
+            except (TypeError, ValueError) as exc:
+                logger.warning("基差信号上次平仓时间无效，仅重置兜底计时：%s", exc)
+
+        entry_trigger = raw.get("signal_entry_trigger")
+        if entry_trigger in {"signal", "fallback", "recovered"}:
+            state.signal_entry_trigger = str(entry_trigger)
+        elif entry_trigger is not None:
+            logger.warning("基差信号入场来源无效，仅清除入场统计")
+
+        pending_close_reason = raw.get("pending_close_reason")
+        if pending_close_reason in {"reverted", "timeout", "fallback"}:
+            state.pending_close_reason = str(pending_close_reason)
+        elif pending_close_reason is not None:
+            logger.warning("基差信号待平仓原因无效，仅清除原因")
+
+        try:
+            for key in (
+                "signal_entry_deviation",
+                "signal_entry_midline",
+                "signal_entry_sigma",
+            ):
+                value = raw.get(key)
+                if value is None:
+                    continue
+                decimal_value = Decimal(str(value))
+                if not decimal_value.is_finite():
+                    raise ValueError(f"{key} 必须为有限十进制数")
+                setattr(state, key, decimal_value)
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            logger.warning("基差信号入场统计无效，仅清除统计：%s", exc)
+            self._clear_signal_entry_state(state)
+
         if self.config.ledger_path is None:
             return state
         try:
@@ -398,6 +578,13 @@ class TimedHedgedVolumeStrategy:
             "ledger_primary_size",
             "ledger_hedge_size",
         )
+        for key in (
+            "signal_entry_deviation",
+            "signal_entry_midline",
+            "signal_entry_sigma",
+        ):
+            value = payload[key]
+            payload[key] = str(value) if value is not None else None
         if self.config.ledger_path is None:
             for key in ledger_keys:
                 payload.pop(key, None)
@@ -419,6 +606,15 @@ class TimedHedgedVolumeStrategy:
         state.ledger_hedge_entry = None
         state.ledger_primary_size = None
         state.ledger_hedge_size = None
+
+    @staticmethod
+    def _clear_signal_entry_state(state: TimedVolumeState) -> None:
+        """清空已结束轮次的信号入场元数据。"""
+        state.signal_entry_trigger = None
+        state.signal_entry_deviation = None
+        state.signal_entry_midline = None
+        state.signal_entry_sigma = None
+        state.pending_close_reason = None
 
     def _clear_close_failure_state(self) -> None:
         """清空连续平仓失败与退避状态。"""
@@ -915,7 +1111,10 @@ class TimedHedgedVolumeStrategy:
                 self.state.current_notional_usd = None
                 self.state.opened_at = None
                 self.state.due_at = None
+                if self.config.entry_mode is EntryMode.SIGNAL:
+                    self.state.last_closed_at = now
                 self._clear_ledger_state(self.state)
+                self._clear_signal_entry_state(self.state)
                 self._clear_close_failure_state()
                 self._save_state()
             return primary_size, hedge_size, False
@@ -937,7 +1136,14 @@ class TimedHedgedVolumeStrategy:
                 self.state.round_index = max(1, self.state.round_index)
                 self.state.current_direction = actual_direction
                 self.state.opened_at = now
-                self.state.due_at = now + self.config.cycle_seconds
+                self.state.due_at = now + (
+                    self.config.max_hold_hours * 3600.0
+                    if self.config.entry_mode is EntryMode.SIGNAL
+                    else self.config.cycle_seconds
+                )
+                self._clear_signal_entry_state(self.state)
+                if self.config.entry_mode is EntryMode.SIGNAL:
+                    self.state.signal_entry_trigger = "recovered"
                 self._clear_ledger_state(self.state)
                 self._save_state()
             return primary_size, hedge_size, False
@@ -998,7 +1204,14 @@ class TimedHedgedVolumeStrategy:
                     self.state.current_direction = actual_direction
                     if not record_keeps_schedule:
                         self.state.opened_at = now
-                        self.state.due_at = now + self.config.cycle_seconds
+                        self.state.due_at = now + (
+                            self.config.max_hold_hours * 3600.0
+                            if self.config.entry_mode is EntryMode.SIGNAL
+                            else self.config.cycle_seconds
+                        )
+                        self._clear_signal_entry_state(self.state)
+                        if self.config.entry_mode is EntryMode.SIGNAL:
+                            self.state.signal_entry_trigger = "recovered"
                         self._clear_ledger_state(self.state)
                     self._save_state()
                     return primary_size, hedge_size, True
@@ -1016,7 +1229,10 @@ class TimedHedgedVolumeStrategy:
             self.state.current_notional_usd = None
             self.state.opened_at = None
             self.state.due_at = None
+            if self.config.entry_mode is EntryMode.SIGNAL:
+                self.state.last_closed_at = now
             self._clear_ledger_state(self.state)
+            self._clear_signal_entry_state(self.state)
             self._save_state()
         return primary_size, hedge_size, True
 
@@ -1140,6 +1356,197 @@ class TimedHedgedVolumeStrategy:
         hedge_mid = self._basis_mid(quotes[1], "对冲腿")
         return (primary_mid - hedge_mid) / hedge_mid * Decimal(100)
 
+    @staticmethod
+    def _candle_closes_by_time(candles: list[dict], role: str) -> dict[int, Decimal]:
+        """提取有效 K 线时间戳与收盘价；坏点隔离但不伪造成零价。"""
+        closes: dict[int, Decimal] = {}
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+            try:
+                timestamp = int(candle["t"])
+                close = Decimal(str(candle["c"]))
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                continue
+            if timestamp < 0 or not close.is_finite() or close <= 0:
+                continue
+            closes[timestamp] = close
+        if not closes:
+            logger.warning("Hyperliquid %s K 线没有有效收盘价", role)
+        return closes
+
+    @classmethod
+    def _aligned_premiums(
+        cls,
+        primary_candles: list[dict],
+        hedge_candles: list[dict],
+    ) -> list[Decimal]:
+        """按 ``t`` 精确对齐两腿收盘价并计算百分比基差序列。"""
+        primary = cls._candle_closes_by_time(primary_candles, "主腿")
+        hedge = cls._candle_closes_by_time(hedge_candles, "对冲腿")
+        premiums: list[Decimal] = []
+        for timestamp in sorted(primary.keys() & hedge.keys()):
+            premium = (primary[timestamp] - hedge[timestamp]) / hedge[timestamp] * Decimal(100)
+            if premium.is_finite():
+                premiums.append(premium)
+        return premiums
+
+    def _publish_signal_statistics(self, statistics: _SignalStatistics) -> None:
+        """把缓存统计复制到当前心跳观测字段。"""
+        self._signal_midline = statistics.midline
+        self._signal_sigma = statistics.sigma
+        self._signal_sample_count = statistics.sample_count
+
+    async def _refresh_signal_statistics(
+        self,
+        now: float,
+        warnings: list[str],
+    ) -> _SignalStatistics | None:
+        """按刷新周期从 Hyperliquid 拉取并缓存对齐后的滚动统计。"""
+        cached = self._signal_statistics
+        refresh_seconds = self.config.signal_refresh_minutes * 60.0
+        if (
+            cached is not None
+            and now >= cached.refreshed_at
+            and now - cached.refreshed_at < refresh_seconds
+        ):
+            self._publish_signal_statistics(cached)
+            return cached
+
+        end_time_ms = max(0, int(now * 1000))
+        lookback_ms = int(self.config.signal_lookback_hours * 3_600_000)
+        start_time_ms = max(0, end_time_ms - lookback_ms)
+        try:
+            primary_candles, hedge_candles = await asyncio.gather(
+                self._candle_loader(
+                    self.config.primary_market,
+                    SIGNAL_CANDLE_INTERVAL,
+                    start_time_ms,
+                    end_time_ms,
+                ),
+                self._candle_loader(
+                    self.config.hedge_market,
+                    SIGNAL_CANDLE_INTERVAL,
+                    start_time_ms,
+                    end_time_ms,
+                ),
+            )
+            premiums = self._aligned_premiums(primary_candles, hedge_candles)
+            midline: Decimal | None = None
+            sigma: Decimal | None = None
+            if premiums:
+                midline, sigma = self._basis_statistics(premiums)
+            statistics = _SignalStatistics(
+                midline=midline,
+                sigma=sigma,
+                sample_count=len(premiums),
+                refreshed_at=now,
+            )
+            self._signal_statistics = statistics
+            self._publish_signal_statistics(statistics)
+            return statistics
+        except Exception as exc:  # noqa: BLE001 公共行情失败必须失败关闭为不入场
+            self._signal_state = "refresh_failed"
+            self._signal_reason = f"基差信号历史刷新失败，拒绝开仓：{exc}"
+            self._warn(warnings, self._signal_reason)
+            return None
+
+    def _statistics_are_sufficient(self, statistics: _SignalStatistics) -> bool:
+        """检查统计点数与必要数值，失败时写入可观测拒绝原因。"""
+        if (
+            statistics.sample_count < self.config.signal_min_samples
+            or statistics.midline is None
+            or statistics.sigma is None
+        ):
+            self._signal_state = "insufficient_samples"
+            self._signal_reason = (
+                "基差信号样本不足："
+                f"{statistics.sample_count}/{self.config.signal_min_samples}，拒绝开仓"
+            )
+            return False
+        return True
+
+    def _start_signal_fallback_clock(self, now: float) -> float:
+        """首次取得可靠统计时建立可持久化兜底计时基线。"""
+        baseline = self.state.last_closed_at
+        if baseline is None or now < baseline:
+            self.state.last_closed_at = now
+            self._save_state()
+            return now
+        return baseline
+
+    def _next_timer_direction(self) -> RoundDirection:
+        """返回既有定时模式使用的机械交替方向。"""
+        return (
+            self.config.initial_direction
+            if self.state.last_direction is None
+            else self.state.last_direction.opposite()
+        )
+
+    async def _signal_entry_decision(
+        self,
+        now: float,
+        warnings: list[str],
+    ) -> tuple[RoundDirection, str] | None:
+        """评估信号入场方向；可靠统计内无偏离时再评估定时兜底。"""
+        statistics = await self._refresh_signal_statistics(now, warnings)
+        if statistics is None or not self._statistics_are_sufficient(statistics):
+            return None
+        assert statistics.midline is not None
+        assert statistics.sigma is not None
+        premium = await self._current_basis()
+        deviation = premium - statistics.midline
+        self._signal_deviation = deviation
+        threshold = self.config.signal_sigma * statistics.sigma
+        if deviation > threshold:
+            self._signal_state = "ready"
+            self._signal_reason = "正偏离超过阈值，开空基差"
+            return RoundDirection.SHORT, "signal"
+        if deviation < -threshold:
+            self._signal_state = "ready"
+            self._signal_reason = "负偏离超过阈值，开多基差"
+            return RoundDirection.LONG, "signal"
+
+        self._signal_state = "within_threshold"
+        self._signal_reason = "基差偏离位于入场阈值内，继续等待"
+        baseline = self._start_signal_fallback_clock(now)
+        fallback_seconds = self.config.signal_fallback_hours * 3600.0
+        if fallback_seconds > 0 and now - baseline >= fallback_seconds:
+            self._signal_state = "fallback"
+            self._signal_reason = "持续无信号达到兜底时长，按定时方向强制开仓"
+            return self._next_timer_direction(), "fallback"
+        return None
+
+    async def _signal_reverted(
+        self,
+        now: float,
+        warnings: list[str],
+    ) -> bool:
+        """只让真实信号仓按当前中位线零交叉退出。"""
+        if self.state.signal_entry_trigger != "signal":
+            return False
+        statistics = await self._refresh_signal_statistics(now, warnings)
+        if statistics is None or not self._statistics_are_sufficient(statistics):
+            self._signal_reason += "；已有持仓仅保留最长持仓保护"
+            return False
+        assert statistics.midline is not None
+        premium = await self._current_basis()
+        deviation = premium - statistics.midline
+        self._signal_deviation = deviation
+        direction = self.state.current_direction
+        reverted = (
+            direction is RoundDirection.SHORT and deviation <= 0
+        ) or (
+            direction is RoundDirection.LONG and deviation >= 0
+        )
+        if reverted:
+            self._signal_state = "reverted"
+            self._signal_reason = "基差偏离已越过当前中位线，触发平仓"
+        else:
+            self._signal_state = "holding"
+            self._signal_reason = "基差尚未越过当前中位线，继续持仓"
+        return reverted
+
     def _clear_basis_gate_wait(self) -> None:
         """清除已结束的门控等待；没有等待时不产生额外状态写盘。"""
         if self.state.basis_gate_wait_started_at is None:
@@ -1203,13 +1610,12 @@ class TimedHedgedVolumeStrategy:
         now: float,
         warnings: list[str],
         limits: _OrderLimits,
+        *,
+        direction: RoundDirection | None = None,
+        entry_trigger: str | None = None,
     ) -> TimedVolumeResult:
         """同步建立两腿，并按实仓差补齐；无法完成时回滚到零。"""
-        direction = (
-            self.config.initial_direction
-            if self.state.last_direction is None
-            else self.state.last_direction.opposite()
-        )
+        direction = direction or self._next_timer_direction()
         notional_usd = self._current_or_sampled_notional()
         primary_quantity, hedge_quantity = await self._target_quantities(
             limits,
@@ -1371,12 +1777,27 @@ class TimedHedgedVolumeStrategy:
         self.state.round_index += 1
         self.state.current_direction = direction
         self.state.opened_at = now
-        self.state.due_at = now + self.config.cycle_seconds
+        self.state.due_at = now + (
+            self.config.max_hold_hours * 3600.0
+            if self.config.entry_mode is EntryMode.SIGNAL
+            else self.config.cycle_seconds
+        )
         self.state.basis_gate_wait_started_at = None
+        self.state.signal_entry_trigger = entry_trigger
+        self.state.signal_entry_deviation = (
+            self._signal_deviation if entry_trigger is not None else None
+        )
+        self.state.signal_entry_midline = (
+            self._signal_midline if entry_trigger is not None else None
+        )
+        self.state.signal_entry_sigma = (
+            self._signal_sigma if entry_trigger is not None else None
+        )
+        self.state.pending_close_reason = None
         self._save_state()
         return self._result("opened", primary_size, hedge_size, warnings)
 
-    def _mark_round_closed(self) -> None:
+    def _mark_round_closed(self, now: float) -> None:
         """结束当前轮次并清除所有平仓失败状态。"""
         self.state.last_direction = self.state.current_direction
         self.state.current_direction = None
@@ -1384,7 +1805,10 @@ class TimedHedgedVolumeStrategy:
         self.state.opened_at = None
         self.state.due_at = None
         self.state.basis_gate_wait_started_at = None
+        if self.config.entry_mode is EntryMode.SIGNAL:
+            self.state.last_closed_at = now
         self._clear_ledger_state(self.state)
+        self._clear_signal_entry_state(self.state)
         self._clear_close_failure_state()
         self._save_state()
 
@@ -1457,7 +1881,7 @@ class TimedHedgedVolumeStrategy:
             limits.hedge_minimum,
         )
         if flat:
-            self._mark_round_closed()
+            self._mark_round_closed(now)
             return self._result("closed", primary_size, hedge_size, warnings)
 
         net = primary_size + hedge_size
@@ -1485,8 +1909,13 @@ class TimedHedgedVolumeStrategy:
         now: float,
         warnings: list[str],
         limits: _OrderLimits,
+        *,
+        close_reason: str | None = None,
     ) -> TimedVolumeResult:
         """按两侧实仓同步平仓；只剩不可交易残余时也确定性结束本轮。"""
+        if close_reason is not None:
+            self.state.pending_close_reason = close_reason
+        self._close_reason = self.state.pending_close_reason
         primary_size, hedge_size = await self._flatten_all(warnings, limits)
         flat = self._is_effectively_flat(
             primary_size,
@@ -1496,7 +1925,7 @@ class TimedHedgedVolumeStrategy:
             limits.hedge_minimum,
         )
         if flat:
-            self._mark_round_closed()
+            self._mark_round_closed(now)
             return self._result("closed", primary_size, hedge_size, warnings)
 
         self.state.consecutive_close_failures += 1
@@ -1558,6 +1987,14 @@ class TimedHedgedVolumeStrategy:
             basis_gate_deviation=self._basis_gate_deviation,
             basis_gate_waited_seconds=self._basis_gate_waited_seconds,
             basis_gate_state=self._basis_gate_state,
+            signal_midline=self._signal_midline,
+            signal_sigma=self._signal_sigma,
+            signal_deviation=self._signal_deviation,
+            signal_sample_count=self._signal_sample_count,
+            signal_state=self._signal_state,
+            signal_reason=self._signal_reason,
+            entry_trigger=self.state.signal_entry_trigger,
+            close_reason=self._close_reason,
         )
 
     async def _run_trading_once(self, *, now: float | None = None) -> TimedVolumeResult:
@@ -1566,6 +2003,19 @@ class TimedHedgedVolumeStrategy:
         self._basis_gate_deviation = None
         self._basis_gate_waited_seconds = 0.0
         self._basis_gate_state = "open"
+        self._signal_midline = None
+        self._signal_sigma = None
+        self._signal_deviation = None
+        self._signal_sample_count = 0
+        self._signal_state = (
+            "waiting" if self.config.entry_mode is EntryMode.SIGNAL else "disabled"
+        )
+        self._signal_reason = (
+            "等待本节拍基差信号评估"
+            if self.config.entry_mode is EntryMode.SIGNAL
+            else "定时入场模式未启用基差信号"
+        )
+        self._close_reason = self.state.pending_close_reason
         warnings: list[str] = []
         blocked_leg = (
             "primary"
@@ -1633,6 +2083,33 @@ class TimedHedgedVolumeStrategy:
 
             if self.state.is_open:
                 due_at = self.state.due_at
+                if self.config.entry_mode is EntryMode.SIGNAL:
+                    if self.state.pending_close_reason is not None:
+                        return await self._close_round(
+                            current_time,
+                            warnings,
+                            limits,
+                        )
+                    if due_at is None or current_time >= due_at:
+                        close_reason = (
+                            "fallback"
+                            if self.state.signal_entry_trigger == "fallback"
+                            else "timeout"
+                        )
+                        return await self._close_round(
+                            current_time,
+                            warnings,
+                            limits,
+                            close_reason=close_reason,
+                        )
+                    if await self._signal_reverted(current_time, warnings):
+                        return await self._close_round(
+                            current_time,
+                            warnings,
+                            limits,
+                            close_reason="reverted",
+                        )
+                    return self._result("wait", primary_size, hedge_size, warnings)
                 if due_at is None or current_time >= due_at:
                     return await self._close_round(current_time, warnings, limits)
                 return self._result("wait", primary_size, hedge_size, warnings)
@@ -1640,6 +2117,23 @@ class TimedHedgedVolumeStrategy:
             if not hedge_available:
                 self._warn(warnings, "Extended 侧不可用，对冲互锁跳过新开仓")
                 return self._result("interlocked", primary_size, hedge_size, warnings)
+            if self.config.entry_mode is EntryMode.SIGNAL:
+                decision = await self._signal_entry_decision(current_time, warnings)
+                if decision is None:
+                    return self._result(
+                        "signal_waiting",
+                        primary_size,
+                        hedge_size,
+                        warnings,
+                    )
+                direction, entry_trigger = decision
+                return await self._open_round(
+                    current_time,
+                    warnings,
+                    limits,
+                    direction=direction,
+                    entry_trigger=entry_trigger,
+                )
             if not await self._basis_gate_allows_open(current_time):
                 return self._result(
                     "basis_waiting",
@@ -1765,6 +2259,10 @@ class TimedHedgedVolumeStrategy:
             hedge_entry=self.state.ledger_hedge_entry,
             primary_size=self.state.ledger_primary_size,
             hedge_size=self.state.ledger_hedge_size,
+            entry_trigger=self.state.signal_entry_trigger,
+            entry_deviation=self.state.signal_entry_deviation,
+            entry_midline=self.state.signal_entry_midline,
+            entry_sigma=self.state.signal_entry_sigma,
         )
 
     def _capture_round_ledger_entry(self, result: TimedVolumeResult) -> None:
@@ -2103,6 +2601,23 @@ class TimedHedgedVolumeStrategy:
                 "fee": str(hedge_fee),
             },
             "entry_basis_pct": str(entry_basis),
+            "entry_deviation_pct": (
+                str(context.entry_deviation)
+                if context.entry_deviation is not None
+                else None
+            ),
+            "entry_midline_pct": (
+                str(context.entry_midline)
+                if context.entry_midline is not None
+                else None
+            ),
+            "entry_sigma_pct": (
+                str(context.entry_sigma)
+                if context.entry_sigma is not None
+                else None
+            ),
+            "entry_trigger": context.entry_trigger,
+            "close_reason": result.close_reason,
             "exit_basis_pct": str(exit_basis),
             "basis_change_pct": str(exit_basis - entry_basis),
             "realized_pnl": str(realized_pnl),

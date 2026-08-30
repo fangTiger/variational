@@ -363,6 +363,14 @@ def _build_strategy(
     instance="test_instance",
     basis_gate_sigma: Decimal = Decimal("0"),
     basis_gate_max_wait_s: float = 1800.0,
+    entry_mode: str = "timer",
+    signal_sigma: Decimal = Decimal("2.0"),
+    signal_lookback_hours: float = 48.0,
+    signal_refresh_minutes: float = 15.0,
+    signal_min_samples: int = 100,
+    max_hold_hours: float = 8.0,
+    signal_fallback_hours: float = 4.0,
+    candle_loader=None,
 ):
     api = _api()
     lighter = lighter or _LighterAdapter("lighter")
@@ -384,6 +392,13 @@ def _build_strategy(
         instance=instance,
         basis_gate_sigma=basis_gate_sigma,
         basis_gate_max_wait_s=basis_gate_max_wait_s,
+        entry_mode=entry_mode,
+        signal_sigma=signal_sigma,
+        signal_lookback_hours=signal_lookback_hours,
+        signal_refresh_minutes=signal_refresh_minutes,
+        signal_min_samples=signal_min_samples,
+        max_hold_hours=max_hold_hours,
+        signal_fallback_hours=signal_fallback_hours,
     )
     strategy = api.TimedHedgedVolumeStrategy(
         lighter,
@@ -394,6 +409,7 @@ def _build_strategy(
         auth_error_types=auth_error_types,
         on_auth_error=on_auth_error,
         on_hedge_auth_error=on_hedge_auth_error,
+        candle_loader=candle_loader,
     )
     return api, strategy, lighter, extended
 
@@ -545,6 +561,97 @@ class _LedgerHedge(_ExtendedAdapter):
         del market, start_time, end_time
         self.fill_reads += 1
         return list(self.fills)
+
+
+class _SignalCandleLoader:
+    """返回两腿可控的 Hyperliquid 5 分钟 K 线并记录请求参数。"""
+
+    def __init__(self, responses: dict[str, list[dict]]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, str, int, int]] = []
+
+    async def __call__(
+        self,
+        coin: str,
+        interval: str,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> list[dict]:
+        self.calls.append((coin, interval, start_time_ms, end_time_ms))
+        return list(self.responses[coin])
+
+
+def _signal_candles(
+    premiums: tuple[Decimal, ...],
+    *,
+    start_ms: int = 1_000_000,
+) -> dict[str, list[dict]]:
+    """以对冲腿价格 100 构造能精确还原指定百分比基差的 K 线。"""
+    primary: list[dict] = []
+    hedge: list[dict] = []
+    for index, premium in enumerate(premiums):
+        timestamp = start_ms + index * 300_000
+        primary.append({"t": timestamp, "c": str(Decimal("100") + premium)})
+        hedge.append({"t": timestamp, "c": "100"})
+    return {"BTC": primary, "BTC-USD": hedge}
+
+
+_SIGNAL_HISTORY = (
+    Decimal("-0.2"),
+    Decimal("-0.1"),
+    Decimal("0"),
+    Decimal("0.1"),
+    Decimal("0.2"),
+)
+
+
+def test_hyperliquid_candle_loader_posts_exact_snapshot_request(monkeypatch) -> None:
+    """历史统计必须直接使用指定的 Hyperliquid candleSnapshot 请求结构。"""
+    from timed_volume import strategy as strategy_module
+
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def read(self) -> bytes:
+            return b'[{"t":123,"c":"100"}]'
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    def fake_urlopen(request, *, timeout):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["content_type"] = request.get_header("Content-type")
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(strategy_module, "urlopen", fake_urlopen)
+
+    candles = strategy_module._load_hyperliquid_candles_sync(
+        "io:SNDK",
+        "5m",
+        1_000,
+        2_000,
+    )
+
+    assert candles == [{"t": 123, "c": "100"}]
+    assert captured == {
+        "url": "https://api.hyperliquid.xyz/info",
+        "method": "POST",
+        "content_type": "application/json",
+        "payload": {
+            "type": "candleSnapshot",
+            "req": {
+                "coin": "io:SNDK",
+                "interval": "5m",
+                "startTime": 1_000,
+                "endTime": 2_000,
+            },
+        },
+        "timeout": strategy_module.SIGNAL_HTTP_TIMEOUT_SECONDS,
+        "closed": True,
+    }
 
 
 def test_equity_read_failure_does_not_block_close_or_next_open(tmp_path) -> None:
@@ -1180,6 +1287,379 @@ def test_basis_gate_wait_does_not_block_expired_position_close(
     assert [call["reduce_only"] for call in executor.calls] == [True, True]
     assert lighter.position == 0
     assert hedge.position == 0
+
+
+def test_timer_mode_ignores_all_signal_parameters_and_never_loads_candles(
+    tmp_path,
+) -> None:
+    """默认 timer 必须保持机械交替，所有 signal 参数都不能改变交易路径。"""
+
+    async def forbidden_loader(*args):
+        del args
+        raise AssertionError("timer 模式不得读取信号 K 线")
+
+    executor = _ScriptedExecutor()
+    api, strategy, _, _ = _build_strategy(
+        tmp_path,
+        executor=executor,
+        entry_mode="timer",
+        signal_sigma=Decimal("-1"),
+        signal_lookback_hours=0,
+        signal_refresh_minutes=0,
+        signal_min_samples=0,
+        max_hold_hours=0,
+        signal_fallback_hours=0,
+        candle_loader=forbidden_loader,
+    )
+
+    first = asyncio.run(strategy.run_once(now=0.0))
+    before_due = asyncio.run(strategy.run_once(now=35.0))
+    closed = asyncio.run(strategy.run_once(now=7200.0))
+    second = asyncio.run(strategy.run_once(now=7200.0))
+
+    assert first.action == "opened"
+    assert first.direction is api.RoundDirection.LONG
+    assert before_due.action == "wait"
+    assert closed.action == "closed"
+    assert second.action == "opened"
+    assert second.direction is api.RoundDirection.SHORT
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"signal_sigma": Decimal("0")}, "标准差倍数"),
+        ({"signal_lookback_hours": 0}, "回看小时数"),
+        ({"signal_refresh_minutes": 0}, "刷新分钟数"),
+        ({"signal_min_samples": 0}, "最少样本"),
+        ({"max_hold_hours": 0}, "最长持仓小时数"),
+        ({"signal_fallback_hours": -1}, "兜底小时数"),
+    ],
+)
+def test_signal_mode_rejects_unsafe_numeric_configuration(
+    tmp_path,
+    overrides,
+    message,
+) -> None:
+    """signal 模式必须在启动时拒绝会破坏统计或风险上限的数值。"""
+    with pytest.raises(ValueError, match=message):
+        _build_strategy(tmp_path, entry_mode="signal", **overrides)
+
+
+@pytest.mark.parametrize(
+    ("primary_mid", "expected_direction", "expected_primary_sign"),
+    [
+        (Decimal("100.30"), "short", Decimal("-1")),
+        (Decimal("99.70"), "long", Decimal("1")),
+    ],
+)
+def test_signal_entry_direction_follows_concrete_deviation_values(
+    tmp_path,
+    primary_mid,
+    expected_direction,
+    expected_primary_sign,
+) -> None:
+    """正偏离开空基差、负偏离开多基差，具体订单符号不得反转。"""
+    loader = _SignalCandleLoader(_signal_candles(_SIGNAL_HISTORY))
+    executor = _ScriptedExecutor()
+    api, strategy, primary, hedge = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=primary_mid),
+        extended=_LedgerHedge(name="hyperliquid", mid_price=Decimal("100")),
+        executor=executor,
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_fallback_hours=0,
+        candle_loader=loader,
+    )
+
+    result = asyncio.run(strategy.run_once(now=10_000.0))
+
+    assert result.action == "opened"
+    assert result.direction is api.RoundDirection(expected_direction)
+    assert result.signal_midline == Decimal("0")
+    assert result.signal_sigma == Decimal("0.02").sqrt()
+    assert result.signal_deviation == primary_mid - Decimal("100")
+    assert executor.calls[0]["target_delta"] * expected_primary_sign > 0
+    assert primary.position * expected_primary_sign > 0
+    assert hedge.position * expected_primary_sign < 0
+    assert [call[1] for call in loader.calls] == ["5m", "5m"]
+
+
+def test_signal_inside_threshold_does_not_open(tmp_path) -> None:
+    """偏离位于正负阈值之间时不得调用交易执行器。"""
+    loader = _SignalCandleLoader(_signal_candles(_SIGNAL_HISTORY))
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100.10")),
+        extended=_LedgerHedge(name="hyperliquid", mid_price=Decimal("100")),
+        executor=executor,
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_fallback_hours=0,
+        candle_loader=loader,
+    )
+
+    result = asyncio.run(strategy.run_once(now=10_000.0))
+
+    assert result.action == "signal_waiting"
+    assert result.signal_state == "within_threshold"
+    assert result.signal_deviation == Decimal("0.10")
+    assert executor.calls == []
+
+
+def test_signal_statistics_refresh_only_after_configured_interval(tmp_path) -> None:
+    """空仓轮询可每拍读当前中价，但历史 K 线只能按配置周期刷新。"""
+    loader = _SignalCandleLoader(_signal_candles(_SIGNAL_HISTORY))
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100.10")),
+        extended=_LedgerHedge(name="hyperliquid", mid_price=Decimal("100")),
+        executor=_ScriptedExecutor(),
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_refresh_minutes=15,
+        signal_fallback_hours=0,
+        candle_loader=loader,
+    )
+
+    first = asyncio.run(strategy.run_once(now=10_000.0))
+    cached = asyncio.run(strategy.run_once(now=10_899.0))
+    refreshed = asyncio.run(strategy.run_once(now=10_900.0))
+
+    assert [first.action, cached.action, refreshed.action] == [
+        "signal_waiting",
+        "signal_waiting",
+        "signal_waiting",
+    ]
+    assert len(loader.calls) == 4
+    assert loader.calls[0][2:] == loader.calls[1][2:]
+    assert loader.calls[2][2:] == loader.calls[3][2:]
+    assert loader.calls[2][3] - loader.calls[0][3] == 900_000
+
+
+def test_signal_insufficient_aligned_samples_refuses_open_and_explains_heartbeat(
+    tmp_path,
+) -> None:
+    """样本不足既不能开仓也不能触发兜底，心跳必须给出中文原因。"""
+    candles = _signal_candles(_SIGNAL_HISTORY)
+    candles["BTC-USD"] = candles["BTC-USD"][:4]
+    loader = _SignalCandleLoader(candles)
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("101")),
+        extended=_LedgerHedge(name="hyperliquid", mid_price=Decimal("100")),
+        executor=executor,
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_fallback_hours=0.001,
+        candle_loader=loader,
+    )
+
+    first = asyncio.run(strategy.run_once(now=10_000.0))
+    after_fallback_deadline = asyncio.run(strategy.run_once(now=20_000.0))
+
+    assert first.action == "signal_waiting"
+    assert after_fallback_deadline.action == "signal_waiting"
+    assert after_fallback_deadline.signal_state == "insufficient_samples"
+    assert after_fallback_deadline.signal_sample_count == 4
+    assert after_fallback_deadline.signal_reason == "基差信号样本不足：4/5，拒绝开仓"
+    assert executor.calls == []
+
+
+def test_signal_position_closes_when_positive_deviation_crosses_midline(
+    tmp_path,
+) -> None:
+    """正偏离建立的空基差仓在 deviation 由正变为负时立即平仓。"""
+    loader = _SignalCandleLoader(_signal_candles(_SIGNAL_HISTORY))
+    executor = _ScriptedExecutor()
+    primary = _LedgerLighter(mid_price=Decimal("100.30"))
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=primary,
+        extended=_LedgerHedge(name="hyperliquid", mid_price=Decimal("100")),
+        executor=executor,
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_fallback_hours=0,
+        candle_loader=loader,
+    )
+    opened = asyncio.run(strategy.run_once(now=10_000.0))
+    primary.mid_price = Decimal("99.95")
+
+    closed = asyncio.run(strategy.run_once(now=10_030.0))
+
+    assert opened.direction.value == "short"
+    assert closed.action == "closed"
+    assert closed.close_reason == "reverted"
+    assert closed.signal_deviation == Decimal("-0.05")
+    assert [call["reduce_only"] for call in executor.calls[-2:]] == [True, True]
+
+
+def test_signal_position_closes_at_max_hold_even_without_fresh_statistics(
+    tmp_path,
+) -> None:
+    """达到最长持仓时间必须优先强平，不得被行情刷新或样本状态阻塞。"""
+    loader = _SignalCandleLoader(_signal_candles(_SIGNAL_HISTORY))
+    executor = _ScriptedExecutor()
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100.30")),
+        extended=_LedgerHedge(name="hyperliquid", mid_price=Decimal("100")),
+        executor=executor,
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        max_hold_hours=2,
+        signal_fallback_hours=0,
+        candle_loader=loader,
+    )
+    opened = asyncio.run(strategy.run_once(now=10_000.0))
+    loader.responses = {}
+
+    closed = asyncio.run(strategy.run_once(now=17_200.0))
+
+    assert opened.due_at == 17_200.0
+    assert closed.action == "closed"
+    assert closed.close_reason == "timeout"
+
+
+def test_signal_close_failure_keeps_retrying_even_if_deviation_moves_back(
+    tmp_path,
+) -> None:
+    """回归触发平仓后若失败，后续必须沿用原因重试，不能重新变成持仓等待。"""
+    loader = _SignalCandleLoader(_signal_candles(_SIGNAL_HISTORY))
+    primary = _LedgerLighter(name="variational", mid_price=Decimal("100.30"))
+    hedge = _LedgerHedge(name="hyperliquid", mid_price=Decimal("100"))
+    _, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=primary,
+        extended=hedge,
+        executor=_ScriptedExecutor(),
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_fallback_hours=0,
+        candle_loader=loader,
+    )
+    asyncio.run(strategy.run_once(now=10_000.0))
+    restricted = _RestrictedVariationalCloseExecutor()
+    strategy._trade_executor = restricted
+    primary.mid_price = Decimal("99.95")
+
+    failed = asyncio.run(strategy.run_once(now=10_030.0))
+    calls_after_trigger = len(restricted.calls)
+    primary.mid_price = Decimal("100.30")
+    _, restarted, _, _ = _build_strategy(
+        tmp_path,
+        lighter=primary,
+        extended=hedge,
+        executor=restricted,
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_fallback_hours=0,
+        candle_loader=loader,
+    )
+    retried = asyncio.run(restarted.run_once(now=10_031.0))
+
+    assert failed.action == "close_failed_neutral"
+    assert restarted.state.pending_close_reason == "reverted"
+    assert retried.action in {"close_failed_neutral", "close_halted"}
+    assert len(restricted.calls) > calls_after_trigger
+    assert retried.close_reason == "reverted"
+
+
+@pytest.mark.parametrize(
+    ("fallback_hours", "expected_action"),
+    [(1.0, "opened"), (0.0, "signal_waiting")],
+)
+def test_signal_fallback_opens_on_deadline_and_zero_disables_it(
+    tmp_path,
+    fallback_hours,
+    expected_action,
+) -> None:
+    """可靠统计下持续无信号才可兜底，零值必须彻底关闭兜底。"""
+    loader = _SignalCandleLoader(_signal_candles(_SIGNAL_HISTORY))
+    executor = _ScriptedExecutor()
+    api, strategy, _, _ = _build_strategy(
+        tmp_path,
+        lighter=_LedgerLighter(mid_price=Decimal("100.05")),
+        extended=_LedgerHedge(name="hyperliquid", mid_price=Decimal("100")),
+        executor=executor,
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_fallback_hours=fallback_hours,
+        candle_loader=loader,
+    )
+    waiting = asyncio.run(strategy.run_once(now=10_000.0))
+
+    result = asyncio.run(strategy.run_once(now=13_600.0))
+
+    assert waiting.action == "signal_waiting"
+    assert result.action == expected_action
+    if fallback_hours:
+        assert result.direction is api.RoundDirection.LONG
+        assert result.entry_trigger == "fallback"
+        assert executor.calls
+        closed = asyncio.run(strategy.run_once(now=result.due_at))
+        assert closed.action == "closed"
+        assert closed.close_reason == "fallback"
+    else:
+        assert result.signal_state == "within_threshold"
+        assert executor.calls == []
+
+
+def test_signal_ledger_records_entry_statistics_and_reversion_reason(
+    tmp_path,
+) -> None:
+    """完成的信号轮必须留下可复算的入场统计与退出原因。"""
+    ledger_path = tmp_path / "signal_ledger.jsonl"
+    loader = _SignalCandleLoader(_signal_candles(_SIGNAL_HISTORY))
+    primary = _LedgerLighter(mid_price=Decimal("100.30"))
+    _, strategy, _, hedge = _build_strategy(
+        tmp_path,
+        lighter=primary,
+        extended=_LedgerHedge(name="variational", mid_price=Decimal("100")),
+        executor=_ScriptedExecutor(),
+        ledger_path=ledger_path,
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_fallback_hours=0,
+        candle_loader=loader,
+    )
+    asyncio.run(strategy.run_once(now=10_000.0))
+    primary.mid_price = Decimal("99.95")
+    _, restarted, _, _ = _build_strategy(
+        tmp_path,
+        lighter=primary,
+        extended=hedge,
+        executor=_ScriptedExecutor(),
+        ledger_path=ledger_path,
+        entry_mode="signal",
+        signal_sigma=Decimal("1"),
+        signal_min_samples=5,
+        signal_fallback_hours=0,
+        candle_loader=loader,
+    )
+
+    asyncio.run(restarted.run_once(now=10_030.0))
+    row = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+    assert Decimal(row["entry_deviation_pct"]) == Decimal("0.30")
+    assert Decimal(row["entry_midline_pct"]) == Decimal("0")
+    assert Decimal(row["entry_sigma_pct"]) == Decimal("0.02").sqrt()
+    assert row["close_reason"] == "reverted"
+    assert row["entry_trigger"] == "signal"
 
 
 def test_primary_auth_error_reloads_client_and_skips_round(tmp_path) -> None:

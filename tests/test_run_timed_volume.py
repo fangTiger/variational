@@ -82,6 +82,13 @@ def test_parser_defaults_match_two_hour_randomized_notional_plan() -> None:
     assert args.maker_timeout == 300.0
     assert args.basis_gate_sigma == Decimal("0")
     assert args.basis_gate_max_wait == 1800.0
+    assert args.entry_mode == "timer"
+    assert args.signal_sigma == Decimal("2.0")
+    assert args.signal_lookback_hours == 48.0
+    assert args.signal_refresh_minutes == 15.0
+    assert args.signal_min_samples == 100
+    assert args.max_hold_hours == 8.0
+    assert args.signal_fallback_hours == 4.0
     assert args.primary_venue == "lighter"
     assert args.primary_env_prefix == "HYPERLIQUID"
     assert args.hedge_env_prefix == "HYPERLIQUID"
@@ -94,6 +101,13 @@ def test_parser_defaults_match_two_hour_randomized_notional_plan() -> None:
     assert config.maker_timeout_s == 300.0
     assert config.basis_gate_sigma == Decimal("0")
     assert config.basis_gate_max_wait_s == 1800.0
+    assert config.entry_mode.value == "timer"
+    assert config.signal_sigma == Decimal("2.0")
+    assert config.signal_lookback_hours == 48.0
+    assert config.signal_refresh_minutes == 15.0
+    assert config.signal_min_samples == 100
+    assert config.max_hold_hours == 8.0
+    assert config.signal_fallback_hours == 4.0
     assert config.equity_path == cli._DEFAULT_HEARTBEAT.with_name(
         "timed_volume_equity.jsonl"
     )
@@ -663,6 +677,20 @@ def test_startup_summary_contains_parameters_and_current_round() -> None:
             "short",
             "--maker-timeout",
             "420",
+            "--entry-mode",
+            "signal",
+            "--signal-sigma",
+            "1.75",
+            "--signal-lookback-hours",
+            "72",
+            "--signal-refresh-minutes",
+            "10",
+            "--signal-min-samples",
+            "120",
+            "--max-hold-hours",
+            "6",
+            "--signal-fallback-hours",
+            "3",
         ]
     )
     state = TimedVolumeState(
@@ -681,6 +709,13 @@ def test_startup_summary_contains_parameters_and_current_round() -> None:
     assert "当前轮名义额：2179 USD" in summary
     assert "初始方向：short" in summary
     assert "maker 优先等待：420 秒" in summary
+    assert "入场模式：signal" in summary
+    assert "信号阈值：1.75 倍标准差" in summary
+    assert "信号回看窗口：72 小时" in summary
+    assert "信号刷新间隔：10 分钟" in summary
+    assert "信号最少样本：120" in summary
+    assert "信号最长持仓：6 小时" in summary
+    assert "信号兜底等待：3 小时" in summary
     assert "当前轮次：5" in summary
     assert "当前方向：short" in summary
     assert "到期时刻：8200.0" in summary
@@ -709,6 +744,14 @@ def test_heartbeat_contains_round_direction_due_net_and_interlock() -> None:
         basis_gate_deviation=Decimal("0.0712"),
         basis_gate_waited_seconds=45.5,
         basis_gate_state="waiting",
+        signal_midline=Decimal("0.0205"),
+        signal_sigma=Decimal("0.1007"),
+        signal_deviation=Decimal("0.2319"),
+        signal_sample_count=576,
+        signal_state="ready",
+        signal_reason="正偏离超过阈值，开空基差",
+        entry_trigger="signal",
+        close_reason=None,
     )
 
     payload = cli.heartbeat_payload(result, now=1234.5)
@@ -730,6 +773,14 @@ def test_heartbeat_contains_round_direction_due_net_and_interlock() -> None:
         "basis_gate_deviation": "0.0712",
         "basis_gate_waited_seconds": 45.5,
         "basis_gate_state": "waiting",
+        "signal_midline": "0.0205",
+        "signal_sigma": "0.1007",
+        "signal_deviation": "0.2319",
+        "signal_sample_count": 576,
+        "signal_state": "ready",
+        "signal_reason": "正偏离超过阈值，开空基差",
+        "entry_trigger": "signal",
+        "close_reason": None,
         "hedge_available": False,
         "hedge_interlock_active": True,
         "hedge_interlock_reason": "Extended 侧不可用",
@@ -1544,7 +1595,7 @@ def test_close_and_exit_cancels_resting_orders_on_both_legs(tmp_path, monkeypatc
     assert strategy.hedge.orders == []
 
 
-def test_close_and_exit_cancels_orders_after_closing_an_open_round(
+def test_signal_mode_close_and_exit_cancels_orders_after_closing_an_open_round(
     tmp_path,
     monkeypatch,
 ):
@@ -1563,6 +1614,7 @@ def test_close_and_exit_cancels_orders_after_closing_an_open_round(
             position_tolerance=Decimal("0.000001"),
             primary_market="io:SNDK",
             hedge_market="xyz:SNDK",
+            entry_mode="signal",
         )
         primary = _FakeLeg("io:SNDK", [order_a])
         hedge = _FakeLeg("xyz:SNDK", [order_b])
