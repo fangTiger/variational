@@ -215,12 +215,42 @@ def test_page_contains_no_automatic_refresh_code(tmp_path) -> None:
     assert "fetch(" not in html
 
 
-def test_panel_source_keeps_zero_credential_boundary() -> None:
-    """面板只能读本地心跳，不得引入交易所连接或凭据加载能力。"""
+def test_panel_never_loads_trading_credentials() -> None:
+    """面板不得加载任何签名凭据或可下单的交易所客户端。
+
+    2026-08-31 放宽了原「完全不联网」的约束：保证金与强平距离只能从交易所
+    读取，本地心跳里没有这些数据，而这正是用户要求新增的监控。
+    放宽的边界仅限「用公开账户地址调只读行情接口」——
+    仍然禁止加载私钥、.env 凭据，或引入具备下单能力的客户端。
+    """
     source = Path(hedge_panel.__file__).read_text(encoding="utf-8").casefold()
 
-    for forbidden in ("getenv", "load_dotenv", "httpx", "requests", "私钥"):
-        assert forbidden not in source
+    for forbidden in ("load_dotenv", "private_key", "api_key", "cookie",
+                      "signer", "trading_enabled", "market_order", "place_"):
+        assert forbidden not in source, f"面板不得出现 {forbidden}"
+
+
+def test_build_page_never_touches_network() -> None:
+    """``build_page`` 必须是纯函数，行情请求只能由调用方注入。
+
+    最初把网络请求写进 build_page，导致 28 个测试真的去打行情接口，
+    耗时从 7 秒涨到 165 秒且结果不确定。这条锁住该边界。
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(hedge_panel.build_page).strip())
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    } | {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    for forbidden in ("urlopen", "read_margin_snapshot", "_hl_info"):
+        assert forbidden not in called, f"build_page 不得直接调用 {forbidden}"
 
 
 def test_portfolio_cumulative_pnl_sums_each_account_delta_with_sources(tmp_path) -> None:

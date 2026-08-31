@@ -58,12 +58,12 @@ class VolumeInstanceConfig:
 #: 配对变更后忘了同步这里，成交量会静默统计错标的。
 DEFAULT_VOLUME_INSTANCES = (
     VolumeInstanceConfig(
-        key="variational_entropy_sndk",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_sndk.jsonl",
-        symbol="SNDK",
-        primary_source="variational",
+        key="entropy_xyz_sndk",
+        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_sndk_xyz.jsonl",
+        symbol="io:SNDK",
+        primary_source="hyperliquid_var",
         hedge_source="hyperliquid_var",
-        hedge_symbol="io:SNDK",
+        hedge_symbol="xyz:SNDK",
     ),
     VolumeInstanceConfig(
         key="lighter_variational_btc",

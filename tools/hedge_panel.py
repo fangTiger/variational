@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import http.server
 import json
 import os
@@ -105,13 +106,15 @@ class InstanceSnapshot:
 #: 2026-08-25 就发生过：A/B 停用、C 从 ETH 改成 BTC 后面板仍指向旧路径。
 DEFAULT_INSTANCES = (
     InstanceConfig(
-        key="variational_entropy_sndk",
-        name="Variational × Entropy（SNDK）",
-        primary_exchange="Variational",
-        hedge_exchange="Entropy",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_sndk.jsonl",
-        state_path=PROJECT_ROOT / "data" / "timed_volume_sndk" / "state.json",
-        lock_path=PROJECT_ROOT / "data" / "timed_volume_sndk" / "state.json.lock",
+        key="entropy_xyz_sndk",
+        name="Entropy × XYZ（SNDK）",
+        primary_exchange="Entropy",
+        hedge_exchange="XYZ",
+        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_sndk_xyz.jsonl",
+        state_path=PROJECT_ROOT / "data" / "timed_volume_sndk_xyz" / "state.json",
+        lock_path=(
+            PROJECT_ROOT / "data" / "timed_volume_sndk_xyz" / "state.json.lock"
+        ),
     ),
     InstanceConfig(
         key="lighter_variational_btc",
@@ -971,14 +974,173 @@ def _render_instance(snapshot: InstanceSnapshot, now: Decimal) -> str:
 </article>"""
 
 
+#: 强平距离配色阈值。io:SNDK 被交易所强制逐仓（strictIsolated），
+#: 爆仓时**无法动用现货余额补保证金**，所以它的强平距离必须持续可见。
+#: 实测 SNDK 在 12 小时窗口触及 4.8% 单向逆向波动的概率高达 20.9%，
+#: 故 io 腿刻意用 5 倍而非上限 10 倍（强平距离约 15.8% 而非 4.8%）。
+LIQUIDATION_DISTANCE_WARN_PCT = Decimal("12")
+LIQUIDATION_DISTANCE_DANGER_PCT = Decimal("8")
+
+#: 面板是同步渲染的，行情接口必须设超时，否则一个慢请求会卡住整页。
+MARGIN_FETCH_TIMEOUT_SECONDS = 5.0
+
+
+def _hl_info(body: dict, *, timeout: float = MARGIN_FETCH_TIMEOUT_SECONDS) -> object:
+    """调用 Hyperliquid 公开只读接口。"""
+    import json as _json
+    import urllib.request
+
+    request = urllib.request.Request(
+        "https://api.hyperliquid.xyz/info",
+        data=_json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return _json.loads(response.read())
+
+
+def read_margin_snapshot(address: str, dexes: tuple[str, ...] = ("io", "xyz")) -> dict:
+    """读取各 dex 持仓的保证金与强平距离，以及现货抵押余额。
+
+    只读公开接口，仅凭公开账户地址即可，不涉及任何签名凭据。
+    任何一步失败都返回 ``error`` 字段而不抛出——
+    面板是只读监控，可用性优先，绝不能因为这一个区块把整页搞挂。
+    """
+    result: dict = {"legs": [], "spot": None, "error": None}
+    try:
+        # 本机 Python 缺少系统根证书时 HTTPS 会失败；与其它工具用同一套修复。
+        from infra.runtime import ensure_ssl_cert
+
+        ensure_ssl_cert()
+        spot = _hl_info({"type": "spotClearinghouseState", "user": address})
+        for balance in (spot or {}).get("balances", []):
+            if balance.get("coin") == "USDC":
+                total = _to_decimal(balance.get("total"))
+                hold = _to_decimal(balance.get("hold")) or Decimal("0")
+                if total is not None:
+                    result["spot"] = {
+                        "total": total,
+                        "hold": hold,
+                        "free": total - hold,
+                    }
+                break
+        for dex in dexes:
+            state = _hl_info(
+                {"type": "clearinghouseState", "user": address, "dex": dex}
+            )
+            for entry in (state or {}).get("assetPositions", []):
+                position = entry.get("position") or {}
+                size = _to_decimal(position.get("szi"))
+                entry_px = _to_decimal(position.get("entryPx"))
+                if size is None or not size:
+                    continue
+                liq = _to_decimal(position.get("liquidationPx"))
+                distance = None
+                if liq is not None and entry_px:
+                    distance = (liq - entry_px) / entry_px * Decimal("100")
+                leverage = position.get("leverage") or {}
+                result["legs"].append(
+                    {
+                        "coin": position.get("coin"),
+                        "size": size,
+                        "entry": entry_px,
+                        "margin": _to_decimal(position.get("marginUsed")),
+                        "liquidation": liq,
+                        "distance": distance,
+                        "leverage_value": leverage.get("value"),
+                        "leverage_type": leverage.get("type"),
+                        "upnl": _to_decimal(position.get("unrealizedPnl")),
+                    }
+                )
+    except Exception as exc:  # noqa: BLE001 监控区块失败不得影响整页
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def _distance_class(distance: object) -> str:
+    """按强平距离绝对值给出配色档位。"""
+    value = _to_decimal(distance)
+    if value is None:
+        return "margin-normal"
+    magnitude = abs(value)
+    if magnitude < LIQUIDATION_DISTANCE_DANGER_PCT:
+        return "margin-danger"
+    if magnitude < LIQUIDATION_DISTANCE_WARN_PCT:
+        return "margin-warn"
+    return "margin-normal"
+
+
+def _render_margin(snapshot: dict) -> str:
+    """渲染保证金与强平距离区块。"""
+    if snapshot.get("error"):
+        body = (
+            '      <p class="margin-error">读取失败：'
+            f"{html.escape(str(snapshot['error']))}</p>\n"
+        )
+    elif not snapshot.get("legs"):
+        body = '      <p class="margin-empty">当前无持仓</p>\n'
+    else:
+        rows = []
+        for leg in snapshot["legs"]:
+            size = leg.get("size") or Decimal("0")
+            side = "多" if size > 0 else "空"
+            lev_type = leg.get("leverage_type")
+            lev_label = {"isolated": "逐仓", "cross": "全仓"}.get(
+                str(lev_type), str(lev_type or "—")
+            )
+            distance = leg.get("distance")
+            dist_text = f"{distance:+.1f}%" if distance is not None else "—"
+            rows.append(
+                "        <tr>\n"
+                f"          <td>{html.escape(str(leg.get('coin') or '—'))}</td>\n"
+                f"          <td>{side} {abs(size)}</td>\n"
+                f"          <td>{html.escape(str(leg.get('leverage_value') or '—'))}x"
+                f"（{lev_label}）</td>\n"
+                f"          <td class=\"mono\">{leg.get('margin') or '—'}</td>\n"
+                f"          <td class=\"mono\">{leg.get('liquidation') or '—'}</td>\n"
+                f"          <td class=\"mono {_distance_class(distance)}\">"
+                f"{dist_text}</td>\n"
+                "        </tr>\n"
+            )
+        body = (
+            '      <table class="margin-table">\n'
+            "        <tr><th>标的</th><th>持仓</th><th>杠杆</th>"
+            "<th>占用保证金</th><th>强平价</th><th>强平距离</th></tr>\n"
+            + "".join(rows)
+            + "      </table>\n"
+        )
+    spot = snapshot.get("spot")
+    spot_line = ""
+    if spot:
+        spot_line = (
+            '      <p class="margin-spot">抵押余额 '
+            f"总 {spot['total']} · 占用 {spot['hold']} · "
+            f"可用 {spot['free']}</p>\n"
+        )
+    return (
+        '  <section class="margin-block" aria-label="保证金与强平距离">\n'
+        "    <h3>保证金与强平距离</h3>\n"
+        f"{body}{spot_line}"
+        "    <small>强平距离绝对值低于 12% 转警示、低于 8% 转危险。"
+        "io 腿被交易所强制逐仓，爆仓时无法动用现货余额补保证金。</small>\n"
+        "  </section>\n"
+    )
+
+
 def build_page(
     *,
     instances: Iterable[InstanceConfig] = DEFAULT_INSTANCES,
     portfolio_equity_path: Path | str = DEFAULT_PORTFOLIO_EQUITY_PATH,
     portfolio_volume_path: Path | str = DEFAULT_PORTFOLIO_VOLUME_PATH,
     now: Decimal | int | str | None = None,
+    margin_snapshot: dict | None = None,
 ) -> str:
-    """采集全部实例并渲染自包含深色 HTML。"""
+    """采集全部实例并渲染自包含深色 HTML。
+
+    ``margin_snapshot`` 由调用方提供（见 ``read_margin_snapshot``）。
+    刻意不在此处发网络请求——``build_page`` 必须保持纯函数，
+    否则测试会真的去打行情接口，既慢又不确定。
+    """
     current = _to_decimal(now)
     if current is None:
         current = Decimal(str(time.time()))
@@ -1035,6 +1197,9 @@ def build_page(
     interlock_summary_class = "summary-danger" if any_interlocked else "summary-ok"
     interlock_summary = "有互锁" if any_interlocked else "无互锁"
     cards = "".join(_render_instance(snapshot, current) for snapshot in snapshots)
+    margin_block = (
+        _render_margin(margin_snapshot) if margin_snapshot is not None else ""
+    )
     portfolio_pnl = _render_portfolio_pnl(portfolio_summary)
     portfolio_volume = _render_portfolio_volume(portfolio_volume_summary)
     rendered_at = datetime.fromtimestamp(int(current)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1061,6 +1226,18 @@ def build_page(
         color: var(--text);
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
+      .margin-block { margin-top: 14px; padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+      .margin-block h3 { font-size: 15px; margin-bottom: 8px; }
+      .margin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .margin-table th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px 6px 0; border-bottom: 1px solid var(--line); }
+      .margin-table td { padding: 6px 8px 6px 0; border-bottom: 1px solid var(--panel-2); }
+      .margin-normal { color: var(--green); }
+      .margin-warn { color: var(--yellow); font-weight: 600; }
+      .margin-danger { color: var(--red); font-weight: 700; }
+      .margin-error { color: var(--yellow); font-size: 13px; }
+      .margin-empty { color: var(--muted); font-size: 13px; }
+      .margin-spot { color: var(--muted); font-size: 12px; margin-top: 8px; }
+      .margin-block small { display: block; margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.5; }
       .mono, .net-value {
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         font-variant-numeric: tabular-nums;
@@ -1312,6 +1489,7 @@ def build_page(
     </header>
     {portfolio_pnl}
     {portfolio_volume}
+    {margin_block}
     <section class="overview" aria-label="总览">
       <div class="{exposure_summary_class}">
         <span>{len(snapshots)} 个实例净敞口合计</span>
@@ -1358,16 +1536,22 @@ class HedgePanelHandler(http.server.BaseHTTPRequestHandler):
     instances = DEFAULT_INSTANCES
     portfolio_equity_path = DEFAULT_PORTFOLIO_EQUITY_PATH
     portfolio_volume_path = DEFAULT_PORTFOLIO_VOLUME_PATH
+    #: 公开账户地址，由 --margin-address 注入；留空则不渲染保证金区块。
+    margin_address = ""
 
     def do_GET(self) -> None:
         """只响应面板首页。"""
         if urlsplit(self.path).path != "/":
             self.send_error(404)
             return
+        # 只有真实服务时才去打行情接口；build_page 本身保持纯函数。
+        address = str(self.margin_address or "").strip()
+        margin_snapshot = read_margin_snapshot(address) if address else None
         body = build_page(
             instances=self.instances,
             portfolio_equity_path=self.portfolio_equity_path,
             portfolio_volume_path=self.portfolio_volume_path,
+            margin_snapshot=margin_snapshot,
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1385,7 +1569,16 @@ def main() -> None:
     """启动仅监听本机的只读面板。"""
     parser = argparse.ArgumentParser(description="启动定时定量对冲持仓面板")
     parser.add_argument("--port", type=int, default=8787, help="本地监听端口")
+    parser.add_argument(
+        "--margin-address",
+        default="",
+        help=(
+            "用于查询保证金与强平距离的公开账户地址；留空则不显示该区块。"
+            "只读公开接口，不涉及任何签名凭据"
+        ),
+    )
     args = parser.parse_args()
+    HedgePanelHandler.margin_address = args.margin_address.strip()
 
     with http.server.HTTPServer(("localhost", args.port), HedgePanelHandler) as server:
         print(f"对冲面板已启动：http://localhost:{args.port}（Ctrl+C 停止）", flush=True)
