@@ -1025,6 +1025,18 @@ def read_margin_snapshot(address: str, dexes: tuple[str, ...] = ("io", "xyz")) -
                     }
                 break
         for dex in dexes:
+            # 各 dex 的标记价互相独立（io 有专属 oracle，xyz 没有），实测系统性
+            # 相差约 0.15%，而盘口中价只差约 0.02%。未实现盈亏按标记价算会被
+            # 放大约 8 倍，但平仓是按盘口成交的，故同时取中价算预估平仓盈亏。
+            mids: dict[str, Decimal] = {}
+            try:
+                meta = _hl_info({"type": "metaAndAssetCtxs", "dex": dex})
+                for asset, ctx in zip(meta[0]["universe"], meta[1]):
+                    mid = _to_decimal(ctx.get("midPx"))
+                    if mid is not None:
+                        mids[asset["name"]] = mid
+            except Exception:  # noqa: BLE001 取不到中价只是少一列，不影响主体
+                mids = {}
             state = _hl_info(
                 {"type": "clearinghouseState", "user": address, "dex": dex}
             )
@@ -1039,8 +1051,16 @@ def read_margin_snapshot(address: str, dexes: tuple[str, ...] = ("io", "xyz")) -
                 if liq is not None and entry_px:
                     distance = (liq - entry_px) / entry_px * Decimal("100")
                 leverage = position.get("leverage") or {}
+                mid = mids.get(str(position.get("coin")))
+                est = (
+                    size * (mid - entry_px)
+                    if mid is not None and entry_px is not None
+                    else None
+                )
                 result["legs"].append(
                     {
+                        "mid": mid,
+                        "est_pnl": est,
                         "coin": position.get("coin"),
                         "size": size,
                         "entry": entry_px,
@@ -1055,6 +1075,12 @@ def read_margin_snapshot(address: str, dexes: tuple[str, ...] = ("io", "xyz")) -
     except Exception as exc:  # noqa: BLE001 监控区块失败不得影响整页
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
+
+
+def _signed(value: object) -> str:
+    """带符号渲染金额；缺失时显示破折号。"""
+    parsed = _to_decimal(value)
+    return "—" if parsed is None else f"{parsed:+.2f}"
 
 
 def _distance_class(distance: object) -> str:
@@ -1081,7 +1107,17 @@ def _render_margin(snapshot: dict) -> str:
         body = '      <p class="margin-empty">当前无持仓</p>\n'
     else:
         rows = []
+        total_upnl = Decimal("0")
+        total_est = Decimal("0")
+        est_complete = True
         for leg in snapshot["legs"]:
+            upnl = leg.get("upnl")
+            if upnl is not None:
+                total_upnl += upnl
+            if leg.get("est_pnl") is None:
+                est_complete = False
+            else:
+                total_est += leg["est_pnl"]
             size = leg.get("size") or Decimal("0")
             side = "多" if size > 0 else "空"
             lev_type = leg.get("leverage_type")
@@ -1100,13 +1136,25 @@ def _render_margin(snapshot: dict) -> str:
                 f"          <td class=\"mono\">{leg.get('liquidation') or '—'}</td>\n"
                 f"          <td class=\"mono {_distance_class(distance)}\">"
                 f"{dist_text}</td>\n"
+                f"          <td class=\"mono\">{_signed(leg.get('upnl'))}</td>\n"
+                f"          <td class=\"mono\">{_signed(leg.get('est_pnl'))}</td>\n"
                 "        </tr>\n"
             )
+        totals = (
+            "        <tr class=\"margin-total\">\n"
+            "          <td colspan=\"6\">两腿合计</td>\n"
+            f"          <td class=\"mono\">{_signed(total_upnl)}</td>\n"
+            f"          <td class=\"mono\">"
+            f"{_signed(total_est) if est_complete else '—'}</td>\n"
+            "        </tr>\n"
+        )
         body = (
             '      <table class="margin-table">\n'
             "        <tr><th>标的</th><th>持仓</th><th>杠杆</th>"
-            "<th>占用保证金</th><th>强平价</th><th>强平距离</th></tr>\n"
+            "<th>占用保证金</th><th>强平价</th><th>强平距离</th>"
+            "<th>未实现（标记价）</th><th>预估平仓（盘口）</th></tr>\n"
             + "".join(rows)
+            + totals
             + "      </table>\n"
         )
     spot = snapshot.get("spot")
@@ -1122,7 +1170,10 @@ def _render_margin(snapshot: dict) -> str:
         "    <h3>保证金与强平距离</h3>\n"
         f"{body}{spot_line}"
         "    <small>强平距离绝对值低于 12% 转警示、低于 8% 转危险。"
-        "io 腿被交易所强制逐仓，爆仓时无法动用现货余额补保证金。</small>\n"
+        "io 腿被交易所强制逐仓，爆仓时无法动用现货余额补保证金。<br>"
+        "两个 dex 的标记价互相独立，实测系统性相差约 0.15%，"
+        "而盘口中价只差约 0.02%——所以「未实现（标记价）」会把浮亏放大约 8 倍，"
+        "<b>实际平仓成本以「预估平仓（盘口）」为准</b>。</small>\n"
         "  </section>\n"
     )
 
@@ -1231,6 +1282,7 @@ def build_page(
       .margin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
       .margin-table th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px 6px 0; border-bottom: 1px solid var(--line); }
       .margin-table td { padding: 6px 8px 6px 0; border-bottom: 1px solid var(--panel-2); }
+      .margin-total td { border-top: 1px solid var(--line); border-bottom: none; color: var(--muted); font-weight: 600; }
       .margin-normal { color: var(--green); }
       .margin-warn { color: var(--yellow); font-weight: 600; }
       .margin-danger { color: var(--red); font-weight: 700; }

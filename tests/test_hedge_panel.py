@@ -885,3 +885,65 @@ def test_cumulative_sums_deltas_across_mixed_sources(tmp_path) -> None:
     # -4（平台）+ -3（自算）+ +2（平台）
     assert summary.cumulative_pnl == Decimal("-5.00")
     assert summary.computed_accounts == frozenset({"b"})
+
+
+def test_margin_block_shows_both_pnl_bases() -> None:
+    """保证金区块必须同时给出标记价口径与盘口口径的盈亏。
+
+    两个 dex 的标记价互相独立，实测系统性相差约 0.15%，而盘口中价只差
+    约 0.02%。只显示标记价口径会把浮亏放大约 8 倍，误导对实际成本的判断。
+    """
+    snapshot = {
+        "legs": [
+            {
+                "coin": "io:SNDK", "size": Decimal("1.3557"),
+                "entry": Decimal("1475.2"), "margin": Decimal("415"),
+                "liquidation": Decimal("1242"), "distance": Decimal("-15.8"),
+                "leverage_value": 5, "leverage_type": "isolated",
+                "upnl": Decimal("15.18"), "mid": Decimal("1488.9"),
+                "est_pnl": Decimal("18.55"),
+            },
+            {
+                "coin": "xyz:SNDK", "size": Decimal("-1.355"),
+                "entry": Decimal("1475.0"), "margin": Decimal("201"),
+                "liquidation": Decimal("1666"), "distance": Decimal("13.0"),
+                "leverage_value": 10, "leverage_type": "cross",
+                "upnl": Decimal("-20.05"), "mid": Decimal("1489.2"),
+                "est_pnl": Decimal("-19.24"),
+            },
+        ],
+        "spot": None,
+        "error": None,
+    }
+
+    html_text = hedge_panel._render_margin(snapshot)
+
+    assert "未实现（标记价）" in html_text
+    assert "预估平仓（盘口）" in html_text
+    assert "+15.18" in html_text and "-20.05" in html_text
+    assert "+18.55" in html_text and "-19.24" in html_text
+    # 合计两栏：标记价 -4.87，盘口 -0.69
+    assert "-4.87" in html_text, "缺少标记价口径合计"
+    assert "-0.69" in html_text, "缺少盘口口径合计"
+
+
+def test_margin_block_survives_missing_mid_prices() -> None:
+    """取不到中价时只少一列，不得整块报错。"""
+    snapshot = {
+        "legs": [
+            {
+                "coin": "io:SNDK", "size": Decimal("1"), "entry": Decimal("100"),
+                "margin": Decimal("20"), "liquidation": Decimal("85"),
+                "distance": Decimal("-15"), "leverage_value": 5,
+                "leverage_type": "isolated", "upnl": Decimal("1"),
+                "mid": None, "est_pnl": None,
+            },
+        ],
+        "spot": None,
+        "error": None,
+    }
+
+    html_text = hedge_panel._render_margin(snapshot)
+
+    assert "io:SNDK" in html_text
+    assert "—" in html_text
