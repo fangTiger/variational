@@ -947,3 +947,60 @@ def test_margin_block_survives_missing_mid_prices() -> None:
 
     assert "io:SNDK" in html_text
     assert "—" in html_text
+
+
+def test_ledger_realized_block_separates_strategy_cost(tmp_path) -> None:
+    """台账口径必须与账户口径分开显示。
+
+    2026-08-31 对账：面板账户口径显示 -37.58，而策略台账只有 -27.74，
+    差额 -9.70 全部是未平仓浮动，且被各平台标记价差异放大
+    （io 标记价长期低于自身盘口约 0.4%）。两者混在一起会高估策略磨损。
+    """
+    heartbeat = tmp_path / "inst.jsonl"
+    heartbeat.write_text("{}\n", encoding="utf-8")
+    ledger = tmp_path / "inst_ledger.jsonl"
+    ledger.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in (
+                {"realized_pnl": "-0.50", "notional_usd": 2000},
+                {"realized_pnl": "-0.30", "notional_usd": 2000},
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = hedge_panel.InstanceConfig(
+        key="k", name="测试对", primary_exchange="A", hedge_exchange="B",
+        heartbeat_path=heartbeat, state_path=tmp_path / "s.json",
+        lock_path=tmp_path / "s.json.lock",
+    )
+
+    items = hedge_panel.read_ledger_realized([config])
+
+    assert len(items) == 1
+    assert items[0]["rounds"] == 2
+    assert items[0]["realized"] == Decimal("-0.80")
+    # 单侧成交量 = 名义 × 2（开+平）× 2 轮 = 8000
+    assert items[0]["volume"] == Decimal("8000")
+    # 每万元磨损 = 0.80 / 8000 * 10000 = 1.00
+    assert items[0]["per_10k"] == Decimal("1.00")
+
+    html_text = hedge_panel._render_ledger_realized(items)
+    assert "策略已实现磨损" in html_text
+    assert "每万元磨损" in html_text
+    assert "含未实现浮动" in html_text, "必须提示与账户口径的区别"
+
+
+def test_ledger_realized_skips_instances_without_ledger(tmp_path) -> None:
+    """没有台账文件的实例直接跳过，不得报错。"""
+    heartbeat = tmp_path / "none.jsonl"
+    heartbeat.write_text("{}\n", encoding="utf-8")
+    config = hedge_panel.InstanceConfig(
+        key="k", name="无台账", primary_exchange="A", hedge_exchange="B",
+        heartbeat_path=heartbeat, state_path=tmp_path / "s.json",
+        lock_path=tmp_path / "s.json.lock",
+    )
+
+    assert hedge_panel.read_ledger_realized([config]) == []
+    assert hedge_panel._render_ledger_realized([]) == ""

@@ -1178,6 +1178,106 @@ def _render_margin(snapshot: dict) -> str:
     )
 
 
+def read_ledger_realized(instances: Iterable[InstanceConfig]) -> list[dict]:
+    """从各实例的轮次台账汇总【已实现】磨损。
+
+    ⚠️ 这与页面上的「组合累计盈亏」口径不同，务必区分：
+    - 台账口径：只记策略完成的轮次，是**策略本身的真实成本**
+    - 账户口径：平台累计盈亏，**含未实现浮动，也含手工干预与测试单**
+
+    2026-08-31 对账发现两者相差 $9.7，全部来自未平仓浮动，而浮动又被各平台
+    互不一致的标记价放大（io 标记价长期低于自身盘口约 0.4%）。
+    只看账户口径会高估策略磨损。
+    """
+    results: list[dict] = []
+    for config in instances:
+        ledger = config.heartbeat_path.with_name(
+            config.heartbeat_path.stem + "_ledger.jsonl"
+        )
+        realized = Decimal("0")
+        volume = Decimal("0")
+        rounds = 0
+        try:
+            text = ledger.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = _load_json(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            pnl = _to_decimal(row.get("realized_pnl"))
+            notional = _to_decimal(row.get("notional_usd"))
+            if pnl is None or notional is None:
+                continue
+            realized += pnl
+            volume += notional * 2   # 单侧成交量 = 开 + 平
+            rounds += 1
+        if rounds:
+            results.append(
+                {
+                    "name": config.name,
+                    "rounds": rounds,
+                    "realized": realized,
+                    "volume": volume,
+                    "per_10k": -realized / volume * Decimal("10000"),
+                }
+            )
+    return results
+
+
+def _render_ledger_realized(items: list[dict]) -> str:
+    """渲染台账口径的已实现磨损。"""
+    if not items:
+        return ""
+    rows = []
+    total_pnl = Decimal("0")
+    total_vol = Decimal("0")
+    total_rounds = 0
+    for item in items:
+        total_pnl += item["realized"]
+        total_vol += item["volume"]
+        total_rounds += item["rounds"]
+        rows.append(
+            "        <tr>\n"
+            f"          <td>{html.escape(item['name'])}</td>\n"
+            f"          <td class=\"mono\">{item['rounds']}</td>\n"
+            f"          <td class=\"mono\">{item['realized']:+.2f}</td>\n"
+            f"          <td class=\"mono\">{item['volume']:,.0f}</td>\n"
+            f"          <td class=\"mono\">{item['per_10k']:.2f}</td>\n"
+            "        </tr>\n"
+        )
+    overall = (
+        -total_pnl / total_vol * Decimal("10000") if total_vol else Decimal("0")
+    )
+    rows.append(
+        "        <tr class=\"margin-total\">\n"
+        "          <td>合计</td>\n"
+        f"          <td class=\"mono\">{total_rounds}</td>\n"
+        f"          <td class=\"mono\">{total_pnl:+.2f}</td>\n"
+        f"          <td class=\"mono\">{total_vol:,.0f}</td>\n"
+        f"          <td class=\"mono\">{overall:.2f}</td>\n"
+        "        </tr>\n"
+    )
+    return (
+        '  <section class="margin-block" aria-label="策略已实现磨损">\n'
+        "    <h3>策略已实现磨损（轮次台账口径）</h3>\n"
+        '      <table class="margin-table">\n'
+        "        <tr><th>对</th><th>轮次</th><th>已实现盈亏</th>"
+        "<th>单侧成交量</th><th>每万元磨损</th></tr>\n"
+        + "".join(rows)
+        + "      </table>\n"
+        "    <small>只统计已平仓轮次，是策略本身的真实成本。"
+        "与上方「组合累计盈亏」口径不同——后者是账户级，"
+        "含未实现浮动、手工干预与测试单，且受各平台标记价差异影响。</small>\n"
+        "  </section>\n"
+    )
+
+
 def build_page(
     *,
     instances: Iterable[InstanceConfig] = DEFAULT_INSTANCES,
@@ -1195,7 +1295,8 @@ def build_page(
     current = _to_decimal(now)
     if current is None:
         current = Decimal(str(time.time()))
-    snapshots = tuple(collect_instance(config) for config in instances)
+    configs = tuple(instances)
+    snapshots = tuple(collect_instance(config) for config in configs)
 
     # 累计运行按「实例·天」求和：三个实例各跑一天，等于累计三天的刷量时长。
     run_day_values = [
@@ -1251,6 +1352,7 @@ def build_page(
     margin_block = (
         _render_margin(margin_snapshot) if margin_snapshot is not None else ""
     )
+    ledger_block = _render_ledger_realized(read_ledger_realized(configs))
     portfolio_pnl = _render_portfolio_pnl(portfolio_summary)
     portfolio_volume = _render_portfolio_volume(portfolio_volume_summary)
     rendered_at = datetime.fromtimestamp(int(current)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1541,6 +1643,7 @@ def build_page(
     </header>
     {portfolio_pnl}
     {portfolio_volume}
+    {ledger_block}
     {margin_block}
     <section class="overview" aria-label="总览">
       <div class="{exposure_summary_class}">
