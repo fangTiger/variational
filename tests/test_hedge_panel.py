@@ -254,7 +254,13 @@ def test_build_page_never_touches_network() -> None:
 
 
 def test_portfolio_cumulative_pnl_sums_each_account_delta_with_sources(tmp_path) -> None:
-    """累计盈亏按账户分别做首末差，并提示本地计算口径。"""
+    """账户级累计盈亏按账户分别做首末差，并显式标注其局限。
+
+    2026-09-04 从主指标降级为参考项：三个平台的盈亏口径互不一致
+    （Lighter trade_pnl / Variational 流水+浮动 / HL allTime），
+    HL 的 io dex 标记价长期低于自身盘口约 0.4%，且混入手工干预与测试单。
+    实测账户口径 -53.19 vs 同期台账已实现 -31.14。
+    """
     instance = _write_instance(
         tmp_path,
         name="cumulative",
@@ -316,9 +322,11 @@ def test_portfolio_cumulative_pnl_sums_each_account_delta_with_sources(tmp_path)
     assert "累计盈亏" in html
     assert "+$5.00" in html
     assert "自 08-23 18:40 起" in html
-    assert "本地计算口径：variational" in html
-    assert "平台官方口径" in html
-    assert 'class="portfolio-pnl-value mono pnl-positive">+$5.00</' in html
+    # 2026-09-04 降级：账户口径不再是主指标，必须显式提示它不代表策略成本
+    assert "账户级累计盈亏（参考）" in html
+    assert "含未实现浮动、手工干预与测试单" in html
+    assert "判断策略成本请看下方「策略已实现磨损」" in html
+    assert 'class="mono pnl-positive">+$5.00</' in html
     assert "全部实例累计盈亏" not in html
     assert "cumulative-pnl-block" not in html
 
@@ -383,7 +391,7 @@ def test_fewer_than_two_portfolio_snapshots_show_accumulating(tmp_path) -> None:
 
     assert html.count("累计中…") == 1
     assert "+$0.00" not in html
-    assert "portfolio-pnl-value mono pnl-missing" in html
+    assert "mono pnl-missing" in html
 
 
 def test_portfolio_volume_does_not_show_approximation_for_lighter(tmp_path) -> None:

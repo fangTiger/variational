@@ -776,28 +776,38 @@ def _render_pair_pnl(value: object) -> str:
 
 
 def _render_portfolio_pnl(summary: PortfolioEquitySummary) -> str:
-    """把组合级累计盈亏渲染为页面最醒目的主指标。"""
+    """把账户级累计盈亏渲染为**次要参考**，不再作为主指标。
+
+    2026-09-04 降级。它结构性地不可靠，不是调参能修好的：
+
+    - 三个平台三套口径（Lighter 的 trade_pnl、Variational 的流水+浮动、
+      HL 的 allTime），对未实现的处理方式各不相同
+    - HL 的 io dex 标记价长期低于自身盘口约 0.4%，且随行情放大
+    - 混入了手工干预、测试单与事故损失
+    - 对冲两腿在多轮交替方向后，累计盈亏无法干净分解
+
+    实测：账户口径显示 -53.19，而同期台账已实现只有 -31.14，
+    浮动 +3.19、资金费 +0.83，约 26 美元的差额全部来自上述口径不一致。
+
+    **判断策略成本请看「策略已实现磨损（轮次台账口径）」区块。**
+    """
     if summary.ready:
         value_text = _money_text(summary.cumulative_pnl)
         value_class = _pnl_class(summary.cumulative_pnl)
-        source_hint = (
-            "平台官方口径与本地计算口径分开统计；本地计算口径："
-            + "、".join(sorted(summary.computed_accounts))
-            if summary.computed_accounts
-            else "全部账户均使用平台官方口径"
-        )
         hint = (
             f"自 {_equity_start_time(summary.started_at)} 起 · "
-            f"各账户最新累计值减首条累计值后汇总 · {source_hint}"
+            "⚠️ 账户级口径：含未实现浮动、手工干预与测试单，"
+            "且三个平台的盈亏口径互不一致（io 标记价长期偏离盘口约 0.4%）。"
+            "判断策略成本请看下方「策略已实现磨损」。"
         )
     else:
         value_text = "累计中…"
         value_class = "pnl-missing"
         hint = "等待至少两条组合权益快照"
     return (
-        '  <section class="portfolio-pnl-block" aria-label="组合累计盈亏">\n'
-        "    <span>累计盈亏</span>\n"
-        f'    <strong class="portfolio-pnl-value mono {value_class}">{_text(value_text)}</strong>\n'
+        '  <section class="portfolio-secondary" aria-label="账户级累计盈亏（参考）">\n'
+        "    <span>账户级累计盈亏（参考）</span>\n"
+        f'    <strong class="mono {value_class}">{_text(value_text)}</strong>\n'
         f"    <small>{_text(hint)}</small>\n"
         "  </section>"
     )
@@ -1379,6 +1389,10 @@ def build_page(
         color: var(--text);
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
+      .portfolio-secondary { margin-top: 12px; padding: 10px 14px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; opacity: 0.75; }
+      .portfolio-secondary span { display: block; color: var(--muted); font-size: 12px; }
+      .portfolio-secondary strong { font-size: 18px; }
+      .portfolio-secondary small { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.5; }
       .margin-block { margin-top: 14px; padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
       .margin-block h3 { font-size: 15px; margin-bottom: 8px; }
       .margin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -1641,9 +1655,9 @@ def build_page(
       <p class="rendered-at">页面渲染时间：<span class="mono">{rendered_at}</span>（本地时间）</p>
       <p class="manual-note">本页不会自动刷新，请按 F5 获取最新数据。</p>
     </header>
-    {portfolio_pnl}
-    {portfolio_volume}
     {ledger_block}
+    {portfolio_volume}
+    {portfolio_pnl}
     {margin_block}
     <section class="overview" aria-label="总览">
       <div class="{exposure_summary_class}">
