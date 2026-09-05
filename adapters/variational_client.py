@@ -11,9 +11,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,8 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 )
+
+logger = logging.getLogger(__name__)
 
 
 class VariationalAuthError(Exception):
@@ -73,6 +77,51 @@ class VariationalBalance:
     equity: Decimal
     balance: Decimal
     upnl: Decimal
+
+
+@dataclass(frozen=True)
+class SwapFundingRate:
+    """一个方向的 swap 年化费率观测。
+
+    ⚠️ ``coverage_days`` 是**向后看**的：它等于本次 ``apply_time`` 与上一次
+    ``apply_time`` 相隔的日历天数，即「距上次结算过了几天」。
+
+    它**不等于**「本次结算向前覆盖几天」——后者是一个尚未验证的开放问题
+    （见 `docs/plans/2026-09-05-swap-carry-hedge-plan.md` §6.2）：
+    平台可能在周五 21:05Z 预收 Fri/Sat/Sun 三天，也可能在周一 21:05Z 追补
+    Sat/Sun。两种情况下相邻 ``apply_time`` 的日历差完全相同，
+    **本字段无法区分它们**。
+
+    因此禁止用本字段推断「周末平仓能躲掉几次计提」。该问题只能靠
+    ``/transfers`` 里的**实际扣款金额**回答，即必须跑一次跨周末的探针仓。
+    """
+
+    raw_rate: Decimal
+    coverage_days: int | None
+    day_count_basis: int
+    normalized_annual_rate: Decimal
+    apply_time: datetime
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
+class SwapFundingPeriod:
+    """一次 swap 资金费应用时点的多空两侧费率。"""
+
+    trade_date: str
+    basis: str
+    long_rate: SwapFundingRate
+    short_rate: SwapFundingRate
+
+
+@dataclass(frozen=True)
+class SwapFundingSnapshot:
+    """Swap 下一次与最近一次资金费观测。"""
+
+    upcoming: SwapFundingPeriod
+    latest_applied: SwapFundingPeriod
+    observed_at: datetime
+    warnings: tuple[str, ...]
 
 
 @dataclass
@@ -236,7 +285,8 @@ class VariationalClient(ExchangeAdapter):
         """资金费率。/funding/v2 需要 underlying + instrument_type 两个查询参数。
 
         返回形如 {predicted_funding_rate, next_funding_time, funding_interval_s}。
-        费率为每 funding_interval_s（BTC=28800s=8h）的百分比；正=多头付空头。
+        predicted_funding_rate 是年化小数（×100 为年化百分比）；单期小数费率
+        需除以每年周期数 ``365 * 86400 / funding_interval_s``。正值表示多头付空头。
         """
         return await self._get(
             f"/funding/v2?underlying={underlying}&instrument_type={instrument_type}"
@@ -245,9 +295,85 @@ class VariationalClient(ExchangeAdapter):
     async def get_funding_rate(
         self, underlying: str = "BTC", instrument_type: str = "perpetual_future"
     ) -> Decimal:
-        """便捷方法：直接返回预测资金费率（Decimal）。"""
+        """原样返回预测资金费率，单位为年化小数（Decimal）。
+
+        返回值乘 100 才是年化百分比；若要计算单期小数费率，需再除以
+        ``365 * 86400 / funding_interval_s``。本方法不做任何单位换算。
+        """
+        if instrument_type == "swap":
+            raise ValueError(
+                "get_funding_rate() 只支持永续合约；swap 请使用 get_swap_funding()"
+            )
+        if instrument_type not in {"perpetual_future", "perpetual_rwa_future"}:
+            raise ValueError(
+                f"get_funding_rate() 只支持永续合约，不支持 {instrument_type!r}"
+            )
         data = await self.get_funding(underlying, instrument_type)
         return Decimal(str(data["predicted_funding_rate"]))
+
+    async def get_swap_funding(self, underlying: str) -> SwapFundingSnapshot:
+        """读取 swap 独立资金费端点，并保留原始费率与覆盖天数。
+
+        ``long_rate`` / ``short_rate`` 本身就是 365 天基准的年化小数，
+        所以归一化年化率与原值相同。覆盖多日只影响实际扣款金额，不能通过
+        放大或缩小年化率表达；本方法仅按相邻 ``apply_time`` 的 UTC 日历日期差
+        计算下一次应用的 ``coverage_days``。
+        """
+        payload = await self._get(f"/funding/swap?underlying={underlying}")
+        if not isinstance(payload, dict):
+            raise ValueError("Variational swap 资金费响应不是对象")
+        upcoming_raw = payload.get("upcoming")
+        latest_raw = payload.get("latest_applied")
+        if not isinstance(upcoming_raw, dict):
+            raise ValueError("Variational swap 资金费响应缺少 upcoming")
+        if not isinstance(latest_raw, dict):
+            raise ValueError("Variational swap 资金费响应缺少 latest_applied")
+
+        observed_at = datetime.now(timezone.utc)
+        upcoming_time = _parse_utc_datetime(
+            upcoming_raw.get("apply_time"),
+            label="upcoming.apply_time",
+        )
+        latest_time = _parse_utc_datetime(
+            latest_raw.get("apply_time"),
+            label="latest_applied.apply_time",
+        )
+        coverage_days = (upcoming_time.date() - latest_time.date()).days
+        if coverage_days <= 0:
+            raise ValueError("swap apply_time 必须晚于上一次 apply_time 的日历日期")
+
+        latest = _parse_swap_funding_period(
+            latest_raw,
+            apply_time=latest_time,
+            coverage_days=None,
+            observed_at=observed_at,
+        )
+        upcoming = _parse_swap_funding_period(
+            upcoming_raw,
+            apply_time=upcoming_time,
+            coverage_days=coverage_days,
+            observed_at=observed_at,
+        )
+        warnings: list[str] = []
+        if coverage_days == 1:
+            for side_name, current, previous in (
+                ("long_rate", upcoming.long_rate.raw_rate, latest.long_rate.raw_rate),
+                ("short_rate", upcoming.short_rate.raw_rate, latest.short_rate.raw_rate),
+            ):
+                if _is_approximately_threefold(current, previous):
+                    message = (
+                        f"{underlying} {side_name} 一天内出现约三倍费率突变；"
+                        "已按 coverage_days=1 处理，不解释为多日计提"
+                    )
+                    warnings.append(message)
+                    logger.warning(message)
+
+        return SwapFundingSnapshot(
+            upcoming=upcoming,
+            latest_applied=latest,
+            observed_at=observed_at,
+            warnings=tuple(warnings),
+        )
 
     async def get_open_orders(self) -> Any:
         """当前挂单。"""
@@ -415,12 +541,13 @@ class VariationalClient(ExchangeAdapter):
         return any(candidate.upper() == target for candidate in candidates)
 
     async def get_position(
-        self, underlying: str = "BTC", *, exact: bool = False
+        self, underlying: str = "BTC", *, exact: bool = True
     ) -> Position:
         """获取某标的持仓并归一化为有符号数量（qty 本身带符号：>0 多，<0 空）。
 
         market 参数传 underlying（如 "BTC"）。当前账户无持仓时返回 signed_size=0。
-        exact=True 时按 instrument.underlying 精确匹配，避免 XAU 误命中 XAUT。
+        默认按 instrument.underlying 精确匹配，避免 XAU 误命中 XAUT/XAUS；
+        仅确实依赖旧子串行为的调用方应显式传 ``exact=False``。
         TODO(有持仓后确认): /positions 填充后核对 instrument/qty 的确切字段与嵌套。
         前端侦察显示结构含 position_info.instrument 与 qty。
         """
@@ -507,15 +634,24 @@ class VariationalClient(ExchangeAdapter):
     def _instrument(
         underlying: str,
         instrument_type: str = "perpetual_future",
-        funding_interval_s: int = 3600,
+        funding_interval_s: int | None = None,
         kind: str | None = None,
     ) -> dict:
-        """构造永续 instrument 描述符；默认值保持原 BTC 流程不变。
+        """构造 instrument 描述符，并在本地拒绝非法 swap 标识。
 
         RWA 永续（perpetual_rwa_future，如 XAU）后端 schema 额外要求 kind 字段，
         取值 = 该资产的 asset_class（黄金=commodity），与前端构造一致；
         缺失会被后端拒绝：HTTP 400 missing field `kind`。非 RWA 传 None 即不带该字段。
+
+        ``None`` 是“调用方未指定”的哨兵。元数据解析完成后，普通永续沿用平台
+        instrument 标识所需的 3600，swap 则只能使用 0。
         """
+        if funding_interval_s is None:
+            funding_interval_s = 0 if instrument_type == "swap" else 3600
+        if instrument_type == "swap" and funding_interval_s != 0:
+            raise ValueError("swap instrument 的 funding_interval_s 必须为 0")
+        if instrument_type == "swap" and not kind:
+            raise ValueError("swap instrument 必须提供 kind（取自 asset_class 元数据）")
         instrument = {
             "funding_interval_s": funding_interval_s,
             "instrument_type": instrument_type,
@@ -583,10 +719,10 @@ class VariationalClient(ExchangeAdapter):
                 if not declared:
                     continue
                 asset_class = record.get("asset_class")
-                # kind 只在 RWA 类合约上要求；普通永续传 None。
+                # kind 在 RWA 与 swap 合约上要求；普通永续传 None。
                 kind = (
                     str(asset_class).strip()
-                    if declared == "perpetual_rwa_future" and asset_class
+                    if declared in {"perpetual_rwa_future", "swap"} and asset_class
                     else None
                 )
                 resolved = (declared, kind)
@@ -601,12 +737,16 @@ class VariationalClient(ExchangeAdapter):
         instrument_type: str,
         kind: str | None,
     ) -> tuple[str, str | None]:
-        """仅为默认普通永续参数自动补全股票 RWA 类型，显式参数保持不变。"""
-        if instrument_type != "perpetual_future" or kind is not None:
+        """从元数据补全自动识别类型，以及 swap/RWA 所需的 kind。"""
+        should_resolve_type = instrument_type == "perpetual_future" and kind is None
+        should_resolve_kind = instrument_type in {"swap", "perpetual_rwa_future"} and kind is None
+        if not should_resolve_type and not should_resolve_kind:
             return instrument_type, kind
         resolved = await self._instrument_kind_from_metadata(underlying)
-        if resolved is not None:
+        if resolved is not None and should_resolve_type:
             return resolved
+        if resolved is not None and resolved[0] == instrument_type:
+            return instrument_type, resolved[1]
         return instrument_type, kind
 
     async def request_quote(
@@ -616,7 +756,7 @@ class VariationalClient(ExchangeAdapter):
         qty: Decimal,
         *,
         instrument_type: str = "perpetual_future",
-        funding_interval_s: int = 3600,
+        funding_interval_s: int | None = None,
         kind: str | None = None,
     ) -> Any:
         """询价。side ∈ {buy, sell}。返回含 quote_id/bid/ask/mark_price/margin_requirements。
@@ -625,6 +765,8 @@ class VariationalClient(ExchangeAdapter):
         /quotes/accept 成交。/quotes/simple 是无状态价格预览，quote_id 不可成交。
         默认参数会根据标的元数据自动识别股票 RWA；显式黄金参数继续原样透传。
         """
+        if instrument_type == "swap" and funding_interval_s not in (None, 0):
+            raise ValueError("swap instrument 的 funding_interval_s 必须为 0")
         instrument_type, kind = await self._resolve_instrument_params(
             underlying,
             instrument_type,
@@ -662,7 +804,7 @@ class VariationalClient(ExchangeAdapter):
         *,
         reduce_only: bool = False,
         instrument_type: str = "perpetual_future",
-        funding_interval_s: int = 3600,
+        funding_interval_s: int | None = None,
         kind: str | None = None,
     ):
         """RFQ 市价成交：/quotes/simple 询价 → /quotes/accept 成交。
@@ -671,6 +813,8 @@ class VariationalClient(ExchangeAdapter):
         默认参数会根据标的元数据自动识别股票 RWA；显式黄金参数继续原样透传。
         """
         s = "buy" if side is Side.BUY else "sell"
+        if instrument_type == "swap" and funding_interval_s not in (None, 0):
+            raise ValueError("swap instrument 的 funding_interval_s 必须为 0")
         instrument_type, kind = await self._resolve_instrument_params(
             market,
             instrument_type,
@@ -698,6 +842,71 @@ class VariationalClient(ExchangeAdapter):
 
     async def close(self) -> None:
         await self._http.close()
+
+
+def _parse_utc_datetime(value: object, *, label: str) -> datetime:
+    """严格解析带时区的 ISO8601 时间并归一化为 UTC。"""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Variational swap 资金费缺少 {label}")
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"Variational swap 资金费 {label} 不是有效时间") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"Variational swap 资金费 {label} 必须带时区")
+    return parsed.astimezone(timezone.utc)
+
+
+def _finite_decimal(value: object, *, label: str) -> Decimal:
+    """严格解析 swap 费率为有限十进制数。"""
+    try:
+        parsed = Decimal(str(value))
+    except (ArithmeticError, ValueError) as exc:
+        raise ValueError(f"Variational swap 资金费 {label} 不是有效十进制数") from exc
+    if not parsed.is_finite():
+        raise ValueError(f"Variational swap 资金费 {label} 必须为有限数")
+    return parsed
+
+
+def _parse_swap_funding_period(
+    payload: dict[str, Any],
+    *,
+    apply_time: datetime,
+    coverage_days: int | None,
+    observed_at: datetime,
+) -> SwapFundingPeriod:
+    """把一个真实 swap 资金费时点解析成结构化结果。"""
+    long_raw = _finite_decimal(payload.get("long_rate"), label="long_rate")
+    short_raw = _finite_decimal(payload.get("short_rate"), label="short_rate")
+
+    def rate(raw_rate: Decimal) -> SwapFundingRate:
+        return SwapFundingRate(
+            raw_rate=raw_rate,
+            coverage_days=coverage_days,
+            day_count_basis=365,
+            # 接口原值已经是年化小数；覆盖天数不改变费率本身。
+            normalized_annual_rate=raw_rate,
+            apply_time=apply_time,
+            observed_at=observed_at,
+        )
+
+    return SwapFundingPeriod(
+        trade_date=str(payload.get("trade_date") or ""),
+        basis=str(payload.get("basis") or ""),
+        long_rate=rate(long_raw),
+        short_rate=rate(short_raw),
+    )
+
+
+def _is_approximately_threefold(current: Decimal, previous: Decimal) -> bool:
+    """判断绝对费率是否约为上次三倍，仅用于突变告警。"""
+    if previous == 0:
+        return False
+    ratio = abs(current / previous)
+    return Decimal("2.5") <= ratio <= Decimal("3.5")
 
 
 def _parse_cookie_header(cookie_str: str) -> dict[str, str]:
