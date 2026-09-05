@@ -47,6 +47,11 @@ async def build_snapshot(var: Any, ext: Any) -> dict:
         "points_total": float(pts["total_points"]),
         "carry_pct_8h": float(fv.carry_short_var_pct_8h),
         "annualized_pct_est": float(fv.annualized_pct),
+        "extended_funding_calibrated": fv.extended_calibrated,
+        "funding_warnings": [
+            "Extended 资金费单位未经校准，carry 与年化估算不可全信。",
+            *fv.warnings,
+        ],
     }
 
 

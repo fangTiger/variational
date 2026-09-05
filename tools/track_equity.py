@@ -37,6 +37,11 @@ def _report(snaps: list[dict]) -> None:
     )
     print(f"净 delta={cur['net_delta']:.5f}  名义≈${cur['notional']:.0f}  积分={cur['points_total']}")
     print(f"资金费估算 carry {cur['carry_pct_8h']:+.4f}%/8h（年化估 {cur['annualized_pct_est']:+.1f}%）")
+    if not cur.get("extended_funding_calibrated", False):
+        print("⚠️ Extended 资金费单位未经校准，以上 carry 与年化估算不可全信。")
+    for warning in cur.get("funding_warnings", []):
+        if "未经校准" not in warning:
+            print(f"⚠️ {warning}")
 
     if len(snaps) < 2:
         print("（首条快照，持有一段时间后再跑即可对比出真实 carry）")

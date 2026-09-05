@@ -3,11 +3,13 @@
 采集两腿的资金费与账户积分，计算净 carry 与推荐对冲方向，并把快照记入
 MetricsTracker 供趋势分析。入金前也能空跑（只监控积分与资金费）。
 
-⚠️ 资金费单位假设（需用一次真实资金费结算校准）：
-- Variational /funding/v2 的 predicted_funding_rate 视为「百分比 / funding_interval_s」，
-  BTC 间隔 28800s(8h)。即 0.062 表示 0.062% / 8h。
-- Extended market_statistics 的 funding_rate 视为「小数 / 1 小时」，
-  即 0.000013 表示 0.0013% / 小时。
+⚠️ 资金费单位口径：
+- Variational /funding/v2 的 predicted_funding_rate 是年化小数（×100 为年化百分比），
+  单期小数费率 = 年化值 ÷ (365 天 / funding_interval_s)。依据是 /transfers 的
+  已结算单期 funding_rate 能精确解释扣款，且按 365 天折算可还原 6 位小数年化值；
+  8h 与 4h 市场的费率帽也都折算为同一个 0.109500 年化值。
+- Extended market_statistics 的 funding_rate 暂按「小数 / 1 小时」处理，
+  即 0.000013 表示 0.0013% / 小时；该口径尚未经真实结算校准。
 """
 
 from __future__ import annotations
@@ -26,13 +28,18 @@ if TYPE_CHECKING:  # 仅类型检查导入，避免纯逻辑测试被 x10 依赖
 
 logger = get_logger("monitor")
 
-# 归一化基准：每 8 小时、每年（一年 = 3 段 8h × 365）
+# 归一化基准：每 8 小时、每年（固定采用 365 天基准）
+_SECONDS_PER_YEAR = Decimal(365 * 24 * 60 * 60)
 _PER_YEAR_FROM_8H = Decimal(3 * 365)
+_UNSTABLE_RELATIVE_GAP = Decimal("0.10")
+
+# 仅记录当前进程最近一次观测，用于识别监控循环中的方向翻转。
+_last_recommended_direction: str | None = None
 
 
 @dataclass
 class FundingView:
-    """两腿资金费对比与方向建议（均已归一化到 % / 8h）。"""
+    """两腿预测资金费对比与方向建议（费率均折算为每 8 小时百分比）。"""
 
     var_pct_8h: Decimal          # Variational 每 8h 费率（%）
     ext_pct_8h: Decimal          # Extended 每 8h 费率（%）
@@ -40,13 +47,31 @@ class FundingView:
     carry_short_var_pct_8h: Decimal
     recommended: str             # 推荐方向说明
     annualized_pct: Decimal      # 推荐方向的年化 carry（%）
+    extended_calibrated: bool    # Extended 原始费率单位是否已经结算记录校准
+    warnings: tuple[str, ...]    # 方向翻转或判定不稳健等显式告警
 
     def pretty(self) -> str:
-        return (
-            f"资金费(%/8h)  Variational={self.var_pct_8h:+.4f}  Extended={self.ext_pct_8h:+.4f}\n"
-            f"  推荐方向：{self.recommended}\n"
-            f"  净 carry：{self.carry_short_var_pct_8h:+.4f}%/8h（年化 {self.annualized_pct:+.1f}%）"
-        )
+        lines = [
+            f"预测资金费（折算 %/8h）  Variational={self.var_pct_8h:+.4f}  "
+            f"Extended={self.ext_pct_8h:+.4f}",
+            "  ⚠️ Extended 资金费单位未经校准（缺少真实结算记录），折算值与推荐方向不可全信。",
+            f"  推荐方向：{self.recommended}",
+            (
+                f"  净 carry：{self.carry_short_var_pct_8h:+.4f}%/8h"
+                f"（年化 {self.annualized_pct:+.1f}%）"
+            ),
+        ]
+        lines.extend(f"  ⚠️ {warning}" for warning in self.warnings)
+        return "\n".join(lines)
+
+
+def _funding_rates_are_close(var_pct_8h: Decimal, ext_pct_8h: Decimal) -> bool:
+    """判断两腿折算费率是否接近到不足以稳健决定方向。"""
+    difference = abs(var_pct_8h - ext_pct_8h)
+    scale = max(abs(var_pct_8h), abs(ext_pct_8h))
+    if scale == 0:
+        return True
+    return difference / scale <= _UNSTABLE_RELATIVE_GAP
 
 
 def compute_funding_view(
@@ -58,23 +83,55 @@ def compute_funding_view(
 ) -> FundingView:
     """把两腿原始费率归一化到 %/8h 并计算净 carry。
 
-    var_rate_raw: Variational 值（百分比 / var_interval）。
-    ext_rate_raw: Extended 值（小数 / ext_interval）。
+    var_rate_raw: Variational 年化小数；单期费率按 365 天基准换算。
+    ext_rate_raw: Extended 每 ``ext_interval_s`` 的小数费率；该口径未经结算校准。
     """
-    # Variational：已是百分比 / 间隔 → 换算到 8h
-    var_pct_8h = var_rate_raw * (Decimal(28800) / Decimal(var_interval_s))
-    # Extended：小数 / 间隔 → ×100 变百分比，再换算到 8h
+    if var_interval_s <= 0:
+        raise ValueError("Variational 资金费周期必须为正数")
+    if ext_interval_s <= 0:
+        raise ValueError("Extended 资金费周期必须为正数")
+
+    # Variational：年化小数 → 当前单期百分比 → 统一折算到 8h。
+    # 两步中的 var_interval_s 会约掉；保留展开写法以明确单期费率定义。
+    periods_per_year = _SECONDS_PER_YEAR / Decimal(var_interval_s)
+    var_period_pct = var_rate_raw / periods_per_year * 100
+    var_pct_8h = var_period_pct * (Decimal(28800) / Decimal(var_interval_s))
+    # Extended：暂按小数 / 间隔 → ×100 变百分比，再换算到 8h；未经真实结算校准。
     ext_pct_8h = ext_rate_raw * 100 * (Decimal(28800) / Decimal(ext_interval_s))
 
     # 方案一：Variational 做空(收 var)、Extended 做多(付 ext) → 净 = var - ext
     carry_short_var = var_pct_8h - ext_pct_8h
     # 方案二反向 → 净 = ext - var（= -carry_short_var）
     if carry_short_var >= 0:
+        direction = "short_variational"
         recommended = "Variational 做空 + Extended 做多（收 Variational 资金费）"
         best = carry_short_var
     else:
+        direction = "long_variational"
         recommended = "Variational 做多 + Extended 做空（收 Extended 资金费）"
         best = -carry_short_var
+
+    warnings: list[str] = []
+    global _last_recommended_direction
+    if (
+        _last_recommended_direction is not None
+        and direction != _last_recommended_direction
+    ):
+        warning = (
+            "推荐方向翻转：与当前进程上一次资金费观测的推荐方向相反；"
+            "Extended 单位未经校准，请勿据此自动换向。"
+        )
+        warnings.append(warning)
+        logger.warning(warning)
+    _last_recommended_direction = direction
+
+    if _funding_rates_are_close(var_pct_8h, ext_pct_8h):
+        warning = (
+            "方向判定不稳健：两腿折算费率差不超过较大绝对费率的 10%；"
+            "微小波动即可改变推荐方向。"
+        )
+        warnings.append(warning)
+        logger.warning(warning)
 
     return FundingView(
         var_pct_8h=var_pct_8h,
@@ -82,6 +139,8 @@ def compute_funding_view(
         carry_short_var_pct_8h=carry_short_var,
         recommended=recommended,
         annualized_pct=best * _PER_YEAR_FROM_8H,
+        extended_calibrated=False,
+        warnings=tuple(warnings),
     )
 
 
