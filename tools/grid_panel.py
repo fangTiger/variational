@@ -76,7 +76,7 @@ def build_unified_page() -> str:
     """组装统一面板页面。任何异常都要出页面，白屏比错误信息更危险。"""
     try:
         systems = registry.collect_all()
-        alerts = registry.collect_panel_alerts()
+        alerts = registry.collect_panel_alerts(systems)
         total = registry.total_equity(systems)
     except Exception as exc:  # noqa: BLE001
         from panel.types import PanelAlert

@@ -15,6 +15,11 @@ def test_collect_all_returns_one_status_per_provider(monkeypatch):
     assert [s.name for s in got] == ["A", "B"]
 
 
+def test_swap_carry_provider_is_registered():
+    names = [name for name, _fn in registry.PROVIDERS]
+    assert "Swap Carry（XAUS/XAU）" in names
+
+
 def test_failing_provider_does_not_break_others(monkeypatch):
     """这是本模块存在的理由：一个 provider 抛异常不能让整页白屏。"""
     def boom():
@@ -76,3 +81,29 @@ def test_alert_collection_failure_is_surfaced(monkeypatch):
     alerts = registry.collect_panel_alerts()
     assert len(alerts) == 1
     assert alerts[0].level == "critical"
+
+
+def test_collect_panel_alerts_includes_provider_alerts(monkeypatch):
+    """provider 在同一轮采集发现的告警必须进入页面告警区。"""
+    from panel.types import PanelAlert
+
+    monkeypatch.setattr(registry, "_collect_alerts", lambda: [])
+    systems = [
+        SystemStatus(
+            name="Swap Carry",
+            alive=False,
+            summary="心跳陈旧",
+            alerts=[
+                PanelAlert(
+                    key="swap_carry_heartbeat_stale",
+                    level="critical",
+                    title="守护进程心跳陈旧",
+                    action="立即检查并重启守护进程",
+                )
+            ],
+        )
+    ]
+
+    alerts = registry.collect_panel_alerts(systems)
+
+    assert [alert.key for alert in alerts] == ["swap_carry_heartbeat_stale"]

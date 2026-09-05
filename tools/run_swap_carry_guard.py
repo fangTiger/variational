@@ -1,7 +1,7 @@
-"""Swap carry 无人值守风控守护进程。
+"""Swap carry 无人值守周循环守护进程。
 
-本进程只会减少或清空既有仓位，绝不包含开仓动作。launchd 每五分钟以
-``--once`` 启动一轮；任何不确定的强平或交易时段状态都按失败关闭处理。
+launchd 每五分钟以 ``--once`` 启动一轮。既有仓位始终先执行平仓与风控检查；
+只有账户两腿均为空且所有入场条件明确满足时，才复用人工执行器尝试自动开仓。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ ensure_ssl_cert()
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
 import json  # noqa: E402
+import os  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
@@ -24,6 +25,7 @@ from adapters.base import Position  # noqa: E402
 from adapters.variational_client import (  # noqa: E402
     VariationalAuthError,
     VariationalJurisdictionError,
+    VariationalRequestError,
 )
 from engine.swap_trading_schedule import SwapTradingSchedule  # noqa: E402
 from tools.alert_check import notify  # noqa: E402
@@ -42,6 +44,10 @@ PRE_CLOSE_MINUTES = 30
 LONG_CLOSURE_THRESHOLD = timedelta(hours=4)
 CLOSE_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
+AUTO_OPEN_NOTIONAL_USD = Decimal("500")
+MIN_ENTRY_CARRY_ANNUAL = Decimal("0.05")
+MIN_TIME_TO_CLOSE = timedelta(hours=2)
+MAX_DAILY_OPEN_ATTEMPTS = 20
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,18 @@ class FlattenResult:
     complete: bool
     pending_xaus: bool
     message: str
+
+
+@dataclass(frozen=True)
+class AutoOpenResult:
+    """一轮最低优先级自动开仓判定的结果。"""
+
+    attempted: bool
+    conclusion: str
+    daily_attempts: int
+    status: str = "healthy"
+    result_code: int = 0
+    incident: bool = False
 
 
 class CloseActionError(RuntimeError):
@@ -96,12 +114,30 @@ def _read_failure_count(path: Path) -> int:
         return 0
 
 
+def _read_auto_open_state(path: Path, observed_at: datetime) -> tuple[int, bool]:
+    """读取当日尝试计数与跨轮次 INCIDENT；日期按 UTC 切换。"""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            return 0, False
+        incident = payload.get("auto_open_incident") is True
+        if payload.get("open_attempt_date") != observed_at.date().isoformat():
+            return 0, incident
+        attempts = max(0, int(payload.get("daily_open_attempts", 0)))
+        return attempts, incident
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+        return 0, False
+
+
 def _state_payload(
     *,
     observed_at: datetime,
     status: str,
     message: str,
     consecutive_failures: int,
+    open_attempt_date: str | None = None,
+    daily_open_attempts: int = 0,
+    auto_open_incident: bool = False,
 ) -> dict[str, object]:
     """构造供人工 status 置顶显示的显著状态。"""
     return {
@@ -109,6 +145,9 @@ def _state_payload(
         "status": status,
         "message": message,
         "consecutive_failures": consecutive_failures,
+        "open_attempt_date": open_attempt_date or observed_at.date().isoformat(),
+        "daily_open_attempts": daily_open_attempts,
+        "auto_open_incident": auto_open_incident,
     }
 
 
@@ -203,6 +242,278 @@ def _imbalance_reason(
     if ratio > IMBALANCE_RATIO:
         return f"双腿名义失衡 {ratio:.2%}，超过阈值 {IMBALANCE_RATIO:.2%}"
     return None
+
+
+def _exception_chain(error: BaseException) -> tuple[BaseException, ...]:
+    """展开包装异常，供业务拒绝与回滚事故精确分类。"""
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _is_skew_rejection(error: BaseException) -> bool:
+    """只把 message 含 skew 的 HTTP 422 识别为预期业务拒绝。"""
+    for item in _exception_chain(error):
+        status = getattr(item, "status", None)
+        if (
+            isinstance(item, VariationalRequestError) or status is not None
+        ) and status == 422 and "skew" in str(item).lower():
+            return True
+    return False
+
+
+def _is_rollback_failure(error: BaseException) -> bool:
+    """识别人工执行器升级的第一腿回滚事故。"""
+    return any("回滚失败" in str(item) for item in _exception_chain(error))
+
+
+def _is_safe_open_rejection(error: SystemExit) -> bool:
+    """识别尚未成交前因条件变化而安全拒绝的开仓结果。"""
+    message = str(error)
+    markers = (
+        "保证金不足",
+        "已有目标持仓",
+        "当前不可交易",
+        "距 XAUS 休市",
+        "缺少距下次休市时间",
+        "kill switch",
+        "目标名义过小",
+        "超过硬上限",
+    )
+    return any(marker in message for marker in markers)
+
+
+async def _try_auto_open(
+    var: Any,
+    *,
+    xaus_position: Position,
+    xau_position: Position,
+    schedule: SwapTradingSchedule | None,
+    schedule_error: str | None,
+    market_status: str | None,
+    kill_switch_path: Path,
+    auto_open: bool,
+    auto_open_notional: Decimal,
+    daily_attempts: int,
+    incident: bool,
+    dry_run: bool,
+    audit_path: Path,
+    observed_at: datetime,
+) -> AutoOpenResult:
+    """逐项失败关闭地判定入场，并把成交委托给人工执行器。"""
+
+    def skip(
+        reason: str,
+        *,
+        status: str = "healthy",
+        result_code: int = 0,
+        attempted: bool = False,
+        incident_state: bool = incident,
+        attempts: int | None = None,
+    ) -> AutoOpenResult:
+        recorded_attempts = daily_attempts if attempts is None else attempts
+        _append_audit(
+            audit_path,
+            {
+                "timestamp": observed_at,
+                "event": "auto_open_skipped",
+                "reason": reason,
+                "attempted": attempted,
+                "daily_open_attempts": recorded_attempts,
+                "dry_run": dry_run,
+            },
+        )
+        return AutoOpenResult(
+            attempted=attempted,
+            conclusion=reason,
+            daily_attempts=recorded_attempts,
+            status=status,
+            result_code=result_code,
+            incident=incident_state,
+        )
+
+    if not auto_open:
+        return skip("自动开仓已由 --no-auto-open 关闭")
+    if incident:
+        return skip(
+            "自动开仓已因既有 INCIDENT 停止，需人工解除后才能恢复",
+            status="incident",
+            result_code=1,
+            incident_state=True,
+        )
+    if daily_attempts >= MAX_DAILY_OPEN_ATTEMPTS:
+        return skip(
+            f"当日自动开仓尝试已达上限 {MAX_DAILY_OPEN_ATTEMPTS} 次"
+        )
+    if not xaus_position.is_flat or not xau_position.is_flat:
+        return skip(
+            "账户并非两腿都为空仓："
+            f"XAUS={xaus_position.signed_size} XAU={xau_position.signed_size}"
+        )
+    if kill_switch_path.exists():
+        return skip("kill switch 已激活，禁止自动开仓")
+
+    try:
+        target_notional = execution._validate_notional(auto_open_notional)
+    except SystemExit as exc:
+        return skip(str(exc))
+
+    if schedule_error is not None:
+        return skip(f"XAUS 时段元数据不可用，禁止自动开仓：{schedule_error}")
+    if schedule is None or not schedule.metadata_is_fresh:
+        detail = schedule.reason if schedule is not None else "无解析结果"
+        return skip(f"XAUS 时段元数据不安全，禁止自动开仓：{detail}")
+    if market_status != "open" or not schedule.is_tradable:
+        return skip(f"XAUS 当前不可交易，禁止自动开仓：{schedule.reason}")
+    if schedule.time_until_close is None:
+        return skip("XAUS 缺少距下次休市时间，禁止自动开仓")
+    if schedule.time_until_close <= MIN_TIME_TO_CLOSE:
+        return skip(
+            f"XAUS 距休市 {schedule.time_until_close}，"
+            f"未超过最短开仓窗口 {MIN_TIME_TO_CLOSE}"
+        )
+
+    try:
+        xaus_rate = execution._swap_long_rate(
+            await var.get_swap_funding(execution.XAUS_LEG.underlying)
+        )
+        xau_rate = execution._decimal(
+            await var.get_funding_rate(
+                execution.XAU_LEG.underlying,
+                execution.XAU_LEG.instrument_type,
+            ),
+            label="XAU 永续资金费率",
+        )
+        net_carry = xaus_rate + xau_rate
+    except Exception as exc:  # noqa: BLE001 入场数据不确定时只跳过，不升级故障
+        return skip(f"净 carry 读取失败，按不确定处理：{type(exc).__name__}: {exc}")
+
+    if net_carry < MIN_ENTRY_CARRY_ANNUAL:
+        return skip(
+            f"净 carry {net_carry:.4%} 低于入场阈值 "
+            f"{MIN_ENTRY_CARRY_ANNUAL:.4%}"
+        )
+
+    attempt_number = daily_attempts if dry_run else daily_attempts + 1
+    _append_audit(
+        audit_path,
+        {
+            "timestamp": observed_at,
+            "event": "auto_open_attempt",
+            "notional_usd": target_notional,
+            "net_carry_annual": net_carry,
+            "daily_open_attempts": attempt_number,
+            "dry_run": dry_run,
+        },
+    )
+    try:
+        await execution.cmd_open(
+            var,
+            target_notional,
+            yes=True,
+            dry_run=dry_run,
+            now=observed_at,
+        )
+    except SystemExit as exc:
+        if _is_skew_rejection(exc):
+            conclusion = (
+                "XAUS 开仓因 OI 偏斜被拒；本轮结束，下一轮退避后可重试："
+                f"{exc}"
+            )
+            _append_audit(
+                audit_path,
+                {
+                    "timestamp": observed_at,
+                    "event": "auto_open_skew_rejected",
+                    "message": conclusion,
+                    "daily_open_attempts": attempt_number,
+                },
+            )
+            return AutoOpenResult(True, conclusion, attempt_number)
+        if _is_rollback_failure(exc):
+            conclusion = f"自动开仓回滚失败，进入 INCIDENT：{exc}"
+            _append_audit(
+                audit_path,
+                {
+                    "timestamp": observed_at,
+                    "event": "auto_open_incident",
+                    "message": conclusion,
+                    "daily_open_attempts": attempt_number,
+                },
+            )
+            notify("Swap carry 自动开仓 INCIDENT", conclusion)
+            return AutoOpenResult(
+                True,
+                conclusion,
+                attempt_number,
+                status="incident",
+                result_code=1,
+                incident=True,
+            )
+        if _is_safe_open_rejection(exc):
+            return skip(str(exc), attempted=True, attempts=attempt_number)
+        conclusion = f"自动开仓失败：{exc}"
+    except Exception as exc:  # noqa: BLE001 报价或执行器未知错误必须显著记录
+        if _is_skew_rejection(exc):
+            conclusion = (
+                "XAUS 开仓因 OI 偏斜被拒；本轮结束，下一轮退避后可重试："
+                f"{exc}"
+            )
+            _append_audit(
+                audit_path,
+                {
+                    "timestamp": observed_at,
+                    "event": "auto_open_skew_rejected",
+                    "message": conclusion,
+                    "daily_open_attempts": attempt_number,
+                },
+            )
+            return AutoOpenResult(True, conclusion, attempt_number)
+        conclusion = f"自动开仓失败：{type(exc).__name__}: {exc}"
+    else:
+        conclusion = (
+            f"自动开仓 dry-run 完成：每腿名义 ${target_notional}"
+            if dry_run
+            else f"自动开仓完成：每腿目标名义 ${target_notional}"
+        )
+        _append_audit(
+            audit_path,
+            {
+                "timestamp": observed_at,
+                "event": "auto_open_dry_run" if dry_run else "auto_open_succeeded",
+                "message": conclusion,
+                "daily_open_attempts": attempt_number,
+            },
+        )
+        return AutoOpenResult(
+            True,
+            conclusion,
+            attempt_number,
+            status="dry_run" if dry_run else "healthy",
+        )
+
+    _append_audit(
+        audit_path,
+        {
+            "timestamp": observed_at,
+            "event": "auto_open_failed",
+            "message": conclusion,
+            "daily_open_attempts": attempt_number,
+        },
+    )
+    notify("Swap carry 自动开仓失败", conclusion)
+    return AutoOpenResult(
+        True,
+        conclusion,
+        attempt_number,
+        status="action_failed",
+        result_code=1,
+    )
 
 
 async def _close_leg(
@@ -340,20 +651,27 @@ async def run_once(
     var: Any,
     *,
     dry_run: bool = False,
+    auto_open: bool = True,
+    auto_open_notional: Decimal = AUTO_OPEN_NOTIONAL_USD,
     now: datetime | None = None,
     kill_switch_path: Path = DEFAULT_KILL_SWITCH,
     heartbeat_path: Path = DEFAULT_HEARTBEAT,
     state_path: Path = DEFAULT_STATE,
     audit_path: Path = DEFAULT_AUDIT_LOG,
 ) -> int:
-    """按固定优先级执行一轮风控，并无条件尝试写入心跳。"""
+    """先执行全部平仓风控，再以最低优先级判定自动开仓。"""
     observed_at = now or datetime.now(timezone.utc)
     if observed_at.tzinfo is None:
         raise ValueError("now 必须包含时区")
     observed_at = observed_at.astimezone(timezone.utc)
     previous_failures = _read_failure_count(state_path)
+    daily_open_attempts, auto_open_incident = _read_auto_open_state(
+        state_path, observed_at
+    )
     consecutive_failures = previous_failures
     conclusion = "本轮尚未完成"
+    auto_open_attempted = False
+    auto_open_conclusion = "未进入自动开仓判定"
     result_code = 1
     xaus_position: Position | None = None
     xau_position: Position | None = None
@@ -363,6 +681,22 @@ async def run_once(
     schedule_error: str | None = None
     market_status: str | None = None
 
+    def persist_state(status: str, message: str, failures: int) -> None:
+        """写状态时始终保留每日计数和不可自动清除的 INCIDENT。"""
+        effective_status = "incident" if auto_open_incident else status
+        _write_json(
+            state_path,
+            _state_payload(
+                observed_at=observed_at,
+                status=effective_status,
+                message=message,
+                consecutive_failures=failures,
+                open_attempt_date=observed_at.date().isoformat(),
+                daily_open_attempts=daily_open_attempts,
+                auto_open_incident=auto_open_incident,
+            ),
+        )
+
     _append_audit(
         audit_path,
         {
@@ -370,6 +704,10 @@ async def run_once(
             "event": "round_started",
             "dry_run": dry_run,
             "kill_switch": kill_switch_path.exists(),
+            "auto_open": auto_open,
+            "auto_open_notional": auto_open_notional,
+            "daily_open_attempts": daily_open_attempts,
+            "auto_open_incident": auto_open_incident,
         },
     )
     try:
@@ -456,20 +794,51 @@ async def run_once(
                         f"{schedule.time_until_close} 后开始"
                     )
 
-        if reason is None:
+        if reason is None and xaus_position.is_flat and xau_position.is_flat:
+            open_result = await _try_auto_open(
+                var,
+                xaus_position=xaus_position,
+                xau_position=xau_position,
+                schedule=schedule,
+                schedule_error=schedule_error,
+                market_status=market_status,
+                kill_switch_path=kill_switch_path,
+                auto_open=auto_open,
+                auto_open_notional=auto_open_notional,
+                daily_attempts=daily_open_attempts,
+                incident=auto_open_incident,
+                dry_run=dry_run,
+                audit_path=audit_path,
+                observed_at=observed_at,
+            )
+            auto_open_attempted = open_result.attempted
+            auto_open_conclusion = open_result.conclusion
+            daily_open_attempts = open_result.daily_attempts
+            auto_open_incident = open_result.incident
+            conclusion = open_result.conclusion
+            result_code = open_result.result_code
+            consecutive_failures = (
+                previous_failures + 1 if result_code != 0 else 0
+            )
+            persist_state(open_result.status, conclusion, consecutive_failures)
+        elif reason is None:
+            auto_open_conclusion = "已有双腿持仓，自动开仓不适用"
             conclusion = "无需动作：仓位与风控检查正常"
             consecutive_failures = 0
-            _write_json(
-                state_path,
-                _state_payload(
-                    observed_at=observed_at,
-                    status="healthy",
-                    message=conclusion,
-                    consecutive_failures=0,
-                ),
+            _append_audit(
+                audit_path,
+                {
+                    "timestamp": observed_at,
+                    "event": "auto_open_skipped",
+                    "reason": auto_open_conclusion,
+                    "attempted": False,
+                    "daily_open_attempts": daily_open_attempts,
+                },
             )
+            persist_state("healthy", conclusion, 0)
             result_code = 0
         else:
+            auto_open_conclusion = f"平仓/风控检查优先命中：{reason}"
             print(f"守护进程命中风控：{reason}")
             flatten_result = await _flatten(
                 var,
@@ -515,26 +884,12 @@ async def run_once(
                     if dry_run
                     else state_status if state_status != "healthy" else "flattened"
                 )
-                _write_json(
-                    state_path,
-                    _state_payload(
-                        observed_at=observed_at,
-                        status=completed_status,
-                        message=conclusion,
-                        consecutive_failures=0,
-                    ),
-                )
+                persist_state(completed_status, conclusion, 0)
                 result_code = 0
             else:
                 consecutive_failures = previous_failures + 1
-                _write_json(
-                    state_path,
-                    _state_payload(
-                        observed_at=observed_at,
-                        status="pending_xaus_close",
-                        message=conclusion,
-                        consecutive_failures=consecutive_failures,
-                    ),
+                persist_state(
+                    "pending_xaus_close", conclusion, consecutive_failures
                 )
                 result_code = 1
     except (VariationalJurisdictionError, VariationalAuthError) as exc:
@@ -545,30 +900,14 @@ async def run_once(
             else "会话失效"
         )
         conclusion = f"{category}导致守护进程无法平仓：{exc}"
-        _write_json(
-            state_path,
-            _state_payload(
-                observed_at=observed_at,
-                status="action_failed",
-                message=conclusion,
-                consecutive_failures=consecutive_failures,
-            ),
-        )
+        persist_state("action_failed", conclusion, consecutive_failures)
         notify("Swap carry 无法自动平仓", conclusion)
         print(f"🚨 {conclusion}")
         result_code = 1
     except Exception as exc:  # noqa: BLE001 任意未知错误都不得静默
         consecutive_failures = previous_failures + 1
         conclusion = f"守护轮次失败，无法确认已安全平仓：{type(exc).__name__}: {exc}"
-        _write_json(
-            state_path,
-            _state_payload(
-                observed_at=observed_at,
-                status="action_failed",
-                message=conclusion,
-                consecutive_failures=consecutive_failures,
-            ),
-        )
+        persist_state("action_failed", conclusion, consecutive_failures)
         notify("Swap carry 守护进程失败", conclusion)
         print(f"🚨 {conclusion}")
         result_code = 1
@@ -596,6 +935,10 @@ async def run_once(
             "xaus_schedule": _schedule_payload(schedule),
             "consecutive_failures": consecutive_failures,
             "dry_run": dry_run,
+            "auto_open_attempted": auto_open_attempted,
+            "auto_open_conclusion": auto_open_conclusion,
+            "daily_open_attempts": daily_open_attempts,
+            "auto_open_incident": auto_open_incident,
         }
         _write_json(heartbeat_path, heartbeat)
         _append_audit(
@@ -617,6 +960,8 @@ async def _main(args: argparse.Namespace) -> int:
         return await run_once(
             var,
             dry_run=args.dry_run,
+            auto_open=args.auto_open,
+            auto_open_notional=args.auto_open_notional,
             kill_switch_path=args.kill_switch,
             heartbeat_path=args.heartbeat,
             state_path=args.state,
@@ -627,12 +972,31 @@ async def _main(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """构造只支持单轮降险的命令行参数。"""
+    """构造单轮周循环守护命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="Variational swap carry 无人值守风控守护进程（只平仓）"
+        description="Variational swap carry 无人值守周循环守护进程"
     )
     parser.add_argument("--once", action="store_true", help="执行一轮后退出")
     parser.add_argument("--dry-run", action="store_true", help="判定并询价，但不 accept")
+    parser.add_argument(
+        "--no-auto-open",
+        dest="auto_open",
+        action="store_false",
+        default=True,
+        help="关闭自动开仓，但保留全部自动平仓与风控",
+    )
+    parser.add_argument(
+        "--auto-open-notional",
+        type=Decimal,
+        default=os.environ.get(
+            "AUTO_OPEN_NOTIONAL_USD", str(AUTO_OPEN_NOTIONAL_USD)
+        ),
+        help=(
+            "自动开仓每腿目标名义美元；默认读取 AUTO_OPEN_NOTIONAL_USD，"
+            f"未配置时为 {AUTO_OPEN_NOTIONAL_USD}，硬上限 "
+            f"{execution.MAX_NOTIONAL_USD}"
+        ),
+    )
     parser.add_argument("--kill-switch", type=Path, default=DEFAULT_KILL_SWITCH)
     parser.add_argument("--heartbeat", type=Path, default=DEFAULT_HEARTBEAT)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
@@ -641,7 +1005,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """清理代理变量后运行单轮守护；永不进入自动开仓循环。"""
+    """清理代理变量后运行单轮周循环守护。"""
     args = build_parser().parse_args(argv)
     removed = execution._load_environment_without_proxy()
     if removed:

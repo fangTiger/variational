@@ -703,8 +703,19 @@ def _transfer_underlying(row: Mapping[str, Any]) -> str | None:
     return str(value).upper() if value not in (None, "") else None
 
 
-async def _settled_funding_by_leg(var: Any) -> dict[str, Decimal]:
-    """分页读取 /transfers，并按真实已结算 qty 汇总两腿资金费。"""
+async def _settled_funding_by_leg(
+    var: Any,
+    *,
+    since: datetime | None = None,
+) -> dict[str, Decimal]:
+    """分页读取 /transfers，并按真实已结算 qty 汇总两腿资金费。
+
+    ``since`` 用于面板的本周口径；人工 status 不传时继续展示全部历史。
+    """
+    if since is not None:
+        if since.tzinfo is None:
+            raise ValueError("资金费起始时间必须包含时区")
+        since = since.astimezone(timezone.utc)
     totals = {XAUS_LEG.underlying: Decimal("0"), XAU_LEG.underlying: Decimal("0")}
     offset = 0
     object_count: int | None = None
@@ -731,6 +742,12 @@ async def _settled_funding_by_leg(var: Any) -> dict[str, Decimal]:
                 raise ValueError("/transfers 流水不是对象")
             if row.get("funding_rate") in (None, ""):
                 continue
+            if since is not None:
+                created_at = _guard_timestamp(row.get("created_at"))
+                if created_at is None:
+                    raise ValueError("/transfers 资金费流水 created_at 无效")
+                if created_at < since:
+                    continue
             underlying = _transfer_underlying(row)
             if underlying not in totals:
                 continue
