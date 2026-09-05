@@ -681,7 +681,7 @@ class VariationalClient(ExchangeAdapter):
             logger.warning("%s 缺少有效标记价，无法降级计算强平价", market)
             return None
 
-        maint = await self._get_maintenance_margin(market)
+        maint = await self._get_maintenance_margin(market, quote=quote)
         if maint is None:
             return None
         port = await self.raw("/portfolio")
@@ -712,17 +712,15 @@ class VariationalClient(ExchangeAdapter):
                     return found
         return None
 
-    async def _get_maintenance_margin(self, market: str) -> Decimal | None:
-        """读取指定标的维持保证金率，不使用写死默认值。"""
-        try:
-            payload = await self.raw("/settlement_pools/details")
-        except Exception as exc:  # noqa: BLE001 缺失参数时宁可不提供强平价
-            logger.warning("读取 %s 维持保证金参数失败：%s", market, exc)
-            return None
+    def _maintenance_margin_from_payload(
+        self,
+        payload: Any,
+        market: str,
+    ) -> Decimal | None:
+        """从含 margin_params 的真实响应中严格选择标的维持保证金。"""
         margin_params = self._find_margin_params(payload)
         params = margin_params.get("params") if margin_params is not None else None
         if not isinstance(params, dict):
-            logger.warning("%s 维持保证金响应缺少 margin_params.params", market)
             return None
 
         asset_params = params.get("asset_params")
@@ -746,18 +744,44 @@ class VariationalClient(ExchangeAdapter):
         elif use_default_asset_param is False:
             selected = asset_param
         else:
+            return None
+
+        return self._decimal_or_none(
+            selected.get("futures_maintenance_margin")
+            if isinstance(selected, dict)
+            else None
+        )
+
+    async def _get_maintenance_margin(
+        self,
+        market: str,
+        *,
+        quote: dict[str, Any] | None = None,
+    ) -> Decimal | None:
+        """优先读 indicative 报价参数，再以结算池参数兜底。"""
+        if quote is not None:
+            quote_maint = self._maintenance_margin_from_payload(quote, market)
+            if quote_maint is not None:
+                return quote_maint
+        try:
+            payload = await self.raw("/settlement_pools/details")
+        except Exception as exc:  # noqa: BLE001 缺失参数时宁可不提供强平价
+            logger.warning("读取 %s 维持保证金参数失败：%s", market, exc)
+            return None
+        margin_params = self._find_margin_params(payload)
+        params = margin_params.get("params") if margin_params is not None else None
+        if not isinstance(params, dict):
+            logger.warning("%s 维持保证金响应缺少 margin_params.params", market)
+            return None
+
+        if params.get("use_default_asset_param") not in (True, False):
             logger.warning(
                 "%s margin_params.params 缺少有效 use_default_asset_param，"
                 "拒绝猜测维持保证金",
                 market,
             )
             return None
-
-        maint = self._decimal_or_none(
-            selected.get("futures_maintenance_margin")
-            if isinstance(selected, dict)
-            else None
-        )
+        maint = self._maintenance_margin_from_payload(payload, market)
         if maint is None:
             logger.warning("%s 缺少有效 futures_maintenance_margin", market)
         return maint

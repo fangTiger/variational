@@ -356,6 +356,57 @@ def test_liquidation_fallback_reads_asset_maintenance_margin() -> None:
     assert result[1] != (Decimal("-100") - Decimal("5")) / Decimal("-1.1")
 
 
+def test_xau_liquidation_prefers_quote_margin_params_asset_override() -> None:
+    """XAU 自算强平价应优先使用 indicative 报价里的真实标的 MM。"""
+    client, calls = _liquidation_client(
+        [
+            {
+                "position_info": {
+                    "instrument": {
+                        "underlying": "XAU",
+                        "instrument_type": "perpetual_rwa_future",
+                        "funding_interval_s": 3600,
+                        "settlement_asset": "USDC",
+                        "kind": "commodity",
+                    },
+                    "qty": "-1",
+                    "avg_entry_price": "4000",
+                },
+                "price_info": {"underlying_price": "4000"},
+                "margin_mode": "cross",
+            }
+        ],
+        quote={
+            "quote_id": "quote-xau",
+            "bid": "3999",
+            "ask": "4001",
+            "mark_price": "4000",
+            "margin_requirements": {},
+            "margin_params": {
+                "params": {
+                    "asset_params": {
+                        "XAU": {"futures_maintenance_margin": "0.025"}
+                    },
+                    "default_asset_param": {
+                        "futures_maintenance_margin": "0.1"
+                    },
+                    "use_default_asset_param": False,
+                }
+            },
+        },
+        raw_responses={"/portfolio": {"balance": "200", "upnl": "0"}},
+    )
+
+    result = asyncio.run(client.get_liquidation_info("XAU"))
+
+    assert result == (
+        Decimal("4000"),
+        (Decimal("-4000") - Decimal("200"))
+        / (Decimal("-1") - Decimal("0.025")),
+    )
+    assert ("raw", "/settlement_pools/details") not in calls
+
+
 def test_liquidation_fallback_honors_default_asset_param_switch() -> None:
     """配置明确启用默认参数时，必须忽略同名标的覆盖值。"""
     client, _ = _liquidation_client(

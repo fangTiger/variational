@@ -24,7 +24,7 @@ from adapters.variational_client import (
     SwapFundingSnapshot,
     VariationalClient,
 )
-from engine.swap_carry import calculate_carry_returns
+from engine.swap_carry import calculate_carry_returns, derive_perp_accrual_ratio
 from engine.swap_trading_schedule import parse_trading_schedule
 from tools.verify_funding_units import remove_proxy_environment
 
@@ -407,7 +407,21 @@ async def sample_once(
         "n_roundtrips": n_roundtrips,
         "n_rebalance": n_rebalance,
     }
-    if xau_funding is not None and isinstance(xaus_funding, Mapping):
+    perp_accrual_ratio: Decimal | None = None
+    if xaus_record is not None:
+        try:
+            perp_accrual_ratio = derive_perp_accrual_ratio(
+                xaus_record.get("trading_sessions"),
+                period=timedelta(days=7),
+            )
+            carry["perp_accrual_ratio"] = str(perp_accrual_ratio)
+        except Exception as exc:  # noqa: BLE001 收益参数失败不丢原始费率
+            errors.append(_error("perp_accrual_ratio", exc))
+    if (
+        xau_funding is not None
+        and isinstance(xaus_funding, Mapping)
+        and perp_accrual_ratio is not None
+    ):
         try:
             long_rate = xaus_funding["long_rate"]
             if not isinstance(long_rate, Mapping):
@@ -416,6 +430,7 @@ async def sample_once(
                 f_perp=Decimal(str(xau_funding["raw_rate"])),
                 f_swap=abs(Decimal(str(long_rate["normalized_annual_rate"]))),
                 hold_ratio=hold_ratio,
+                perp_accrual_ratio=perp_accrual_ratio,
                 swap_ratio=swap_ratio,
                 cost_bps=cost_bps,
                 n_roundtrips=n_roundtrips,

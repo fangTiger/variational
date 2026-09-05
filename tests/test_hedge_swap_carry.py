@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -257,6 +258,26 @@ def _accepted_markets(client: StrictFakeVariational) -> list[tuple[str, str, boo
     ]
 
 
+def test_all_structure_parameter_defaults_use_default_structure() -> None:
+    """所有可省略 structure 的 Python 调用入口必须与 CLI 默认结构一致。"""
+    from tools import hedge_swap_carry
+
+    functions = {
+        name: value
+        for name, value in vars(hedge_swap_carry).items()
+        if inspect.isfunction(value)
+        and "structure" in inspect.signature(value).parameters
+        and inspect.signature(value).parameters["structure"].default
+        is not inspect.Parameter.empty
+    }
+
+    assert functions
+    assert {
+        name: inspect.signature(value).parameters["structure"].default
+        for name, value in functions.items()
+    } == {name: hedge_swap_carry.DEFAULT_STRUCTURE for name in functions}
+
+
 def test_open_rejects_notional_over_hard_cap_without_any_order() -> None:
     """超过硬上限必须在任何行情或下单调用前拒绝。"""
     from tools import hedge_swap_carry
@@ -292,6 +313,7 @@ def test_open_rejects_active_kill_switch_before_any_network_call(
             hedge_swap_carry.cmd_open(
                 client,
                 Decimal("50"),
+                structure=hedge_swap_carry.XAUS_XAU,
                 yes=True,
                 now=OPEN_NOW,
             )
@@ -312,6 +334,7 @@ def test_open_rejects_when_xaus_market_is_closed() -> None:
             hedge_swap_carry.cmd_open(
                 client,
                 Decimal("50"),
+                structure=hedge_swap_carry.XAUS_XAU,
                 yes=True,
                 now=OPEN_NOW,
             )
@@ -331,6 +354,7 @@ def test_open_rejects_with_less_than_thirty_minutes_to_close() -> None:
             hedge_swap_carry.cmd_open(
                 client,
                 Decimal("50"),
+                structure=hedge_swap_carry.XAUS_XAU,
                 yes=True,
                 now=NEAR_CLOSE_NOW,
             )
@@ -354,6 +378,7 @@ def test_second_leg_rejection_rolls_back_first_leg_reduce_only(monkeypatch) -> N
             hedge_swap_carry.cmd_open(
                 client,
                 Decimal("50"),
+                structure=hedge_swap_carry.XAUS_XAU,
                 yes=True,
                 now=OPEN_NOW,
             )
@@ -381,6 +406,7 @@ def test_second_leg_and_rollback_failure_is_loud_nonzero(monkeypatch, capsys) ->
             hedge_swap_carry.cmd_open(
                 client,
                 Decimal("50"),
+                structure=hedge_swap_carry.XAUS_XAU,
                 yes=True,
                 now=OPEN_NOW,
             )
@@ -408,6 +434,7 @@ def test_position_delay_is_polled_then_second_leg_opens(monkeypatch) -> None:
         hedge_swap_carry.cmd_open(
             client,
             Decimal("50"),
+            structure=hedge_swap_carry.XAUS_XAU,
             yes=True,
             now=OPEN_NOW,
         )
@@ -435,6 +462,7 @@ def test_jurisdiction_403_has_dedicated_message() -> None:
             hedge_swap_carry.cmd_open(
                 client,
                 Decimal("50"),
+                structure=hedge_swap_carry.XAUS_XAU,
                 yes=True,
                 now=OPEN_NOW,
             )
@@ -455,6 +483,7 @@ def test_dry_run_completes_checks_and_quotes_without_accept() -> None:
         hedge_swap_carry.cmd_open(
             client,
             Decimal("50"),
+            structure=hedge_swap_carry.XAUS_XAU,
             yes=True,
             dry_run=True,
             now=OPEN_NOW,
@@ -473,7 +502,13 @@ def test_status_warns_loudly_when_only_one_leg_remains(capsys) -> None:
         positions={"XAUS": Decimal("0.0125"), "XAU": Decimal("0")}
     )
 
-    asyncio.run(hedge_swap_carry.cmd_status(client, now=OPEN_NOW))
+    asyncio.run(
+        hedge_swap_carry.cmd_status(
+            client,
+            structure=hedge_swap_carry.XAUS_XAU,
+            now=OPEN_NOW,
+        )
+    )
 
     output = capsys.readouterr().out
     assert "🚨" in output
@@ -493,6 +528,7 @@ def test_open_rejects_when_equity_cannot_cover_both_initial_margins() -> None:
             hedge_swap_carry.cmd_open(
                 client,
                 Decimal("50"),
+                structure=hedge_swap_carry.XAUS_XAU,
                 yes=True,
                 now=OPEN_NOW,
             )
@@ -574,7 +610,7 @@ def test_leg_descriptors_are_fixed_to_xaus_long_then_xau_short() -> None:
     """合约类型、周期、kind 与方向不得被参数化或调换。"""
     from tools import hedge_swap_carry
 
-    first, second = hedge_swap_carry._opening_plan()
+    first, second = hedge_swap_carry._opening_plan(hedge_swap_carry.XAUS_XAU)
     assert (
         first.underlying,
         first.open_side,
@@ -604,7 +640,14 @@ def test_close_does_not_require_opening_margin_fields(monkeypatch) -> None:
         include_quote_margin=False,
     )
 
-    asyncio.run(hedge_swap_carry.cmd_close(client, yes=True, now=OPEN_NOW))
+    asyncio.run(
+        hedge_swap_carry.cmd_close(
+            client,
+            structure=hedge_swap_carry.XAUS_XAU,
+            yes=True,
+            now=OPEN_NOW,
+        )
+    )
 
     assert _accepted_markets(client) == [
         ("XAUS", "sell", True),
@@ -676,7 +719,13 @@ def test_status_reports_liquidation_carry_schedule_and_actual_transfers(capsys) 
         positions={"XAUS": Decimal("0.0125"), "XAU": Decimal("-0.0125")},
     )
 
-    asyncio.run(hedge_swap_carry.cmd_status(client, now=OPEN_NOW))
+    asyncio.run(
+        hedge_swap_carry.cmd_status(
+            client,
+            structure=hedge_swap_carry.XAUS_XAU,
+            now=OPEN_NOW,
+        )
+    )
 
     output = capsys.readouterr().out
     assert "XAUS 数量=0.0125，权重=1，名义=$50.00" in output
@@ -729,7 +778,13 @@ def test_status_puts_incident_and_stale_guard_heartbeat_first(
         positions={"XAUS": Decimal("0"), "XAU": Decimal("0")}
     )
 
-    asyncio.run(hedge_swap_carry.cmd_status(client, now=OPEN_NOW))
+    asyncio.run(
+        hedge_swap_carry.cmd_status(
+            client,
+            structure=hedge_swap_carry.XAUS_XAU,
+            now=OPEN_NOW,
+        )
+    )
 
     output = capsys.readouterr().out
     assert output.index("地区封锁") < output.index("swap carry 状态")

@@ -220,7 +220,7 @@ def resolve_structure(value: CarryStructure | str) -> CarryStructure:
 
 
 def _opening_plan(
-    structure: CarryStructure | str = XAUS_XAU,
+    structure: CarryStructure | str = DEFAULT_STRUCTURE,
 ) -> tuple[CarryLeg, ...]:
     """返回结构声明的不可调换开仓顺序。"""
     return resolve_structure(structure).legs
@@ -408,7 +408,7 @@ def _positions_net_delta(
 
 async def _net_delta(
     var: Any,
-    structure: CarryStructure | str = XAUS_XAU,
+    structure: CarryStructure | str = DEFAULT_STRUCTURE,
 ) -> tuple[Decimal, ...]:
     """兼容返回各腿有符号数量，并在末尾附加净 delta。"""
     selected = resolve_structure(structure)
@@ -548,7 +548,7 @@ def _prepare_quote(
 async def _prepare_open_quotes(
     var: Any,
     target_notional: Decimal,
-    structure: CarryStructure | str = XAUS_XAU,
+    structure: CarryStructure | str = DEFAULT_STRUCTURE,
 ) -> tuple[tuple[PreparedQuote, ...], Decimal]:
     """询价并按相对权重生成全部腿的计划；全程不 accept。"""
     selected = resolve_structure(structure)
@@ -762,7 +762,7 @@ async def _rollback_first_leg(var: Any, qty: Decimal) -> None:
 async def _await_net_delta(
     var: Any,
     tolerance: Decimal,
-    structure: CarryStructure | str = XAUS_XAU,
+    structure: CarryStructure | str = DEFAULT_STRUCTURE,
 ) -> tuple[Decimal, ...]:
     """轮询最终净 delta，容忍后续腿的 /positions 最终一致延迟。"""
     selected = resolve_structure(structure)
@@ -780,7 +780,7 @@ async def cmd_open(
     var: Any,
     notional: Decimal = DEFAULT_NOTIONAL_USD,
     *,
-    structure: CarryStructure | str = XAUS_XAU,
+    structure: CarryStructure | str = DEFAULT_STRUCTURE,
     yes: bool = False,
     dry_run: bool = False,
     now: datetime | None = None,
@@ -1033,7 +1033,7 @@ async def _settled_funding_by_leg(
     var: Any,
     *,
     since: datetime | None = None,
-    structure: CarryStructure | str = XAUS_XAU,
+    structure: CarryStructure | str = DEFAULT_STRUCTURE,
 ) -> dict[str, Decimal]:
     """分页读取 /transfers，并按真实已结算 qty 汇总结构各腿资金费。
 
@@ -1091,7 +1091,7 @@ async def _settled_funding_by_leg(
 async def cmd_status(
     var: Any,
     *,
-    structure: CarryStructure | str = XAUS_XAU,
+    structure: CarryStructure | str = DEFAULT_STRUCTURE,
     now: datetime | None = None,
 ) -> None:
     """输出结构、仓位、强平、carry 与实际已结算资金费快照。"""
@@ -1261,7 +1261,7 @@ async def _close_position_quote(
 
 async def _await_flat(
     var: Any,
-    structure: CarryStructure | str = XAUS_XAU,
+    structure: CarryStructure | str = DEFAULT_STRUCTURE,
 ) -> tuple[Decimal, ...]:
     """轮询结构全部腿归零，容忍平仓后的 /positions 最终一致延迟。"""
     selected = resolve_structure(structure)
@@ -1278,7 +1278,7 @@ async def _await_flat(
 async def cmd_close(
     var: Any,
     *,
-    structure: CarryStructure | str = XAUS_XAU,
+    structure: CarryStructure | str = DEFAULT_STRUCTURE,
     yes: bool = False,
     dry_run: bool = False,
     now: datetime | None = None,

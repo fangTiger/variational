@@ -21,13 +21,16 @@ from decimal import Decimal  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Any, Mapping, Sequence  # noqa: E402
 
-from adapters.base import Position  # noqa: E402
+from adapters.base import Position, Side  # noqa: E402
 from adapters.variational_client import (  # noqa: E402
     VariationalAuthError,
     VariationalJurisdictionError,
     VariationalRequestError,
 )
-from engine.swap_trading_schedule import SwapTradingSchedule  # noqa: E402
+from engine.swap_trading_schedule import (  # noqa: E402
+    SwapTradingSchedule,
+    parse_trading_schedule,
+)
 from tools.alert_check import notify  # noqa: E402
 from tools import hedge_swap_carry as execution  # noqa: E402
 
@@ -40,6 +43,7 @@ DEFAULT_AUDIT_LOG = PROJECT_ROOT / "data" / "swap_carry_guard_audit.jsonl"
 
 IMBALANCE_RATIO = Decimal("0.05")
 LIQUIDATION_ALERT_RATIO = Decimal("0.015")
+ACCOUNT_MARGIN_RATIO_MIN = Decimal("2.0")
 PRE_CLOSE_MINUTES = 30
 LONG_CLOSURE_THRESHOLD = timedelta(hours=4)
 CLOSE_RETRIES = 3
@@ -48,6 +52,11 @@ AUTO_OPEN_NOTIONAL_USD = Decimal("500")
 MIN_ENTRY_CARRY_ANNUAL = Decimal("0.05")
 MIN_TIME_TO_CLOSE = timedelta(hours=2)
 MAX_DAILY_OPEN_ATTEMPTS = 20
+EXIT_CARRY_ANNUAL = Decimal("0")
+EXIT_CARRY_CONSECUTIVE_ROUNDS = 3
+_SCHEDULED_FUNDING_INSTRUMENT_TYPES = frozenset(
+    {"perpetual_rwa_future", "swap"}
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +78,49 @@ class AutoOpenResult:
     status: str = "healthy"
     result_code: int = 0
     incident: bool = False
+
+
+@dataclass(frozen=True)
+class FundingAvailability:
+    """单腿费率在当前标的市场时段是否具有经济含义。"""
+
+    usable: bool
+    reason: str
+    schedule_source: str | None = None
+
+
+@dataclass(frozen=True)
+class MarginModeStatus:
+    """单腿保证金模式及其权威来源。"""
+
+    mode: str
+    source: str
+
+    @property
+    def isolated(self) -> bool:
+        """返回是否必须执行严格的独立桶强平监控。"""
+        return self.mode == "isolated"
+
+
+@dataclass(frozen=True)
+class AccountPositionMargin:
+    """账户级保证金计算中的一条真实持仓。"""
+
+    underlying: str
+    qty: Decimal
+    mark_price: Decimal
+    maintenance_rate: Decimal
+    maintenance_margin: Decimal
+
+
+@dataclass(frozen=True)
+class AccountMarginHealth:
+    """全账户权益与全部持仓维持保证金的比率。"""
+
+    equity: Decimal
+    maintenance_margin: Decimal
+    ratio: Decimal
+    positions: tuple[AccountPositionMargin, ...]
 
 
 class CloseActionError(RuntimeError):
@@ -129,6 +181,16 @@ def _read_auto_open_state(path: Path, observed_at: datetime) -> tuple[int, bool]
         return 0, False
 
 
+def _read_exit_carry_rounds(path: Path) -> int:
+    """读取跨进程保存的连续非正 carry 轮次。"""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        value = int(payload.get("exit_carry_consecutive_rounds", 0))
+        return max(0, value)
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+
+
 def _state_payload(
     *,
     observed_at: datetime,
@@ -138,6 +200,7 @@ def _state_payload(
     open_attempt_date: str | None = None,
     daily_open_attempts: int = 0,
     auto_open_incident: bool = False,
+    exit_carry_consecutive_rounds: int = 0,
 ) -> dict[str, object]:
     """构造供人工 status 置顶显示的显著状态。"""
     return {
@@ -148,6 +211,7 @@ def _state_payload(
         "open_attempt_date": open_attempt_date or observed_at.date().isoformat(),
         "daily_open_attempts": daily_open_attempts,
         "auto_open_incident": auto_open_incident,
+        "exit_carry_consecutive_rounds": exit_carry_consecutive_rounds,
     }
 
 
@@ -203,12 +267,430 @@ def _format_money(value: Decimal | None) -> str | None:
     return format(value, ".2f") if value is not None else None
 
 
-def _liquidation_distance(info: object, position: Position) -> Decimal:
+def _schedule_record_for_funding_leg(
+    metadata: object,
+    leg: execution.CarryLeg,
+) -> tuple[Mapping[str, Any], str]:
+    """选择费率时段元数据；XAU 与 XAUS 明确共享黄金现货时段。"""
+    candidates = [leg]
+    if leg.underlying == "XAU":
+        candidates.append(execution.XAUS_LEG)
+    elif leg.underlying == "XAUS":
+        candidates.append(execution.XAU_LONG_LEG)
+
+    errors: list[str] = []
+    for candidate in candidates:
+        try:
+            record = execution._instrument_record(metadata, candidate)
+        except (TypeError, ValueError) as exc:
+            errors.append(str(exc))
+            continue
+        if (
+            record.get("trading_sessions") is not None
+            and record.get("trading_schedule") is not None
+            and isinstance(record.get("market_status"), str)
+            and str(record.get("market_status")).strip()
+        ):
+            return record, candidate.underlying
+        errors.append(
+            f"{candidate.underlying} 缺少完整的交易会话、日程或 market_status"
+        )
+    raise ValueError("；".join(errors) or f"{leg.underlying} 缺少时段元数据")
+
+
+def _funding_availability_by_leg(
+    metadata: object | None,
+    selected: execution.CarryStructure,
+    observed_at: datetime,
+    *,
+    metadata_error: str | None,
+) -> dict[str, FundingAvailability]:
+    """仅以交易时段元数据判定费率是否可用于入场或退出。"""
+    result: dict[str, FundingAvailability] = {}
+    for leg in selected.legs:
+        if leg.instrument_type not in _SCHEDULED_FUNDING_INSTRUMENT_TYPES:
+            result[leg.underlying] = FundingAvailability(
+                True,
+                f"{leg.underlying} 为 24/7 合约，费率可用",
+            )
+            continue
+        if metadata is None:
+            detail = metadata_error or "supported_assets 无数据"
+            result[leg.underlying] = FundingAvailability(
+                False,
+                f"{leg.underlying} 费率不可用：{detail}",
+            )
+            continue
+        try:
+            record, source = _schedule_record_for_funding_leg(metadata, leg)
+            schedule = parse_trading_schedule(
+                record.get("trading_sessions"),
+                record.get("trading_schedule"),
+                record.get("market_status"),
+                observed_at,
+            )
+        except (TypeError, ValueError) as exc:
+            result[leg.underlying] = FundingAvailability(
+                False,
+                f"{leg.underlying} 费率不可用：时段元数据异常：{exc}",
+            )
+            continue
+        usable = schedule.metadata_is_fresh and schedule.is_tradable
+        result[leg.underlying] = FundingAvailability(
+            usable,
+            (
+                f"{leg.underlying} 费率可用：{schedule.reason}"
+                if usable
+                else f"{leg.underlying} 费率不可用：{schedule.reason}"
+            ),
+            schedule_source=source,
+        )
+    return result
+
+
+def _unusable_funding_reason(
+    availability: Mapping[str, FundingAvailability],
+) -> str | None:
+    """汇总任一不能用于决策的结构腿。"""
+    reasons = [item.reason for item in availability.values() if not item.usable]
+    return "；".join(reasons) if reasons else None
+
+
+def _margin_mode_from_supported_assets(
+    metadata: object | None,
+    leg: execution.CarryLeg,
+) -> MarginModeStatus | None:
+    """优先从标的元数据读取是否仅支持 isolated。"""
+    if metadata is None:
+        return None
+    try:
+        record = execution._instrument_record(metadata, leg)
+    except (TypeError, ValueError):
+        return None
+    isolated_only = record.get("isolated_only")
+    if isolated_only is True:
+        return MarginModeStatus("isolated", "supported_assets.isolated_only")
+    if isolated_only is False:
+        return MarginModeStatus("cross", "supported_assets.isolated_only")
+    return None
+
+
+def _margin_mode_from_quote(
+    quote: Mapping[str, Any],
+) -> MarginModeStatus | None:
+    """从报价保证金要求读取显式模式，未知值不作乐观猜测。"""
+    requirements = quote.get("margin_requirements")
+    if not isinstance(requirements, Mapping):
+        return None
+    raw_mode = requirements.get("margin_mode")
+    normalized = str(raw_mode or "").strip().lower()
+    if normalized in {"isolated", "isolated_margin"}:
+        return MarginModeStatus(
+            "isolated",
+            "报价 margin_requirements.margin_mode",
+        )
+    if normalized in {"cross", "cross_margin"}:
+        return MarginModeStatus(
+            "cross",
+            "报价 margin_requirements.margin_mode",
+        )
+    return None
+
+
+def _quote_cache_key(
+    leg: execution.CarryLeg,
+    side: Side,
+) -> tuple[str, str, int, str | None, str]:
+    """用完整合约描述和方向隔离监控报价缓存。"""
+    return (
+        leg.underlying,
+        leg.instrument_type,
+        leg.funding_interval_s,
+        leg.kind,
+        side.value,
+    )
+
+
+async def _monitoring_quote(
+    var: Any,
+    leg: execution.CarryLeg,
+    position: Position,
+    quote_cache: dict[
+        tuple[str, str, int, str | None, str],
+        Mapping[str, Any],
+    ],
+) -> Mapping[str, Any]:
+    """按当前持仓方向请求一次报价，并在本轮账户检查中复用。"""
+    if position.is_flat:
+        raise ValueError(f"{leg.underlying} 空仓无需请求监控报价")
+    side = Side.BUY if position.signed_size > 0 else Side.SELL
+    key = _quote_cache_key(leg, side)
+    quote = quote_cache.get(key)
+    if quote is None:
+        quote = await execution._request_quote(
+            var,
+            leg,
+            side,
+            abs(position.signed_size),
+        )
+        quote_cache[key] = quote
+    return quote
+
+
+async def _resolve_margin_mode(
+    var: Any,
+    *,
+    metadata: object | None,
+    leg: execution.CarryLeg,
+    position: Position,
+    quote_cache: dict[
+        tuple[str, str, int, str | None, str],
+        Mapping[str, Any],
+    ],
+) -> MarginModeStatus:
+    """按元数据、报价、保守默认的固定顺序判定保证金模式。"""
+    supported_mode = _margin_mode_from_supported_assets(metadata, leg)
+    if supported_mode is not None:
+        return supported_mode
+    try:
+        quote = await _monitoring_quote(var, leg, position, quote_cache)
+    except Exception:  # noqa: BLE001 报价不可用等价于第二级证据缺失
+        return MarginModeStatus("isolated", "保守默认")
+    quote_mode = _margin_mode_from_quote(quote)
+    if quote_mode is not None:
+        return quote_mode
+    return MarginModeStatus("isolated", "保守默认")
+
+
+def _position_items(payload: object) -> Sequence[object]:
+    """兼容 `/positions` 的列表响应与带 positions 键的对象响应。"""
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        return payload
+    if isinstance(payload, Mapping):
+        items = payload.get("positions")
+        if isinstance(items, Sequence) and not isinstance(items, (str, bytes)):
+            return items
+    raise ValueError("/positions 响应缺少持仓列表")
+
+
+def _account_position_leg(
+    raw_position: object,
+    selected_legs: Mapping[str, execution.CarryLeg],
+) -> tuple[execution.CarryLeg, Position, Decimal]:
+    """从真实持仓记录还原询价参数、有符号数量和标记价。"""
+    if not isinstance(raw_position, Mapping):
+        raise ValueError("/positions 持仓记录不是对象")
+    raw_info = raw_position.get("position_info", raw_position)
+    if not isinstance(raw_info, Mapping):
+        raise ValueError("/positions.position_info 不是对象")
+    raw_instrument = raw_info.get("instrument")
+    instrument = raw_instrument if isinstance(raw_instrument, Mapping) else {}
+
+    underlying_value = instrument.get("underlying") or raw_info.get("underlying")
+    underlying = str(underlying_value or "").strip().upper()
+    if not underlying:
+        raise ValueError("/positions 持仓缺少 instrument.underlying")
+    qty_value = raw_info.get("qty", raw_info.get("size"))
+    qty = execution._decimal(qty_value, label=f"{underlying} 持仓数量")
+
+    selected_leg = selected_legs.get(underlying)
+    if selected_leg is not None:
+        leg = selected_leg
+    else:
+        instrument_type = str(instrument.get("instrument_type") or "").strip()
+        if not instrument_type:
+            raise ValueError(f"{underlying} 持仓缺少 instrument_type")
+        raw_interval = instrument.get("funding_interval_s")
+        if isinstance(raw_interval, bool):
+            raise ValueError(f"{underlying} funding_interval_s 无效")
+        try:
+            funding_interval_s = int(raw_interval)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{underlying} funding_interval_s 无效") from exc
+        raw_kind = instrument.get("kind")
+        kind = str(raw_kind).strip() if raw_kind not in (None, "") else None
+        leg = execution.CarryLeg(
+            underlying=underlying,
+            open_side=Side.BUY if qty >= 0 else Side.SELL,
+            instrument_type=instrument_type,
+            funding_interval_s=funding_interval_s,
+            kind=kind,
+            weight=Decimal("1"),
+        )
+
+    raw_price_info = raw_position.get("price_info")
+    price_info = raw_price_info if isinstance(raw_price_info, Mapping) else {}
+    mark_value = (
+        price_info.get("underlying_price")
+        or raw_position.get("mark_price")
+        or raw_info.get("mark_price")
+        or raw_info.get("avg_entry_price")
+    )
+    mark_price = execution._decimal(
+        mark_value,
+        label=f"{underlying} 标记价",
+        positive=True,
+    )
+    return leg, Position(underlying, qty, raw=raw_position), mark_price
+
+
+def _maintenance_rate_from_quote(
+    quote: Mapping[str, Any],
+    underlying: str,
+) -> Decimal:
+    """严格读取报价中当前标的专属的期货维持保证金率。"""
+    margin_params = quote.get("margin_params")
+    params = margin_params.get("params") if isinstance(margin_params, Mapping) else None
+    asset_params = params.get("asset_params") if isinstance(params, Mapping) else None
+    if not isinstance(asset_params, Mapping):
+        raise ValueError(f"{underlying} 报价缺少 margin_params.params.asset_params")
+    raw_asset_param = next(
+        (
+            value
+            for asset, value in asset_params.items()
+            if str(asset).upper() == underlying and isinstance(value, Mapping)
+        ),
+        None,
+    )
+    if raw_asset_param is None:
+        raise ValueError(f"{underlying} 报价缺少专属维持保证金参数")
+    return execution._decimal(
+        raw_asset_param.get("futures_maintenance_margin"),
+        label=f"{underlying} 维持保证金率",
+        positive=True,
+    )
+
+
+async def _account_margin_health(
+    var: Any,
+    *,
+    selected: execution.CarryStructure,
+    quote_cache: dict[
+        tuple[str, str, int, str | None, str],
+        Mapping[str, Any],
+    ],
+) -> AccountMarginHealth:
+    """用全账户真实持仓计算权益相对维持保证金的倍数。"""
+    payload = await var.get_positions()
+    selected_legs = {leg.underlying: leg for leg in selected.legs}
+    margins: list[AccountPositionMargin] = []
+    for raw_position in _position_items(payload):
+        leg, position, mark_price = _account_position_leg(
+            raw_position,
+            selected_legs,
+        )
+        if position.is_flat:
+            continue
+        quote = await _monitoring_quote(var, leg, position, quote_cache)
+        maintenance_rate = _maintenance_rate_from_quote(
+            quote,
+            leg.underlying,
+        )
+        maintenance_margin = (
+            abs(position.signed_size) * mark_price * maintenance_rate
+        )
+        margins.append(
+            AccountPositionMargin(
+                underlying=leg.underlying,
+                qty=position.signed_size,
+                mark_price=mark_price,
+                maintenance_rate=maintenance_rate,
+                maintenance_margin=maintenance_margin,
+            )
+        )
+    if not margins:
+        raise ValueError("/positions 未返回任何非零持仓")
+
+    balance = await var.get_balance()
+    equity_value = (
+        balance.get("equity")
+        if isinstance(balance, Mapping)
+        else getattr(balance, "equity", None)
+    )
+    equity = execution._decimal(equity_value, label="账户权益")
+    maintenance_margin = sum(
+        (item.maintenance_margin for item in margins),
+        Decimal("0"),
+    )
+    if maintenance_margin <= 0:
+        raise ValueError("账户总维持保证金必须大于 0")
+    return AccountMarginHealth(
+        equity=equity,
+        maintenance_margin=maintenance_margin,
+        ratio=equity / maintenance_margin,
+        positions=tuple(margins),
+    )
+
+
+def _per_leg_liquidation_payload(
+    *,
+    mode: MarginModeStatus,
+    status: str,
+    distance: Decimal | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    """构造统一的单腿强平监控心跳字段。"""
+    return {
+        "status": status,
+        "enforced": mode.isolated,
+        "fallback": None if mode.isolated else "账户级保证金率",
+        "distance": str(distance) if distance is not None else None,
+        "threshold": str(LIQUIDATION_ALERT_RATIO),
+        "error": error,
+    }
+
+
+def _account_margin_payload(
+    health: AccountMarginHealth | None,
+    *,
+    error: str | None,
+) -> dict[str, object]:
+    """把账户级保证金检查结果转换为稳定的心跳结构。"""
+    if health is None:
+        return {
+            "status": "无数据" if error is not None else "未检查",
+            "equity": None,
+            "maintenance_margin": None,
+            "ratio": None,
+            "threshold": str(ACCOUNT_MARGIN_RATIO_MIN),
+            "positions": [],
+            "error": error,
+        }
+    return {
+        "status": (
+            "正常" if health.ratio >= ACCOUNT_MARGIN_RATIO_MIN else "低于阈值"
+        ),
+        "equity": str(health.equity),
+        "maintenance_margin": str(health.maintenance_margin),
+        "ratio": str(health.ratio),
+        "threshold": str(ACCOUNT_MARGIN_RATIO_MIN),
+        "positions": [
+            {
+                "underlying": item.underlying,
+                "qty": str(item.qty),
+                "mark_price": str(item.mark_price),
+                "maintenance_rate": str(item.maintenance_rate),
+                "maintenance_margin": str(item.maintenance_margin),
+            }
+            for item in health.positions
+        ],
+        "error": None,
+    }
+
+
+def _liquidation_distance(
+    info: object,
+    position: Position,
+    *,
+    underlying: str,
+) -> Decimal:
     """严格读取 API 权威强平价并计算方向相关距离。"""
     if not isinstance(info, tuple) or len(info) != 2:
         raise ValueError("get_liquidation_info 未返回权威强平价")
-    mark = execution._decimal(info[0], label="XAUS mark", positive=True)
-    liquidation = execution._decimal(info[1], label="XAUS 强平价", positive=True)
+    mark = execution._decimal(info[0], label=f"{underlying} mark", positive=True)
+    liquidation = execution._decimal(
+        info[1], label=f"{underlying} 强平价", positive=True
+    )
     if position.signed_size > 0:
         return (mark - liquidation) / mark
     if position.signed_size < 0:
@@ -306,6 +788,7 @@ async def _try_auto_open(
     schedule: SwapTradingSchedule | None,
     schedule_error: str | None,
     market_status: str | None,
+    funding_availability: Mapping[str, FundingAvailability],
     kill_switch_path: Path,
     auto_open: bool,
     auto_open_notional: Decimal,
@@ -376,6 +859,10 @@ async def _try_auto_open(
         target_notional = execution._validate_notional(auto_open_notional)
     except SystemExit as exc:
         return skip(str(exc))
+
+    unavailable_reason = _unusable_funding_reason(funding_availability)
+    if unavailable_reason is not None:
+        return skip(f"费率不可用，禁止自动开仓：{unavailable_reason}")
 
     if selected.has_xaus:
         if schedule_error is not None:
@@ -673,6 +1160,7 @@ async def run_once(
     daily_open_attempts, auto_open_incident = _read_auto_open_state(
         state_path, observed_at
     )
+    exit_carry_rounds = _read_exit_carry_rounds(state_path)
     consecutive_failures = previous_failures
     conclusion = "本轮尚未完成"
     auto_open_attempted = False
@@ -685,6 +1173,19 @@ async def run_once(
     schedule: SwapTradingSchedule | None = None
     schedule_error: str | None = None
     market_status: str | None = None
+    metadata: object | None = None
+    metadata_error: str | None = None
+    funding_availability: dict[str, FundingAvailability] = {}
+    net_carry: Decimal | None = None
+    exit_carry_observation = "本轮未评估退出 carry"
+    margin_modes: dict[str, MarginModeStatus] = {}
+    per_leg_liquidation: dict[str, dict[str, object]] = {}
+    account_margin: AccountMarginHealth | None = None
+    account_margin_error: str | None = None
+    quote_cache: dict[
+        tuple[str, str, int, str | None, str],
+        Mapping[str, Any],
+    ] = {}
 
     def persist_state(status: str, message: str, failures: int) -> None:
         """写状态时始终保留每日计数和不可自动清除的 INCIDENT。"""
@@ -699,6 +1200,7 @@ async def run_once(
                 open_attempt_date=observed_at.date().isoformat(),
                 daily_open_attempts=daily_open_attempts,
                 auto_open_incident=auto_open_incident,
+                exit_carry_consecutive_rounds=exit_carry_rounds,
             ),
         )
 
@@ -714,28 +1216,53 @@ async def run_once(
             "auto_open_notional": auto_open_notional,
             "daily_open_attempts": daily_open_attempts,
             "auto_open_incident": auto_open_incident,
+            "exit_carry_consecutive_rounds": exit_carry_rounds,
         },
     )
     try:
         positions = await execution._get_positions(var, selected)
 
+        try:
+            metadata = await var.get_supported_assets()
+            for leg in selected.legs:
+                prices[leg.underlying] = execution._metadata_price(metadata, leg)
+        except Exception as exc:  # noqa: BLE001 费率有效性按失败关闭，持仓仍继续降险
+            metadata_error = f"{type(exc).__name__}: {exc}"
+
+        funding_availability = _funding_availability_by_leg(
+            metadata,
+            selected,
+            observed_at,
+            metadata_error=metadata_error,
+        )
+        for leg in selected.legs:
+            mode = _margin_mode_from_supported_assets(metadata, leg)
+            if mode is not None:
+                margin_modes[leg.underlying] = mode
+
         if selected.has_xaus:
-            try:
-                metadata, record, schedule = await execution._load_schedule(
-                    var, now=observed_at
-                )
-                raw_market_status = record.get("market_status")
-                if (
-                    not isinstance(raw_market_status, str)
-                    or not raw_market_status.strip()
-                ):
-                    schedule_error = "XAUS market_status 元数据缺失"
+            if metadata is None:
+                schedule_error = metadata_error or "supported_assets 无数据"
+            else:
+                try:
+                    record = execution._instrument_record(metadata, execution.XAUS_LEG)
+                    schedule = parse_trading_schedule(
+                        record.get("trading_sessions"),
+                        record.get("trading_schedule"),
+                        record.get("market_status"),
+                        observed_at,
+                    )
+                except Exception as exc:  # noqa: BLE001 时段读取失败后仍要尝试降险
+                    schedule_error = f"{type(exc).__name__}: {exc}"
                 else:
-                    market_status = raw_market_status.strip().lower()
-                for leg in selected.legs:
-                    prices[leg.underlying] = execution._metadata_price(metadata, leg)
-            except Exception as exc:  # noqa: BLE001 时段读取失败后仍要尝试降险
-                schedule_error = f"{type(exc).__name__}: {exc}"
+                    raw_market_status = record.get("market_status")
+                    if (
+                        not isinstance(raw_market_status, str)
+                        or not raw_market_status.strip()
+                    ):
+                        schedule_error = "XAUS market_status 元数据缺失"
+                    else:
+                        market_status = raw_market_status.strip().lower()
 
         notionals = {
             leg.underlying: _position_notional(
@@ -755,29 +1282,106 @@ async def run_once(
             # 优先级 2：缺腿、方向或结构权重比例失衡。
             reason = _imbalance_reason(selected, positions)
 
-        # 优先级 3：XAUS 权威强平价缺失也视为不安全。
-        xaus_position = positions.get("XAUS")
+        all_flat = all(position.is_flat for position in positions.values())
+
+        # 优先级 3：isolated 腿严格使用单腿强平价；全仓腿只记录该值。
+        if reason is None and not all_flat:
+            for leg in selected.legs:
+                position = positions[leg.underlying]
+                if position.is_flat:
+                    continue
+                mode = margin_modes.get(leg.underlying)
+                if mode is None:
+                    mode = await _resolve_margin_mode(
+                        var,
+                        metadata=metadata,
+                        leg=leg,
+                        position=position,
+                        quote_cache=quote_cache,
+                    )
+                    margin_modes[leg.underlying] = mode
+                try:
+                    liquidation_info = await var.get_liquidation_info(
+                        leg.underlying,
+                        exact=True,
+                    )
+                    distance = _liquidation_distance(
+                        liquidation_info,
+                        position,
+                        underlying=leg.underlying,
+                    )
+                    below_threshold = distance < LIQUIDATION_ALERT_RATIO
+                    per_leg_liquidation[leg.underlying] = (
+                        _per_leg_liquidation_payload(
+                            mode=mode,
+                            status=(
+                                "低于阈值" if below_threshold else "有数据"
+                            ),
+                            distance=distance,
+                        )
+                    )
+                    if mode.isolated and below_threshold:
+                        reason = (
+                            f"{leg.underlying} 强平距离 {distance:.2%} 低于阈值 "
+                            f"{LIQUIDATION_ALERT_RATIO:.2%}"
+                        )
+                        break
+                except Exception as exc:  # noqa: BLE001 是否退出取决于保证金模式
+                    error = f"{type(exc).__name__}: {exc}"
+                    per_leg_liquidation[leg.underlying] = (
+                        _per_leg_liquidation_payload(
+                            mode=mode,
+                            status="无数据",
+                            error=error,
+                        )
+                    )
+                    if mode.isolated:
+                        reason = (
+                            f"{leg.underlying} 强平价不可用，按不安全处理：{exc}"
+                        )
+                        break
+
+        # 每日短休市冻结窗内不主动询价，避免把计划内报价空窗误判成账户风险。
+        in_short_closure_freeze = (
+            selected.has_xaus
+            and schedule is not None
+            and schedule.metadata_is_fresh
+            and schedule.closure_duration is not None
+            and schedule.closure_duration <= LONG_CLOSURE_THRESHOLD
+            and schedule.time_until_close is not None
+            and schedule.time_until_close <= timedelta(minutes=PRE_CLOSE_MINUTES)
+        )
+
+        # 优先级 3b：全仓腿退出只看全账户权益对全部持仓维持保证金的倍数。
         if (
             reason is None
-            and selected.has_xaus
-            and xaus_position is not None
-            and not xaus_position.is_flat
+            and not all_flat
+            and not in_short_closure_freeze
+            and any(
+            not margin_modes[leg.underlying].isolated
+            for leg in selected.legs
+            if not positions[leg.underlying].is_flat
+            )
         ):
             try:
-                liquidation_info = await var.get_liquidation_info(
-                    execution.XAUS_LEG.underlying,
-                    exact=True,
+                account_margin = await _account_margin_health(
+                    var,
+                    selected=selected,
+                    quote_cache=quote_cache,
                 )
-                distance = _liquidation_distance(liquidation_info, xaus_position)
-                if distance < LIQUIDATION_ALERT_RATIO:
+            except Exception as exc:  # noqa: BLE001 全仓安全数据缺失必须降险
+                account_margin_error = f"{type(exc).__name__}: {exc}"
+                reason = (
+                    "账户保证金率不可用，无法确认全仓腿安全："
+                    f"{account_margin_error}"
+                )
+            else:
+                if account_margin.ratio < ACCOUNT_MARGIN_RATIO_MIN:
                     reason = (
-                        f"XAUS 强平距离 {distance:.2%} 低于阈值 "
-                        f"{LIQUIDATION_ALERT_RATIO:.2%}"
+                        f"账户保证金率 {account_margin.ratio:.4f} 低于阈值 "
+                        f"{ACCOUNT_MARGIN_RATIO_MIN}"
                     )
-            except Exception as exc:  # noqa: BLE001 读不到权威值必须平仓
-                reason = f"XAUS 强平价不可用，按不安全处理：{exc}"
 
-        all_flat = all(position.is_flat for position in positions.values())
         if (
             reason is None
             and selected.has_xaus
@@ -810,7 +1414,55 @@ async def run_once(
                         f"{schedule.time_until_close} 后开始"
                     )
 
+        # 优先级 5：只有全部腿费率在当前时段有效时才更新退出连续计数。
+        if reason is None and not all_flat:
+            unavailable_reason = _unusable_funding_reason(funding_availability)
+            if unavailable_reason is not None:
+                exit_carry_observation = (
+                    f"费率不可用，本轮退出 carry 不计数也不清零："
+                    f"{unavailable_reason}"
+                )
+            else:
+                try:
+                    rates = await execution._load_funding_rates(var, selected)
+                    net_carry = execution._weighted_net_carry(selected, rates)
+                except Exception as exc:  # noqa: BLE001 读取失败必须保持原计数
+                    exit_carry_observation = (
+                        "退出 carry 读取失败，本轮不计数也不清零："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    if net_carry <= EXIT_CARRY_ANNUAL:
+                        exit_carry_rounds += 1
+                        exit_carry_observation = (
+                            f"净 carry {net_carry:.4%} 不高于退出阈值 "
+                            f"{EXIT_CARRY_ANNUAL:.4%}，连续第 "
+                            f"{exit_carry_rounds}/{EXIT_CARRY_CONSECUTIVE_ROUNDS} 轮"
+                        )
+                        if exit_carry_rounds >= EXIT_CARRY_CONSECUTIVE_ROUNDS:
+                            reason = exit_carry_observation
+                            state_status = "exit_carry_triggered"
+                    else:
+                        exit_carry_rounds = 0
+                        exit_carry_observation = (
+                            f"净 carry {net_carry:.4%} 高于退出阈值 "
+                            f"{EXIT_CARRY_ANNUAL:.4%}，连续计数已清零"
+                        )
+            _append_audit(
+                audit_path,
+                {
+                    "timestamp": observed_at,
+                    "event": "exit_carry_observed",
+                    "message": exit_carry_observation,
+                    "net_carry_annual": net_carry,
+                    "threshold_annual": EXIT_CARRY_ANNUAL,
+                    "consecutive_rounds": exit_carry_rounds,
+                    "required_rounds": EXIT_CARRY_CONSECUTIVE_ROUNDS,
+                },
+            )
+
         if reason is None and all_flat:
+            exit_carry_rounds = 0
             open_result = await _try_auto_open(
                 var,
                 structure=selected,
@@ -818,6 +1470,7 @@ async def run_once(
                 schedule=schedule,
                 schedule_error=schedule_error,
                 market_status=market_status,
+                funding_availability=funding_availability,
                 kill_switch_path=kill_switch_path,
                 auto_open=auto_open,
                 auto_open_notional=auto_open_notional,
@@ -907,6 +1560,7 @@ async def run_once(
                             "net_delta": net_delta,
                         },
                     )
+                    exit_carry_rounds = 0
                 consecutive_failures = 0
                 completed_status = (
                     "dry_run"
@@ -964,6 +1618,20 @@ async def run_once(
             if len(positions) == len(selected.legs)
             else None
         )
+        for leg in selected.legs:
+            mode = margin_modes.get(leg.underlying)
+            if mode is None:
+                mode = _margin_mode_from_supported_assets(metadata, leg)
+                if mode is None:
+                    mode = MarginModeStatus("isolated", "保守默认")
+                margin_modes[leg.underlying] = mode
+            if leg.underlying not in per_leg_liquidation:
+                per_leg_liquidation[leg.underlying] = (
+                    _per_leg_liquidation_payload(
+                        mode=mode,
+                        status="未检查",
+                    )
+                )
         heartbeat = {
             "timestamp": observed_at.isoformat(),
             "structure": selected.name,
@@ -975,6 +1643,11 @@ async def run_once(
                     else None,
                     "weight": str(leg.weight),
                     "notional": _format_money(notionals[leg.underlying]),
+                    "margin_mode": margin_modes[leg.underlying].mode,
+                    "margin_mode_source": margin_modes[leg.underlying].source,
+                    "per_leg_liquidation": per_leg_liquidation[
+                        leg.underlying
+                    ],
                 }
                 for leg in selected.legs
             },
@@ -982,9 +1655,28 @@ async def run_once(
             "xaus_notional": _format_money(notionals.get("XAUS")),
             "xau_notional": _format_money(notionals.get("XAU")),
             "net_delta": str(net_delta) if net_delta is not None else None,
+            "account_margin": _account_margin_payload(
+                account_margin,
+                error=account_margin_error,
+            ),
             "xaus_schedule": (
                 _schedule_payload(schedule) if selected.has_xaus else None
             ),
+            "funding_availability": {
+                underlying: {
+                    "usable": item.usable,
+                    "reason": item.reason,
+                    "schedule_source": item.schedule_source,
+                }
+                for underlying, item in funding_availability.items()
+            },
+            "net_carry_annual": (
+                str(net_carry) if net_carry is not None else None
+            ),
+            "exit_carry_annual": str(EXIT_CARRY_ANNUAL),
+            "exit_carry_consecutive_rounds": exit_carry_rounds,
+            "exit_carry_required_rounds": EXIT_CARRY_CONSECUTIVE_ROUNDS,
+            "exit_carry_observation": exit_carry_observation,
             "consecutive_failures": consecutive_failures,
             "dry_run": dry_run,
             "auto_open_attempted": auto_open_attempted,

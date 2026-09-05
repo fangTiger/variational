@@ -5,15 +5,20 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal
 
-from engine.swap_carry import calculate_carry_returns, derive_carry_ratios
+from engine.swap_carry import (
+    calculate_carry_returns,
+    derive_carry_ratios,
+    derive_perp_accrual_ratio,
+)
 
 
 def test_plan_example_calculates_both_policies_side_by_side() -> None:
-    """方案 §2.3 的 6bp 口径应得到约 0.86% 与 4.33%。"""
+    """计息占空比修正后，两种政策应得到约 0.86% 与 1.29%。"""
     result = calculate_carry_returns(
         f_perp=Decimal("0.102888"),
         f_swap=Decimal("0.057214"),
         hold_ratio=Decimal("0.705"),
+        perp_accrual_ratio=Decimal("0.705"),
         swap_ratio=Decimal(4) / Decimal(7),
         cost_bps=Decimal("6"),
         n_roundtrips=52,
@@ -21,7 +26,7 @@ def test_plan_example_calculates_both_policies_side_by_side() -> None:
     )
 
     assert abs(result.weekly_flat - Decimal("0.0086")) < Decimal("0.0001")
-    assert abs(result.hold_through - Decimal("0.0433")) < Decimal("0.0001")
+    assert abs(result.hold_through - Decimal("0.01292204")) < Decimal("0.0001")
 
 
 def test_perpetual_and_swap_ratios_are_applied_separately() -> None:
@@ -30,6 +35,7 @@ def test_perpetual_and_swap_ratios_are_applied_separately() -> None:
         f_perp=Decimal("0.10"),
         f_swap=Decimal("0.05"),
         hold_ratio=Decimal("0.50"),
+        perp_accrual_ratio=Decimal("0.75"),
         swap_ratio=Decimal("0.25"),
         cost_bps=Decimal("0"),
         n_roundtrips=0,
@@ -66,3 +72,19 @@ def test_ratios_are_derived_from_sessions_and_actual_settlement_points() -> None
     assert ratios.swap_ratio == Decimal(4) / Decimal(7)
     assert ratios.included_settlements == 4
     assert ratios.total_settlements == 7
+
+
+def test_perp_accrual_ratio_is_derived_from_real_session_durations() -> None:
+    """计息占空比应累计真实开市时长，不能复用连续持仓窗口比例。"""
+    sessions = [
+        {"open": "2026-09-06T22:00:00Z", "close": "2026-09-07T21:00:00Z"},
+        {"open": "2026-09-07T22:00:00Z", "close": "2026-09-08T21:00:00Z"},
+        {"open": "2026-09-08T22:00:00Z", "close": "2026-09-09T21:00:00Z"},
+        {"open": "2026-09-09T22:00:00Z", "close": "2026-09-10T21:00:00Z"},
+        {"open": "2026-09-10T22:00:00Z", "close": "2026-09-11T21:00:00Z"},
+    ]
+
+    result = derive_perp_accrual_ratio(sessions, period=timedelta(days=7))
+
+    assert result == Decimal(115) / Decimal(168)
+    assert result != Decimal("0.705")

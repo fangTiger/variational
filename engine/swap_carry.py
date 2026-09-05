@@ -59,6 +59,7 @@ def calculate_carry_returns(
     f_perp: Decimal,
     f_swap: Decimal,
     hold_ratio: Decimal,
+    perp_accrual_ratio: Decimal,
     swap_ratio: Decimal,
     cost_bps: Decimal = Decimal("6"),
     n_roundtrips: int = 52,
@@ -67,17 +68,26 @@ def calculate_carry_returns(
     """并列计算 weekly-flat 与 hold-through 年化收益。
 
     ``f_perp``、``f_swap`` 与返回值均为年化小数；例如 10.2888% 传
-    ``Decimal("0.102888")``。成本输入单位是 bp，函数内部换算为小数。
+    ``Decimal("0.102888")``。``perp_accrual_ratio`` 是 RWA 永续费率实际
+    计提的时段占比，独立于 ``hold_ratio`` 的持仓占比。成本输入单位是 bp，
+    函数内部换算为小数。
     """
     perp = _finite_decimal(f_perp, label="永续费率")
     swap = _finite_decimal(f_swap, label="swap 费率")
-    holding = _finite_decimal(hold_ratio, label="永续持仓比例")
+    holding = _finite_decimal(hold_ratio, label="weekly-flat 永续持仓比例")
+    # hold-through 虽然持续持仓，但 RWA 永续仅在标的现货开市时计息；
+    # 该占空比与 weekly-flat 的持仓占比是两个独立经济量。
+    perp_accrual = _finite_decimal(
+        perp_accrual_ratio, label="hold-through 永续计息占空比"
+    )
     swap_accrual = _finite_decimal(swap_ratio, label="swap 计息比例")
     cost = _finite_decimal(cost_bps, label="往返成本 bp") / Decimal("10000")
     roundtrips = _nonnegative_count(n_roundtrips, label="年往返次数")
     rebalances = _nonnegative_count(n_rebalance, label="年再平衡次数")
     if not Decimal(0) <= holding <= Decimal(1):
-        raise ValueError("永续持仓比例必须在 0 到 1 之间")
+        raise ValueError("weekly-flat 永续持仓比例必须在 0 到 1 之间")
+    if not Decimal(0) <= perp_accrual <= Decimal(1):
+        raise ValueError("hold-through 永续计息占空比必须在 0 到 1 之间")
     if not Decimal(0) <= swap_accrual <= Decimal(1):
         raise ValueError("swap 计息比例必须在 0 到 1 之间")
     if cost < 0:
@@ -87,7 +97,9 @@ def calculate_carry_returns(
         weekly_flat=(
             perp * holding - swap * swap_accrual - Decimal(roundtrips) * cost
         ),
-        hold_through=perp - swap - Decimal(rebalances) * cost,
+        hold_through=(
+            perp * perp_accrual - swap - Decimal(rebalances) * cost
+        ),
     )
 
 
@@ -104,6 +116,28 @@ def _settlement_datetime(value: object, *, index: int) -> datetime:
             raise ValueError(f"settlement_points[{index}] 必须带时区")
         return value.astimezone(timezone.utc)
     return parse_utc_timestamp(value, label=f"settlement_points[{index}]")
+
+
+def derive_perp_accrual_ratio(
+    trading_sessions: object,
+    *,
+    period: timedelta,
+) -> Decimal:
+    """从真实交易会话累计 RWA 永续的计息占空比。
+
+    该比例只描述标的现货开市、平台费率有效的时间，不描述策略是否持仓；
+    因而不能复用 weekly-flat 的连续持仓窗口比例。
+    """
+    sessions = parse_sessions(trading_sessions)
+    if period <= timedelta(0):
+        raise ValueError("计息观察周期必须大于零")
+    accrued = sum(
+        (session.close_at - session.open_at for session in sessions),
+        timedelta(0),
+    )
+    if accrued > period:
+        raise ValueError("交易会话总时长不能长于计息观察周期")
+    return _timedelta_seconds(accrued) / _timedelta_seconds(period)
 
 
 def derive_carry_ratios(

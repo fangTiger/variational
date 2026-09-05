@@ -114,7 +114,11 @@ async def _liquidation_metric(
     try:
         info = await client.get_liquidation_info(underlying, exact=True)
         text = carry._format_liquidation(info, position)
-        distance = guard._liquidation_distance(info, position)
+        distance = guard._liquidation_distance(
+            info,
+            position,
+            underlying=underlying,
+        )
     except Exception:  # noqa: BLE001 单项失败只降级这一行
         return Metric(label, "无数据"), None
     tone = "bad" if distance < guard.LIQUIDATION_ALERT_RATIO else "good"

@@ -21,6 +21,7 @@ from adapters.variational_client import (
 
 
 NOW = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+_UNCONFIGURED = object()
 
 
 def _metadata(
@@ -68,8 +69,11 @@ def _metadata(
     return {
         "XAUS": [
             {
+                "asset": "XAUS",
+                "asset_class": "commodity",
                 "instrument_type": "swap",
                 "funding_interval_s": 0,
+                "isolated_only": True,
                 "market_status": market_status,
                 "price": "4000",
                 "trading_schedule": {
@@ -81,8 +85,21 @@ def _metadata(
         ],
         "XAU": [
             {
+                "asset": "XAU",
+                "asset_class": "commodity",
                 "instrument_type": "perpetual_rwa_future",
                 "funding_interval_s": 3600,
+                "isolated_only": False,
+                "price": "4000",
+            }
+        ],
+        "XAUT": [
+            {
+                "asset": "XAUT",
+                "asset_class": "crypto",
+                "instrument_type": "perpetual_future",
+                "funding_interval_s": 3600,
+                "isolated_only": False,
                 "price": "4000",
             }
         ],
@@ -122,6 +139,49 @@ def _margin_requirements(
     return requirements
 
 
+def _maintenance_rate(underlying: str) -> Decimal:
+    """返回实测标的值，并为结构外 BTC 提供真实路径下的测试值。"""
+    return {
+        "XAUS": Decimal("0.05"),
+        "XAU": Decimal("0.025"),
+        "XAUT": Decimal("0.0142855"),
+        "BTC": Decimal("0.01"),
+    }[underlying]
+
+
+def _position_payload(
+    underlying: str,
+    qty: Decimal,
+    *,
+    mark_price: Decimal,
+) -> dict[str, object]:
+    """按真实 `/positions` schema 构造单条持仓。"""
+    instrument_types = {
+        "XAUS": ("swap", 0, "commodity"),
+        "XAU": ("perpetual_rwa_future", 3600, "commodity"),
+        "XAUT": ("perpetual_future", 3600, None),
+        "BTC": ("perpetual_future", 3600, None),
+    }
+    instrument_type, funding_interval_s, kind = instrument_types[underlying]
+    instrument: dict[str, object] = {
+        "underlying": underlying,
+        "instrument_type": instrument_type,
+        "funding_interval_s": funding_interval_s,
+        "settlement_asset": "USDC",
+    }
+    if kind is not None:
+        instrument["kind"] = kind
+    return {
+        "position_info": {
+            "instrument": instrument,
+            "qty": str(qty),
+            "avg_entry_price": str(mark_price),
+        },
+        "price_info": {"underlying_price": str(mark_price)},
+        "upnl": "0",
+    }
+
+
 class StrictGuardClient:
     """只允许测试显式配置的调用；遗漏编排时立即失败。"""
 
@@ -130,13 +190,14 @@ class StrictGuardClient:
         *,
         positions: dict[str, Decimal],
         metadata: object,
-        liquidation_info: object = None,
+        liquidation_info: object = _UNCONFIGURED,
         accept_script: list[object] | None = None,
         quote_enabled: bool = True,
         apply_accept: bool = True,
         swap_rate: object = None,
         perp_rate: object = None,
         equity: Decimal | None = None,
+        account_positions: list[dict[str, object]] | None = None,
     ) -> None:
         self.sizes = dict(positions)
         self.metadata = metadata
@@ -149,10 +210,14 @@ class StrictGuardClient:
         self.swap_rate = swap_rate
         self.perp_rate = perp_rate
         self.equity = equity
+        self.account_positions = account_positions
         self.quote_calls: list[tuple[str, str, Decimal]] = []
         self.accept_calls: list[tuple[str, str, bool]] = []
         self.position_calls: list[tuple[str, bool]] = []
+        self.liquidation_calls: list[tuple[str, bool]] = []
         self.funding_calls: list[tuple[str, str | None]] = []
+        self.all_positions_calls = 0
+        self.balance_calls = 0
         self._quotes: dict[str, tuple[str, str, Decimal]] = {}
         self._quote_index = 0
         self._max_slippage = 0.01
@@ -164,6 +229,21 @@ class StrictGuardClient:
             raise AssertionError(f"未配置仓位：{underlying}")
         return Position(underlying, self.sizes[underlying])
 
+    async def get_positions(self) -> list[dict[str, object]]:
+        """返回真实 schema 的账户全部持仓，而非仅返回结构腿。"""
+        self.all_positions_calls += 1
+        if self.account_positions is not None:
+            return self.account_positions
+        return [
+            _position_payload(
+                underlying,
+                qty,
+                mark_price=Decimal("4000"),
+            )
+            for underlying, qty in self.sizes.items()
+            if qty != 0
+        ]
+
     async def get_supported_assets(self) -> object:
         if self.metadata is None:
             raise AssertionError("未配置调用：get_supported_assets")
@@ -172,12 +252,20 @@ class StrictGuardClient:
     async def get_liquidation_info(
         self, underlying: str, *, exact: bool = False
     ) -> object:
-        assert (underlying, exact) == ("XAUS", True)
-        if isinstance(self.liquidation_info, BaseException):
-            raise self.liquidation_info
-        if self.liquidation_info is None:
-            return None
-        return self.liquidation_info
+        self.liquidation_calls.append((underlying, exact))
+        assert exact is True
+        if self.liquidation_info is _UNCONFIGURED:
+            raise AssertionError(f"未配置调用：get_liquidation_info({underlying})")
+        result = self.liquidation_info
+        if isinstance(result, dict):
+            if underlying not in result:
+                raise AssertionError(
+                    f"未配置调用：get_liquidation_info({underlying})"
+                )
+            result = result[underlying]
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     async def request_quote(
         self,
@@ -196,10 +284,26 @@ class StrictGuardClient:
             "quote_id": quote_id,
             "bid": "3999",
             "ask": "4001",
+            "mark_price": "4000",
             "margin_requirements": _margin_requirements(
                 qty=qty,
                 isolated=underlying == "XAUS",
             ),
+            "margin_params": {
+                "params": {
+                    "asset_params": {
+                        underlying: {
+                            "futures_maintenance_margin": str(
+                                _maintenance_rate(underlying)
+                            )
+                        }
+                    },
+                    "default_asset_param": {
+                        "futures_maintenance_margin": "0.1"
+                    },
+                    "use_default_asset_param": False,
+                }
+            },
         }
 
     async def get_swap_funding(self, underlying: str) -> object:
@@ -225,6 +329,7 @@ class StrictGuardClient:
         return self.perp_rate
 
     async def get_balance(self) -> object:
+        self.balance_calls += 1
         if self.equity is None:
             raise AssertionError("未配置调用：get_balance")
         return SimpleNamespace(equity=self.equity)
@@ -297,16 +402,29 @@ def _healthy_client(
     *,
     positions: dict[str, Decimal] | None = None,
     metadata: object | None = None,
-    liquidation_info: object = (Decimal("4000"), Decimal("3900")),
+    liquidation_info: object = _UNCONFIGURED,
     accept_script: list[object] | None = None,
+    swap_rate: object = None,
+    perp_rate: object = None,
+    equity: Decimal = Decimal("1000"),
+    account_positions: list[dict[str, object]] | None = None,
 ) -> StrictGuardClient:
     """构造默认安全且配平的守护客户端。"""
+    if liquidation_info is _UNCONFIGURED:
+        liquidation_info = {
+            "XAUS": (Decimal("4000"), Decimal("3900")),
+            "XAU": (Decimal("4000"), Decimal("4100")),
+        }
     return StrictGuardClient(
         positions=positions
         or {"XAUS": Decimal("0.01"), "XAU": Decimal("-0.01")},
         metadata=metadata if metadata is not None else _metadata(),
         liquidation_info=liquidation_info,
         accept_script=accept_script,
+        swap_rate=swap_rate,
+        perp_rate=perp_rate,
+        equity=equity,
+        account_positions=account_positions,
     )
 
 
@@ -419,8 +537,14 @@ def test_low_liquidation_distance_flattens_both_legs(tmp_path: Path) -> None:
 
 
 def test_missing_liquidation_price_is_unsafe_and_flattens(tmp_path: Path) -> None:
-    """强平价拿不到时必须 fail-closed，不得假设安全。"""
-    client = _healthy_client(liquidation_info=None, accept_script=[{}, {}])
+    """isolated 腿强平价拿不到时必须 fail-closed。"""
+    client = _healthy_client(
+        liquidation_info={
+            "XAUS": None,
+            "XAU": (Decimal("4000"), Decimal("4100")),
+        },
+        accept_script=[{}, {}],
+    )
 
     result = _run(client, tmp_path)
 
@@ -430,6 +554,156 @@ def test_missing_liquidation_price_is_unsafe_and_flattens(tmp_path: Path) -> Non
         _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
     )
     assert "强平" in heartbeat["conclusion"]
+
+
+def test_cross_leg_missing_liquidation_keeps_running_with_account_check(
+    tmp_path: Path,
+) -> None:
+    """全仓腿没有 per-leg 强平价时不得平仓，仍须完成账户级检查。"""
+    from tools import hedge_swap_carry
+
+    client = _healthy_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        liquidation_info={
+            "XAU": (Decimal("4000"), Decimal("3900")),
+            "XAUT": None,
+        },
+        accept_script=[{}, {}],
+    )
+
+    result = _run(client, tmp_path, structure=hedge_swap_carry.XAU_XAUT)
+
+    assert result == 0
+    assert client.accept_calls == []
+    assert client.all_positions_calls == 1
+    assert client.balance_calls == 1
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    xaut_monitor = heartbeat["legs"]["XAUT"]["per_leg_liquidation"]
+    assert xaut_monitor["status"] == "无数据"
+    assert xaut_monitor["enforced"] is False
+    assert xaut_monitor["fallback"] == "账户级保证金率"
+    assert Decimal(heartbeat["account_margin"]["ratio"]) > Decimal("2.0")
+
+
+def test_low_account_margin_ratio_flattens_even_with_normal_leg_prices(
+    tmp_path: Path,
+) -> None:
+    """账户级保证金率低于阈值时，即使各腿强平价正常也必须平仓。"""
+    client = _healthy_client(
+        liquidation_info={
+            "XAUS": (Decimal("4000"), Decimal("3900")),
+            "XAU": (Decimal("4000"), Decimal("4100")),
+        },
+        equity=Decimal("5"),
+        accept_script=[{}, {}],
+    )
+
+    result = _run(client, tmp_path)
+
+    assert result == 0
+    assert len(client.accept_calls) == 2
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert Decimal(heartbeat["account_margin"]["ratio"]) < Decimal("2.0")
+    assert "账户保证金率" in heartbeat["conclusion"]
+
+
+def test_account_margin_includes_btc_outside_selected_structure(
+    tmp_path: Path,
+) -> None:
+    """账户级维持保证金必须覆盖 `/positions` 中结构外的 BTC 腿。"""
+    from tools import hedge_swap_carry
+
+    positions = {"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")}
+    account_positions = [
+        _position_payload("XAU", Decimal("0.01"), mark_price=Decimal("4000")),
+        _position_payload("XAUT", Decimal("-0.01"), mark_price=Decimal("4000")),
+        _position_payload("BTC", Decimal("0.01"), mark_price=Decimal("100000")),
+    ]
+    client = _healthy_client(
+        positions=positions,
+        liquidation_info={
+            "XAU": (Decimal("4000"), Decimal("3900")),
+            "XAUT": (Decimal("4000"), Decimal("4100")),
+        },
+        equity=Decimal("20"),
+        account_positions=account_positions,
+        accept_script=[{}, {}],
+    )
+
+    result = _run(client, tmp_path, structure=hedge_swap_carry.XAU_XAUT)
+
+    assert result == 0
+    assert len(client.accept_calls) == 2
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    margins = heartbeat["account_margin"]["positions"]
+    assert {item["underlying"] for item in margins} == {"XAU", "XAUT", "BTC"}
+    assert next(
+        item for item in margins if item["underlying"] == "BTC"
+    )["maintenance_margin"] == "10.0000"
+    assert Decimal(heartbeat["account_margin"]["ratio"]) < Decimal("2.0")
+
+
+def test_missing_isolated_only_and_margin_mode_defaults_to_isolated(
+    tmp_path: Path,
+) -> None:
+    """两级保证金模式证据都缺失时须保守按 isolated 严格监控。"""
+    from tools import hedge_swap_carry
+
+    metadata = _metadata()
+    metadata["XAU"][0].pop("isolated_only")  # type: ignore[index,union-attr]
+    client = _healthy_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        metadata=metadata,
+        liquidation_info={
+            "XAU": None,
+            "XAUT": (Decimal("4000"), Decimal("4100")),
+        },
+        accept_script=[{}, {}],
+    )
+
+    result = _run(client, tmp_path, structure=hedge_swap_carry.XAU_XAUT)
+
+    assert result == 0
+    assert len(client.accept_calls) == 2
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert heartbeat["legs"]["XAU"]["margin_mode"] == "isolated"
+    assert heartbeat["legs"]["XAU"]["margin_mode_source"] == "保守默认"
+
+
+def test_incident_regression_xau_cross_missing_liquidation_stays_open(
+    tmp_path: Path,
+) -> None:
+    """复现事故：健康的 XAU/XAUT 不得因 XAU 强平价缺失而随机平仓。"""
+    from tools import hedge_swap_carry
+
+    client = _healthy_client(
+        positions={"XAU": Decimal("0.1"), "XAUT": Decimal("-0.1")},
+        liquidation_info={
+            "XAU": None,
+            "XAUT": (Decimal("4000"), Decimal("4200")),
+        },
+        equity=Decimal("1000"),
+        accept_script=[{}, {}],
+    )
+
+    result = _run(client, tmp_path, structure=hedge_swap_carry.XAU_XAUT)
+
+    assert result == 0
+    assert client.accept_calls == []
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert heartbeat["legs"]["XAU"]["margin_mode"] == "cross"
+    assert heartbeat["legs"]["XAU"]["per_leg_liquidation"]["status"] == "无数据"
+    assert Decimal(heartbeat["account_margin"]["ratio"]) > Decimal("2.0")
 
 
 def test_long_closure_within_preclose_window_flattens(tmp_path: Path) -> None:
@@ -721,8 +995,102 @@ def test_auto_open_never_runs_while_either_leg_exists(tmp_path: Path) -> None:
     result = _run(client, tmp_path)
 
     assert result == 0
-    assert client.funding_calls == []
     assert client.accept_calls == []
+
+
+def test_exit_carry_closes_after_three_consecutive_nonpositive_rounds(
+    tmp_path: Path,
+) -> None:
+    """净 carry 连续三轮不高于零时，第三轮必须平掉全部腿。"""
+    for expected_count in (1, 2):
+        client = _healthy_client(
+            swap_rate=Decimal("-0.10"),
+            perp_rate=Decimal("0.05"),
+        )
+
+        result = _run(client, tmp_path)
+
+        assert result == 0
+        assert client.accept_calls == []
+        state = json.loads(
+            _paths(tmp_path)["state_path"].read_text(encoding="utf-8")
+        )
+        assert state["exit_carry_consecutive_rounds"] == expected_count
+
+    closing_client = _healthy_client(
+        swap_rate=Decimal("-0.10"),
+        perp_rate=Decimal("0.05"),
+        accept_script=[{}, {}],
+    )
+
+    result = _run(closing_client, tmp_path)
+
+    assert result == 0
+    assert _accepted_markets(closing_client) == [
+        ("XAUS", "sell", True),
+        ("XAU", "buy", True),
+    ]
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert "carry" in heartbeat["conclusion"]
+
+
+def test_positive_carry_resets_exit_counter_before_next_bad_round(
+    tmp_path: Path,
+) -> None:
+    """第二轮转正应清零，下一次非正 carry 只能重新计为第一轮。"""
+    negative = dict(swap_rate=Decimal("-0.10"), perp_rate=Decimal("0.05"))
+    positive = dict(swap_rate=Decimal("-0.04"), perp_rate=Decimal("0.10"))
+
+    assert _run(_healthy_client(**negative), tmp_path) == 0
+    assert _run(_healthy_client(**positive), tmp_path) == 0
+    assert _run(_healthy_client(**negative), tmp_path) == 0
+
+    state = json.loads(_paths(tmp_path)["state_path"].read_text(encoding="utf-8"))
+    assert state["exit_carry_consecutive_rounds"] == 1
+
+
+def test_unreadable_carry_neither_increments_nor_resets_exit_counter(
+    tmp_path: Path,
+) -> None:
+    """读取失败不能被解释成坏 carry，也不能伪装成恢复正常。"""
+    assert _run(
+        _healthy_client(
+            swap_rate=Decimal("-0.10"),
+            perp_rate=Decimal("0.05"),
+        ),
+        tmp_path,
+    ) == 0
+
+    assert _run(
+        _healthy_client(
+            swap_rate=RuntimeError("费率接口暂不可用"),
+            perp_rate=Decimal("0.05"),
+        ),
+        tmp_path,
+    ) == 0
+
+    state = json.loads(_paths(tmp_path)["state_path"].read_text(encoding="utf-8"))
+    assert state["exit_carry_consecutive_rounds"] == 1
+
+
+def test_exit_carry_counter_survives_new_client_process_round(tmp_path: Path) -> None:
+    """新进程式重建客户端后，退出连续轮次必须从状态文件继续累计。"""
+    first_process = _healthy_client(
+        swap_rate=Decimal("-0.10"),
+        perp_rate=Decimal("0.05"),
+    )
+    second_process = _healthy_client(
+        swap_rate=Decimal("-0.10"),
+        perp_rate=Decimal("0.05"),
+    )
+
+    assert _run(first_process, tmp_path) == 0
+    assert _run(second_process, tmp_path) == 0
+
+    state = json.loads(_paths(tmp_path)["state_path"].read_text(encoding="utf-8"))
+    assert state["exit_carry_consecutive_rounds"] == 2
 
 
 def test_auto_open_skips_when_available_margin_is_insufficient(
