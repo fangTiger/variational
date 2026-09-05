@@ -515,10 +515,10 @@ def test_weighted_net_carry_uses_all_legs() -> None:
     assert result == Decimal("0.0809")
 
 
-def test_guard_xau_xaut_can_open_when_gold_funding_session_is_open(
+def test_guard_rejects_xau_xaut_when_open_session_targets_xaus_xau(
     tmp_path: Path,
 ) -> None:
-    """黄金现货开市且费率正常时，XAU_XAUT 自动开仓应继续执行。"""
+    """黄金现货开市时不得用当前费率打开非目标 XAU_XAUT。"""
     from tools import hedge_swap_carry as carry
     from tools import run_swap_carry_guard as guard
 
@@ -534,6 +534,7 @@ def test_guard_xau_xaut_can_open_when_gold_funding_session_is_open(
         guard.run_once(
             client,
             structure=carry.XAU_XAUT,
+            auto_switch=False,
             now=NOW,
             **_guard_paths(tmp_path),
         )
@@ -541,16 +542,20 @@ def test_guard_xau_xaut_can_open_when_gold_funding_session_is_open(
 
     assert result == 0
     assert client.metadata_calls == 1
-    assert _accepted_markets(client) == [
-        ("XAU", "buy", False),
-        ("XAUT", "sell", False),
+    assert client.funding_calls == []
+    assert client.accept_calls == []
+    heartbeat = json.loads(
+        _guard_paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert "不是当前时段目标结构 XAUS_XAU" in heartbeat[
+        "auto_open_conclusion"
     ]
 
 
-def test_guard_xau_xaut_rejects_zero_rate_entry_while_gold_market_is_closed(
+def test_guard_rejects_entry_when_market_status_conflicts_with_sessions(
     tmp_path: Path,
 ) -> None:
-    """休市清零费率是伪像，必须按时段元数据拒绝开仓并写明不可用。"""
+    """market_status 与会话冲突时目标结构未知，必须保守拒绝开仓。"""
     from tools import hedge_swap_carry as carry
     from tools import run_swap_carry_guard as guard
 
@@ -566,6 +571,7 @@ def test_guard_xau_xaut_rejects_zero_rate_entry_while_gold_market_is_closed(
         guard.run_once(
             client,
             structure=carry.XAU_XAUT,
+            auto_switch=False,
             now=NOW,
             **_guard_paths(tmp_path),
         )
@@ -577,10 +583,11 @@ def test_guard_xau_xaut_rejects_zero_rate_entry_while_gold_market_is_closed(
     heartbeat = json.loads(
         _guard_paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
     )
-    assert "费率不可用" in heartbeat["auto_open_conclusion"]
-    assert "费率不可用" in _guard_paths(tmp_path)["audit_path"].read_text(
-        encoding="utf-8"
-    )
+    assert heartbeat["target_structure"] is None
+    assert "无法判定当前时段目标结构" in heartbeat["auto_open_conclusion"]
+    assert "无法判定当前时段目标结构" in _guard_paths(tmp_path)[
+        "audit_path"
+    ].read_text(encoding="utf-8")
 
 
 def test_guard_xau_xaut_open_position_has_no_weekend_close_logic(

@@ -324,9 +324,16 @@ class StrictGuardClient:
         self.funding_calls.append((underlying, instrument_type))
         if self.perp_rate is None:
             raise AssertionError("未配置调用：get_funding_rate")
-        if isinstance(self.perp_rate, BaseException):
-            raise self.perp_rate
-        return self.perp_rate
+        result = self.perp_rate
+        if isinstance(result, dict):
+            if underlying not in result:
+                raise AssertionError(
+                    f"未配置调用：get_funding_rate({underlying})"
+                )
+            result = result[underlying]
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     async def get_balance(self) -> object:
         self.balance_calls += 1
@@ -444,6 +451,41 @@ def _flat_open_client(
         perp_rate=perp_rate,
         equity=equity,
         accept_script=accept_script,
+    )
+
+
+def _switch_client(
+    *,
+    positions: dict[str, Decimal],
+    metadata: object | None = None,
+    accept_script: list[object] | None = None,
+    swap_rate: object = Decimal("-0.04"),
+    perp_rate: object = None,
+) -> StrictGuardClient:
+    """构造三标的切换场景，所有可能调用均显式配置。"""
+    if perp_rate is None:
+        perp_rate = {
+            "XAU": Decimal("0.10"),
+            "XAUT": Decimal("0.1095"),
+        }
+    configured_positions = {
+        "XAUS": Decimal("0"),
+        "XAU": Decimal("0"),
+        "XAUT": Decimal("0"),
+        **positions,
+    }
+    return StrictGuardClient(
+        positions=configured_positions,
+        metadata=metadata if metadata is not None else _metadata(),
+        liquidation_info={
+            "XAUS": (Decimal("4000"), Decimal("3900")),
+            "XAU": (Decimal("4000"), Decimal("4100")),
+            "XAUT": (Decimal("4000"), Decimal("4200")),
+        },
+        accept_script=accept_script,
+        swap_rate=swap_rate,
+        perp_rate=perp_rate,
+        equity=Decimal("1000"),
     )
 
 
@@ -1388,3 +1430,531 @@ def test_auto_open_cli_and_environment_configuration(
     assert env_args.auto_open_notional == Decimal("2000")
     assert cli_args.auto_open is True
     assert cli_args.auto_open_notional == Decimal("750")
+
+
+def test_open_market_switches_xau_xaut_to_xaus_xau(tmp_path: Path) -> None:
+    """开市中应先平周末结构，再建立多 XAUS、空 XAU。"""
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[{}, {}, {}, {}],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert _accepted_markets(client) == [
+        ("XAU", "sell", True),
+        ("XAUT", "buy", True),
+        ("XAUS", "buy", False),
+        ("XAU", "sell", False),
+    ]
+    assert client.sizes["XAUT"] == 0
+    assert client.sizes["XAUS"] == -client.sizes["XAU"] > 0
+
+
+def test_weekend_target_xau_xaut_accepts_zero_xau_rate(
+    tmp_path: Path,
+) -> None:
+    """周末目标结构应把合法的 XAU 零费率计入 carry 并允许开仓。"""
+    client = _switch_client(
+        positions={},
+        metadata=_metadata(
+            closure_duration=timedelta(hours=49),
+            market_status="closed",
+        ),
+        perp_rate={
+            "XAU": Decimal("0"),
+            "XAUT": Decimal("0.1095"),
+        },
+        accept_script=[{}, {}],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert client.funding_calls == [
+        ("XAU", "perpetual_rwa_future"),
+        ("XAUT", "perpetual_future"),
+    ]
+    assert _accepted_markets(client) == [
+        ("XAU", "buy", False),
+        ("XAUT", "sell", False),
+    ]
+    audit_records = [
+        json.loads(line)
+        for line in _paths(tmp_path)["audit_path"].read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    attempt = next(
+        record
+        for record in audit_records
+        if record["event"] == "auto_open_attempt"
+    )
+    assert Decimal(attempt["net_carry_annual"]) == Decimal("0.1095")
+
+
+def test_weekend_rejects_non_target_xaus_xau_entry(tmp_path: Path) -> None:
+    """周末不得用当期费率打开并非时段目标的 XAUS_XAU。"""
+    client = _flat_open_client(
+        metadata=_metadata(
+            closure_duration=timedelta(hours=49),
+            market_status="closed",
+        ),
+        accept_script=[],
+    )
+
+    result = _run(
+        client,
+        tmp_path,
+        structure="XAUS_XAU",
+        auto_switch=False,
+    )
+
+    assert result == 0
+    assert client.funding_calls == []
+    assert client.quote_calls == []
+    assert client.accept_calls == []
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert "不是当前时段目标结构 XAU_XAUT" in heartbeat[
+        "auto_open_conclusion"
+    ]
+
+
+def test_open_market_target_xaus_xau_allows_entry(tmp_path: Path) -> None:
+    """开市时 XAUS_XAU 等于时段目标，正常读取费率并允许开仓。"""
+    client = _switch_client(
+        positions={},
+        accept_script=[{}, {}],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert _accepted_markets(client) == [
+        ("XAUS", "buy", False),
+        ("XAU", "sell", False),
+    ]
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert heartbeat["target_structure"] == "XAUS_XAU"
+    assert heartbeat["auto_open_attempted"] is True
+
+
+def test_weekend_rate_api_failure_is_not_treated_as_zero(tmp_path: Path) -> None:
+    """目标结构正确也不能把费率读取异常降级成合法零值。"""
+    client = _switch_client(
+        positions={},
+        metadata=_metadata(
+            closure_duration=timedelta(hours=49),
+            market_status="closed",
+        ),
+        perp_rate={
+            "XAU": RuntimeError("XAU 费率接口暂不可用"),
+            "XAUT": Decimal("0.1095"),
+        },
+        accept_script=[],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert client.funding_calls == [("XAU", "perpetual_rwa_future")]
+    assert client.quote_calls == []
+    assert client.accept_calls == []
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert "读取失败" in heartbeat["auto_open_conclusion"]
+
+
+def test_weekend_positive_xau_xaut_carry_resets_exit_counter(
+    tmp_path: Path,
+) -> None:
+    """周末目标结构的正 carry 应按正常值评估并清零退出计数。"""
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(
+        json.dumps({"exit_carry_consecutive_rounds": 2}),
+        encoding="utf-8",
+    )
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        metadata=_metadata(
+            closure_duration=timedelta(hours=49),
+            market_status="closed",
+        ),
+        perp_rate={
+            "XAU": Decimal("0"),
+            "XAUT": Decimal("0.1095"),
+        },
+        accept_script=None,
+    )
+
+    result = asyncio.run(
+        __import__("tools.run_swap_carry_guard", fromlist=["run_once"]).run_once(
+            client,
+            now=NOW,
+            auto_open=False,
+            auto_switch=True,
+            **paths,
+        )
+    )
+
+    assert result == 0
+    assert client.funding_calls == [
+        ("XAU", "perpetual_rwa_future"),
+        ("XAUT", "perpetual_future"),
+    ]
+    state = json.loads(paths["state_path"].read_text(encoding="utf-8"))
+    assert state["exit_carry_consecutive_rounds"] == 0
+    heartbeat = json.loads(paths["heartbeat_path"].read_text(encoding="utf-8"))
+    assert heartbeat["net_carry_annual"] == "0.1095"
+
+
+def test_unknown_schedule_target_rejects_entry_conservatively(
+    tmp_path: Path,
+) -> None:
+    """时段元数据不完整时无法确定目标结构，必须保守拒绝开仓。"""
+    metadata = _metadata()
+    metadata["XAUS"][0].pop("trading_schedule")  # type: ignore[index,union-attr]
+    client = _switch_client(
+        positions={},
+        metadata=metadata,
+        accept_script=[],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert client.funding_calls == []
+    assert client.quote_calls == []
+    assert client.accept_calls == []
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert heartbeat["target_structure"] is None
+    assert "时段元数据" in heartbeat["auto_open_conclusion"]
+
+
+def test_45_minutes_before_long_close_switches_to_xau_xaut(
+    tmp_path: Path,
+) -> None:
+    """距长休市 45 分钟时应在 XAUS 关市前完成周末结构切换。"""
+    client = _switch_client(
+        positions={"XAUS": Decimal("0.01"), "XAU": Decimal("-0.01")},
+        metadata=_metadata(
+            closure_duration=timedelta(hours=49),
+            time_until_close=timedelta(minutes=45),
+        ),
+        accept_script=[{}, {}, {}, {}],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert _accepted_markets(client) == [
+        ("XAUS", "sell", True),
+        ("XAU", "buy", True),
+        ("XAU", "buy", False),
+        ("XAUT", "sell", False),
+    ]
+    assert client.sizes["XAUS"] == 0
+    assert client.sizes["XAU"] == -client.sizes["XAUT"] > 0
+
+
+def test_daily_one_hour_closure_does_not_switch_structure(tmp_path: Path) -> None:
+    """每日一小时休市边界必须继续持有 XAUS_XAU，不做结构切换。"""
+    client = _switch_client(
+        positions={"XAUS": Decimal("0.01"), "XAU": Decimal("-0.01")},
+        metadata=_metadata(
+            closure_duration=timedelta(hours=1),
+            time_until_close=timedelta(minutes=45),
+        ),
+        accept_script=None,
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert client.accept_calls == []
+
+
+def test_long_closure_keeps_existing_xau_xaut_unchanged(tmp_path: Path) -> None:
+    """长休市中已经处于 XAU_XAUT 时不得重复切换或成交。"""
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        metadata=_metadata(
+            closure_duration=timedelta(hours=49),
+            market_status="closed",
+        ),
+        accept_script=None,
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert client.accept_calls == []
+
+
+def test_open_market_with_unavailable_rates_defers_switch(tmp_path: Path) -> None:
+    """周日开市后费率尚未刷新时保留旧结构，等待下一轮重试。"""
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        swap_rate=RuntimeError("XAUS 费率尚未刷新"),
+        accept_script=None,
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert client.accept_calls == []
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    assert "费率" in heartbeat["auto_switch_conclusion"]
+
+
+def test_switch_close_failure_never_opens_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """旧结构任一平仓失败时不得发送目标结构的非 reduce-only 委托。"""
+    from tools import run_swap_carry_guard
+
+    monkeypatch.setattr(run_swap_carry_guard, "RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(run_swap_carry_guard, "notify", lambda *_args: True)
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[
+            RuntimeError("平仓拒绝 1"),
+            RuntimeError("平仓拒绝 2"),
+            RuntimeError("平仓拒绝 3"),
+        ],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result != 0
+    assert client.accept_calls
+    assert all(call[2] is True for call in client.accept_calls)
+    assert client.sizes == {
+        "XAUS": Decimal("0"),
+        "XAU": Decimal("0.01"),
+        "XAUT": Decimal("-0.01"),
+    }
+
+
+def test_switch_open_failure_stays_fully_flat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """旧结构全平后若目标第二腿失败并回滚，本轮必须安全停在全空仓。"""
+    from tools import run_swap_carry_guard
+
+    monkeypatch.setattr(run_swap_carry_guard, "notify", lambda *_args: True)
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[
+            {},
+            {},
+            {},
+            RuntimeError("目标第二腿拒绝"),
+            {},
+        ],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result != 0
+    assert _accepted_markets(client) == [
+        ("XAU", "sell", True),
+        ("XAUT", "buy", True),
+        ("XAUS", "buy", False),
+        ("XAU", "sell", False),
+        ("XAUS", "sell", True),
+    ]
+    assert all(size == 0 for size in client.sizes.values())
+
+    client.accept_script = [{}, {}]
+    retry = _run(client, tmp_path, auto_switch=True)
+
+    assert retry == 0
+    assert _accepted_markets(client)[-2:] == [
+        ("XAUS", "buy", False),
+        ("XAU", "sell", False),
+    ]
+    assert client.sizes["XAUS"] == -client.sizes["XAU"] > 0
+
+
+def test_simultaneous_structures_are_flattened_without_switching(
+    tmp_path: Path,
+) -> None:
+    """发现两结构同时存在时必须先清空全部受管腿，绝不继续开仓。"""
+    client = _switch_client(
+        positions={"XAUS": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[{}, {}],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert _accepted_markets(client) == [
+        ("XAUS", "sell", True),
+        ("XAUT", "buy", True),
+    ]
+    assert all(size == 0 for size in client.sizes.values())
+
+
+def test_switch_kill_switch_priority_flattens_without_reopening(
+    tmp_path: Path,
+) -> None:
+    """kill switch 优先于切换，命中后只平旧结构并结束本轮。"""
+    paths = _paths(tmp_path)
+    paths["kill_switch_path"].write_text("停止\n", encoding="utf-8")
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[{}, {}],
+    )
+
+    result = asyncio.run(
+        __import__("tools.run_swap_carry_guard", fromlist=["run_once"]).run_once(
+            client,
+            now=NOW,
+            auto_switch=True,
+            **paths,
+        )
+    )
+
+    assert result == 0
+    assert _accepted_markets(client) == [
+        ("XAU", "sell", True),
+        ("XAUT", "buy", True),
+    ]
+
+
+def test_switch_imbalance_priority_flattens_without_reopening(
+    tmp_path: Path,
+) -> None:
+    """缺腿失衡优先于切换，命中后只平剩余腿并结束本轮。"""
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("0")},
+        accept_script=[{}],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert _accepted_markets(client) == [("XAU", "sell", True)]
+
+
+def test_no_auto_switch_keeps_structure_but_preserves_risk(
+    tmp_path: Path,
+) -> None:
+    """关闭切换时健康仓位不动，但 kill switch 仍照常平仓。"""
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=None,
+    )
+
+    first = _run(
+        client,
+        tmp_path,
+        structure="XAU_XAUT",
+        auto_switch=False,
+    )
+
+    assert first == 0
+    assert client.accept_calls == []
+
+    paths = _paths(tmp_path)
+    paths["kill_switch_path"].write_text("停止\n", encoding="utf-8")
+    client.accept_script = [{}, {}]
+    second = asyncio.run(
+        __import__("tools.run_swap_carry_guard", fromlist=["run_once"]).run_once(
+            client,
+            now=NOW,
+            structure="XAU_XAUT",
+            auto_switch=False,
+            **paths,
+        )
+    )
+
+    assert second == 0
+    assert _accepted_markets(client) == [
+        ("XAU", "sell", True),
+        ("XAUT", "buy", True),
+    ]
+
+
+def test_xau_xaut_switch_open_ignores_xaus_preclose_freeze(
+    tmp_path: Path,
+) -> None:
+    """目标结构不含 XAUS 时，即使进入 30 分钟冻结窗也必须能开仓。"""
+    client = _switch_client(
+        positions={"XAUS": Decimal("0.01"), "XAU": Decimal("-0.01")},
+        metadata=_metadata(
+            closure_duration=timedelta(hours=49),
+            time_until_close=timedelta(minutes=25),
+        ),
+        accept_script=[{}, {}, {}, {}],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    assert _accepted_markets(client)[-2:] == [
+        ("XAU", "buy", False),
+        ("XAUT", "sell", False),
+    ]
+
+
+def test_switch_respects_daily_open_attempt_limit(tmp_path: Path) -> None:
+    """达到每日开仓上限时不得先平旧结构再陷入无法开仓的空仓。"""
+    from tools import run_swap_carry_guard
+
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(
+        json.dumps(
+            {
+                "open_attempt_date": NOW.date().isoformat(),
+                "daily_open_attempts": run_swap_carry_guard.MAX_DAILY_OPEN_ATTEMPTS,
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=None,
+    )
+
+    result = asyncio.run(
+        run_swap_carry_guard.run_once(
+            client,
+            now=NOW,
+            auto_switch=True,
+            **paths,
+        )
+    )
+
+    assert result == 0
+    assert client.accept_calls == []
+    heartbeat = json.loads(paths["heartbeat_path"].read_text(encoding="utf-8"))
+    assert "上限" in heartbeat["auto_switch_conclusion"]
+
+
+def test_auto_switch_cli_and_default_notional_configuration() -> None:
+    """切换默认开启且可关闭，自动开仓默认名义调整为 2000 美元。"""
+    from tools import run_swap_carry_guard
+
+    parser = run_swap_carry_guard.build_parser()
+
+    defaults = parser.parse_args(["--once"])
+    disabled = parser.parse_args(["--once", "--no-auto-switch"])
+
+    assert defaults.auto_switch is True
+    assert disabled.auto_switch is False
+    assert defaults.auto_open_notional == Decimal("2000")
+    assert run_swap_carry_guard.SWITCH_LEAD_TIME == timedelta(minutes=60)

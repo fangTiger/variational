@@ -48,15 +48,13 @@ PRE_CLOSE_MINUTES = 30
 LONG_CLOSURE_THRESHOLD = timedelta(hours=4)
 CLOSE_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
-AUTO_OPEN_NOTIONAL_USD = Decimal("500")
+AUTO_OPEN_NOTIONAL_USD = Decimal("2000")
 MIN_ENTRY_CARRY_ANNUAL = Decimal("0.05")
 MIN_TIME_TO_CLOSE = timedelta(hours=2)
 MAX_DAILY_OPEN_ATTEMPTS = 20
+SWITCH_LEAD_TIME = timedelta(minutes=60)
 EXIT_CARRY_ANNUAL = Decimal("0")
 EXIT_CARRY_CONSECUTIVE_ROUNDS = 3
-_SCHEDULED_FUNDING_INSTRUMENT_TYPES = frozenset(
-    {"perpetual_rwa_future", "swap"}
-)
 
 
 @dataclass(frozen=True)
@@ -81,8 +79,16 @@ class AutoOpenResult:
 
 
 @dataclass(frozen=True)
+class StructureDetection:
+    """账户三标的持仓对应的当前结构识别结果。"""
+
+    structure: execution.CarryStructure | None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class FundingAvailability:
-    """单腿费率在当前标的市场时段是否具有经济含义。"""
+    """单腿费率在当前结构预期持有期内是否可用于 carry 决策。"""
 
     usable: bool
     reason: str
@@ -267,85 +273,36 @@ def _format_money(value: Decimal | None) -> str | None:
     return format(value, ".2f") if value is not None else None
 
 
-def _schedule_record_for_funding_leg(
-    metadata: object,
-    leg: execution.CarryLeg,
-) -> tuple[Mapping[str, Any], str]:
-    """选择费率时段元数据；XAU 与 XAUS 明确共享黄金现货时段。"""
-    candidates = [leg]
-    if leg.underlying == "XAU":
-        candidates.append(execution.XAUS_LEG)
-    elif leg.underlying == "XAUS":
-        candidates.append(execution.XAU_LONG_LEG)
-
-    errors: list[str] = []
-    for candidate in candidates:
-        try:
-            record = execution._instrument_record(metadata, candidate)
-        except (TypeError, ValueError) as exc:
-            errors.append(str(exc))
-            continue
-        if (
-            record.get("trading_sessions") is not None
-            and record.get("trading_schedule") is not None
-            and isinstance(record.get("market_status"), str)
-            and str(record.get("market_status")).strip()
-        ):
-            return record, candidate.underlying
-        errors.append(
-            f"{candidate.underlying} 缺少完整的交易会话、日程或 market_status"
-        )
-    raise ValueError("；".join(errors) or f"{leg.underlying} 缺少时段元数据")
-
-
 def _funding_availability_by_leg(
-    metadata: object | None,
     selected: execution.CarryStructure,
-    observed_at: datetime,
     *,
-    metadata_error: str | None,
+    target_structure: execution.CarryStructure | None,
+    target_reason: str,
 ) -> dict[str, FundingAvailability]:
-    """仅以交易时段元数据判定费率是否可用于入场或退出。"""
-    result: dict[str, FundingAvailability] = {}
-    for leg in selected.legs:
-        if leg.instrument_type not in _SCHEDULED_FUNDING_INSTRUMENT_TYPES:
-            result[leg.underlying] = FundingAvailability(
-                True,
-                f"{leg.underlying} 为 24/7 合约，费率可用",
-            )
-            continue
-        if metadata is None:
-            detail = metadata_error or "supported_assets 无数据"
-            result[leg.underlying] = FundingAvailability(
-                False,
-                f"{leg.underlying} 费率不可用：{detail}",
-            )
-            continue
-        try:
-            record, source = _schedule_record_for_funding_leg(metadata, leg)
-            schedule = parse_trading_schedule(
-                record.get("trading_sessions"),
-                record.get("trading_schedule"),
-                record.get("market_status"),
-                observed_at,
-            )
-        except (TypeError, ValueError) as exc:
-            result[leg.underlying] = FundingAvailability(
-                False,
-                f"{leg.underlying} 费率不可用：时段元数据异常：{exc}",
-            )
-            continue
-        usable = schedule.metadata_is_fresh and schedule.is_tradable
-        result[leg.underlying] = FundingAvailability(
-            usable,
-            (
-                f"{leg.underlying} 费率可用：{schedule.reason}"
-                if usable
-                else f"{leg.underlying} 费率不可用：{schedule.reason}"
-            ),
-            schedule_source=source,
+    """按结构的预期持有期判定费率；合法零值仍由 API 原样读取。"""
+    if target_structure is None:
+        usable = False
+        detail = f"无法判定当前时段目标结构：{target_reason}"
+    elif selected.name != target_structure.name:
+        usable = False
+        detail = (
+            f"待评估结构 {selected.name} 不是当前时段目标结构 "
+            f"{target_structure.name}"
         )
-    return result
+    else:
+        usable = True
+        detail = (
+            f"{selected.name} 是当前时段目标结构；"
+            "当前费率（包括合法零值）可用于持有期 carry"
+        )
+    return {
+        leg.underlying: FundingAvailability(
+            usable,
+            f"{leg.underlying} 费率{'可用' if usable else '不可用'}：{detail}",
+            schedule_source="XAUS",
+        )
+        for leg in selected.legs
+    }
 
 
 def _unusable_funding_reason(
@@ -534,6 +491,106 @@ def _account_position_leg(
     return leg, Position(underlying, qty, raw=raw_position), mark_price
 
 
+def _carry_positions_from_payload(payload: object) -> dict[str, Position]:
+    """从真实 `/positions` 响应提取三个受管标的，缺席标的视为空仓。"""
+    monitored_legs = {
+        execution.XAUS_LEG.underlying: execution.XAUS_LEG,
+        execution.XAU_LONG_LEG.underlying: execution.XAU_LONG_LEG,
+        execution.XAUT_LEG.underlying: execution.XAUT_LEG,
+    }
+    positions = {
+        underlying: Position(underlying, Decimal("0"))
+        for underlying in monitored_legs
+    }
+    seen: set[str] = set()
+    for raw_position in _position_items(payload):
+        leg, position, _mark_price = _account_position_leg(
+            raw_position,
+            monitored_legs,
+        )
+        if leg.underlying not in monitored_legs:
+            continue
+        if leg.underlying in seen:
+            raise ValueError(
+                f"/positions 返回重复的受管标的 {leg.underlying}"
+            )
+        seen.add(leg.underlying)
+        positions[leg.underlying] = position
+    return positions
+
+
+def _detect_carry_structure(
+    positions: Mapping[str, Position],
+) -> StructureDetection:
+    """按三标的实际方向识别两种互斥结构及其缺腿状态。"""
+    xaus = positions["XAUS"].signed_size
+    xau = positions["XAU"].signed_size
+    xaut = positions["XAUT"].signed_size
+    if xaus == 0 and xau == 0 and xaut == 0:
+        return StructureDetection(None)
+
+    xaus_xau_compatible = xaus >= 0 and xau <= 0 and xaut == 0
+    xau_xaut_compatible = xaus == 0 and xau >= 0 and xaut <= 0
+    if xaus_xau_compatible and (xaus > 0 or xau < 0):
+        return StructureDetection(execution.XAUS_XAU)
+    if xau_xaut_compatible and (xau > 0 or xaut < 0):
+        return StructureDetection(execution.XAU_XAUT)
+
+    detail = f"XAUS={xaus} XAU={xau} XAUT={xaut}"
+    return StructureDetection(
+        execution.TRIPLE,
+        f"检测到两个结构同时持仓或方向异常：{detail}",
+    )
+
+
+def _target_structure_for_schedule(
+    schedule: SwapTradingSchedule | None,
+    market_status: str | None,
+    *,
+    switch_lead_time: timedelta,
+) -> tuple[execution.CarryStructure | None, str]:
+    """只按权威长休市边界选择目标结构，每日短休市不触发切换。"""
+    if schedule is None or not schedule.metadata_is_fresh:
+        detail = schedule.reason if schedule is not None else "无解析结果"
+        return None, f"XAUS 时段元数据不安全，暂不切换：{detail}"
+    if market_status is None:
+        return None, "XAUS market_status 缺失，暂不切换"
+    if schedule.closure_duration is None:
+        return None, "XAUS 缺少完整休市长度，暂不切换"
+    if schedule.closure_duration <= LONG_CLOSURE_THRESHOLD:
+        if schedule.is_tradable and market_status == "open":
+            return execution.XAUS_XAU, "当前开市，目标结构为 XAUS_XAU"
+        return None, "当前处于每日短休市，保持现有结构不切换"
+    if not schedule.is_tradable:
+        if market_status == "open":
+            return None, "XAUS 时段状态矛盾，暂不切换"
+        return execution.XAU_XAUT, "当前处于长休市，目标结构为 XAU_XAUT"
+    if market_status != "open":
+        return None, "XAUS market_status 与交易会话矛盾，暂不切换"
+    if schedule.time_until_close is None:
+        return None, "XAUS 长休市前缺少剩余时间，暂不切换"
+    if schedule.time_until_close <= switch_lead_time:
+        return (
+            execution.XAU_XAUT,
+            f"距 XAUS 长休市仅 {schedule.time_until_close}，目标结构为 XAU_XAUT",
+        )
+    return execution.XAUS_XAU, "XAUS 开市且未临近长休市，目标结构为 XAUS_XAU"
+
+
+def _target_funding_context(
+    target: execution.CarryStructure,
+    *,
+    target_reason: str,
+) -> tuple[dict[str, FundingAvailability], dict[str, Decimal]]:
+    """生成目标结构费率上下文；所有数值都由 API 实际读取。"""
+    availability = _funding_availability_by_leg(
+        target,
+        target_structure=target,
+        target_reason=target_reason,
+    )
+    return availability, {}
+
+
 def _maintenance_rate_from_quote(
     quote: Mapping[str, Any],
     underlying: str,
@@ -565,13 +622,18 @@ async def _account_margin_health(
     var: Any,
     *,
     selected: execution.CarryStructure,
+    positions_payload: object | None = None,
     quote_cache: dict[
         tuple[str, str, int, str | None, str],
         Mapping[str, Any],
     ],
 ) -> AccountMarginHealth:
     """用全账户真实持仓计算权益相对维持保证金的倍数。"""
-    payload = await var.get_positions()
+    payload = (
+        positions_payload
+        if positions_payload is not None
+        else await var.get_positions()
+    )
     selected_legs = {leg.underlying: leg for leg in selected.legs}
     margins: list[AccountPositionMargin] = []
     for raw_position in _position_items(payload):
@@ -780,10 +842,81 @@ def _is_safe_open_rejection(error: SystemExit) -> bool:
     return any(marker in message for marker in markers)
 
 
+async def _load_funding_rates_with_overrides(
+    var: Any,
+    structure: execution.CarryStructure,
+    overrides: Mapping[str, Decimal],
+) -> dict[str, Decimal]:
+    """读取目标结构费率，并只应用由权威休市状态确定的覆盖值。"""
+    rates: dict[str, Decimal] = {}
+    for leg in structure.legs:
+        if leg.underlying in overrides:
+            rates[leg.underlying] = overrides[leg.underlying]
+        else:
+            rates[leg.underlying] = await execution._funding_rate_for_leg(var, leg)
+    return rates
+
+
+async def _switch_readiness(
+    var: Any,
+    *,
+    target: execution.CarryStructure,
+    funding_availability: Mapping[str, FundingAvailability],
+    funding_rate_overrides: Mapping[str, Decimal],
+    schedule: SwapTradingSchedule | None,
+    schedule_error: str | None,
+    market_status: str | None,
+    auto_open: bool,
+    auto_open_notional: Decimal,
+    daily_attempts: int,
+    incident: bool,
+) -> tuple[bool, str]:
+    """在平旧结构前验证不会确定性阻止目标开仓的只读条件。"""
+    if not auto_open:
+        return False, "自动开仓已关闭，不能执行结构切换"
+    if incident:
+        return False, "既有自动开仓 INCIDENT 未解除，不能执行结构切换"
+    if daily_attempts >= MAX_DAILY_OPEN_ATTEMPTS:
+        return False, f"当日切换开仓尝试已达上限 {MAX_DAILY_OPEN_ATTEMPTS} 次"
+    try:
+        execution._validate_notional(auto_open_notional)
+    except SystemExit as exc:
+        return False, str(exc)
+
+    unavailable_reason = _unusable_funding_reason(funding_availability)
+    if unavailable_reason is not None:
+        return False, f"目标结构费率不可用，暂不切换：{unavailable_reason}"
+    if target.has_xaus:
+        if schedule_error is not None:
+            return False, f"XAUS 时段元数据不可用，暂不切换：{schedule_error}"
+        if schedule is None or not schedule.metadata_is_fresh:
+            detail = schedule.reason if schedule is not None else "无解析结果"
+            return False, f"XAUS 时段元数据不安全，暂不切换：{detail}"
+        if market_status != "open" or not schedule.is_tradable:
+            return False, f"XAUS 当前不可交易，暂不切换：{schedule.reason}"
+        if schedule.time_until_close is None:
+            return False, "XAUS 缺少距下次休市时间，暂不切换"
+        if schedule.time_until_close <= MIN_TIME_TO_CLOSE:
+            return False, (
+                f"XAUS 距休市 {schedule.time_until_close}，"
+                f"未超过最短开仓窗口 {MIN_TIME_TO_CLOSE}"
+            )
+    try:
+        await _load_funding_rates_with_overrides(
+            var,
+            target,
+            funding_rate_overrides,
+        )
+    except Exception as exc:  # noqa: BLE001 费率未刷新时保留旧结构更安全
+        return False, f"目标结构费率读取失败，暂不切换：{type(exc).__name__}: {exc}"
+    return True, f"目标结构 {target.name} 的切换前置条件已满足"
+
+
 async def _try_auto_open(
     var: Any,
     *,
     structure: execution.CarryStructure | str,
+    target_structure: execution.CarryStructure | None,
     positions: Mapping[str, Position],
     schedule: SwapTradingSchedule | None,
     schedule_error: str | None,
@@ -797,6 +930,8 @@ async def _try_auto_open(
     dry_run: bool,
     audit_path: Path,
     observed_at: datetime,
+    funding_rate_overrides: Mapping[str, Decimal] | None = None,
+    enforce_min_carry: bool = True,
 ) -> AutoOpenResult:
     """逐项失败关闭地判定入场，并把成交委托给人工执行器。"""
     selected = execution.resolve_structure(structure)
@@ -860,6 +995,14 @@ async def _try_auto_open(
     except SystemExit as exc:
         return skip(str(exc))
 
+    if target_structure is None:
+        return skip("无法判定当前时段目标结构，禁止自动开仓")
+    if selected.name != target_structure.name:
+        return skip(
+            f"待开结构 {selected.name} 不是当前时段目标结构 "
+            f"{target_structure.name}，禁止自动开仓"
+        )
+
     unavailable_reason = _unusable_funding_reason(funding_availability)
     if unavailable_reason is not None:
         return skip(f"费率不可用，禁止自动开仓：{unavailable_reason}")
@@ -881,12 +1024,16 @@ async def _try_auto_open(
             )
 
     try:
-        rates = await execution._load_funding_rates(var, selected)
+        rates = await _load_funding_rates_with_overrides(
+            var,
+            selected,
+            funding_rate_overrides or {},
+        )
         net_carry = execution._weighted_net_carry(selected, rates)
     except Exception as exc:  # noqa: BLE001 入场数据不确定时只跳过，不升级故障
         return skip(f"净 carry 读取失败，按不确定处理：{type(exc).__name__}: {exc}")
 
-    if net_carry < MIN_ENTRY_CARRY_ANNUAL:
+    if enforce_min_carry and net_carry < MIN_ENTRY_CARRY_ANNUAL:
         return skip(
             f"净 carry {net_carry:.4%} 低于入场阈值 "
             f"{MIN_ENTRY_CARRY_ANNUAL:.4%}"
@@ -1143,15 +1290,20 @@ async def run_once(
     structure: execution.CarryStructure | str = execution.XAUS_XAU,
     dry_run: bool = False,
     auto_open: bool = True,
+    auto_switch: bool = True,
     auto_open_notional: Decimal = AUTO_OPEN_NOTIONAL_USD,
+    switch_lead_time: timedelta = SWITCH_LEAD_TIME,
     now: datetime | None = None,
     kill_switch_path: Path = DEFAULT_KILL_SWITCH,
     heartbeat_path: Path = DEFAULT_HEARTBEAT,
     state_path: Path = DEFAULT_STATE,
     audit_path: Path = DEFAULT_AUDIT_LOG,
 ) -> int:
-    """先执行全部平仓风控，再以最低优先级判定自动开仓。"""
-    selected = execution.resolve_structure(structure)
+    """先执行全部平仓风控，再按长休市边界原子切换结构。"""
+    configured_structure = execution.resolve_structure(structure)
+    selected = configured_structure
+    if switch_lead_time < timedelta(0):
+        raise ValueError("switch_lead_time 不得为负数")
     observed_at = now or datetime.now(timezone.utc)
     if observed_at.tzinfo is None:
         raise ValueError("now 必须包含时区")
@@ -1165,11 +1317,21 @@ async def run_once(
     conclusion = "本轮尚未完成"
     auto_open_attempted = False
     auto_open_conclusion = "未进入自动开仓判定"
+    auto_switch_attempted = False
+    auto_switch_conclusion = (
+        "未进入自动切换判定" if auto_switch else "自动切换已由 --no-auto-switch 关闭"
+    )
     result_code = 1
     positions: dict[str, Position] = {}
-    prices: dict[str, Decimal | None] = {
-        leg.underlying: None for leg in selected.legs
-    }
+    prices: dict[str, Decimal | None] = {}
+    portfolio_positions: dict[str, Position] = {}
+    account_positions_payload: object | None = None
+    current_structure: execution.CarryStructure | None = None
+    target_structure: execution.CarryStructure | None = None
+    target_structure_reason = "尚未判定当前时段目标结构"
+    structure_detection_error: str | None = None
+    target_funding_availability: dict[str, FundingAvailability] = {}
+    target_funding_overrides: dict[str, Decimal] = {}
     schedule: SwapTradingSchedule | None = None
     schedule_error: str | None = None
     market_status: str | None = None
@@ -1213,6 +1375,8 @@ async def run_once(
             "dry_run": dry_run,
             "kill_switch": kill_switch_path.exists(),
             "auto_open": auto_open,
+            "auto_switch": auto_switch,
+            "switch_lead_time_seconds": switch_lead_time.total_seconds(),
             "auto_open_notional": auto_open_notional,
             "daily_open_attempts": daily_open_attempts,
             "auto_open_incident": auto_open_incident,
@@ -1220,49 +1384,91 @@ async def run_once(
         },
     )
     try:
-        positions = await execution._get_positions(var, selected)
+        if auto_switch:
+            account_positions_payload = await var.get_positions()
+            portfolio_positions = _carry_positions_from_payload(
+                account_positions_payload
+            )
+            detection = _detect_carry_structure(portfolio_positions)
+            current_structure = detection.structure
+            structure_detection_error = detection.error
+            if current_structure is not None:
+                selected = current_structure
+            positions = {
+                leg.underlying: portfolio_positions[leg.underlying]
+                for leg in selected.legs
+            }
+        else:
+            positions = await execution._get_positions(var, selected)
 
         try:
             metadata = await var.get_supported_assets()
-            for leg in selected.legs:
-                prices[leg.underlying] = execution._metadata_price(metadata, leg)
         except Exception as exc:  # noqa: BLE001 费率有效性按失败关闭，持仓仍继续降险
             metadata_error = f"{type(exc).__name__}: {exc}"
 
+        if metadata is None:
+            schedule_error = metadata_error or "supported_assets 无数据"
+        else:
+            try:
+                record = execution._instrument_record(
+                    metadata,
+                    execution.XAUS_LEG,
+                )
+                schedule = parse_trading_schedule(
+                    record.get("trading_sessions"),
+                    record.get("trading_schedule"),
+                    record.get("market_status"),
+                    observed_at,
+                )
+            except Exception as exc:  # noqa: BLE001 时段读取失败后仍要尝试降险
+                schedule_error = f"{type(exc).__name__}: {exc}"
+            else:
+                raw_market_status = record.get("market_status")
+                if (
+                    not isinstance(raw_market_status, str)
+                    or not raw_market_status.strip()
+                ):
+                    schedule_error = "XAUS market_status 元数据缺失"
+                else:
+                    market_status = raw_market_status.strip().lower()
+
+        target_structure, target_structure_reason = _target_structure_for_schedule(
+            schedule,
+            market_status,
+            switch_lead_time=switch_lead_time,
+        )
+        if auto_switch:
+            auto_switch_conclusion = target_structure_reason
+            if current_structure is None and structure_detection_error is None:
+                if target_structure is not None:
+                    selected = target_structure
+                positions = {
+                    leg.underlying: portfolio_positions[leg.underlying]
+                    for leg in selected.legs
+                }
+
+        prices = {
+            leg.underlying: execution._metadata_price(metadata, leg)
+            for leg in selected.legs
+        }
         funding_availability = _funding_availability_by_leg(
-            metadata,
             selected,
-            observed_at,
-            metadata_error=metadata_error,
+            target_structure=target_structure,
+            target_reason=target_structure_reason,
         )
         for leg in selected.legs:
             mode = _margin_mode_from_supported_assets(metadata, leg)
             if mode is not None:
                 margin_modes[leg.underlying] = mode
 
-        if selected.has_xaus:
-            if metadata is None:
-                schedule_error = metadata_error or "supported_assets 无数据"
-            else:
-                try:
-                    record = execution._instrument_record(metadata, execution.XAUS_LEG)
-                    schedule = parse_trading_schedule(
-                        record.get("trading_sessions"),
-                        record.get("trading_schedule"),
-                        record.get("market_status"),
-                        observed_at,
-                    )
-                except Exception as exc:  # noqa: BLE001 时段读取失败后仍要尝试降险
-                    schedule_error = f"{type(exc).__name__}: {exc}"
-                else:
-                    raw_market_status = record.get("market_status")
-                    if (
-                        not isinstance(raw_market_status, str)
-                        or not raw_market_status.strip()
-                    ):
-                        schedule_error = "XAUS market_status 元数据缺失"
-                    else:
-                        market_status = raw_market_status.strip().lower()
+        if target_structure is not None:
+            (
+                target_funding_availability,
+                target_funding_overrides,
+            ) = _target_funding_context(
+                target_structure,
+                target_reason=target_structure_reason,
+            )
 
         notionals = {
             leg.underlying: _position_notional(
@@ -1273,11 +1479,15 @@ async def run_once(
 
         reason: str | None = None
         state_status = "healthy"
+        long_close_due = False
+        switch_ready = False
 
         # 优先级 1：kill switch 无条件高于所有其他判断。
         if kill_switch_path.exists():
             reason = "kill switch 已激活"
             state_status = "kill_switch_active"
+        elif structure_detection_error is not None:
+            reason = structure_detection_error
         else:
             # 优先级 2：缺腿、方向或结构权重比例失衡。
             reason = _imbalance_reason(selected, positions)
@@ -1367,6 +1577,7 @@ async def run_once(
                 account_margin = await _account_margin_health(
                     var,
                     selected=selected,
+                    positions_payload=account_positions_payload,
                     quote_cache=quote_cache,
                 )
             except Exception as exc:  # noqa: BLE001 全仓安全数据缺失必须降险
@@ -1409,10 +1620,12 @@ async def run_once(
                 elif schedule.time_until_close <= timedelta(
                     minutes=PRE_CLOSE_MINUTES
                 ):
-                    reason = (
-                        f"XAUS 长休市 {schedule.closure_duration} 将在 "
-                        f"{schedule.time_until_close} 后开始"
-                    )
+                    long_close_due = True
+                    if not (auto_switch and auto_open):
+                        reason = (
+                            f"XAUS 长休市 {schedule.closure_duration} 将在 "
+                            f"{schedule.time_until_close} 后开始"
+                        )
 
         # 优先级 5：只有全部腿费率在当前时段有效时才更新退出连续计数。
         if reason is None and not all_flat:
@@ -1461,25 +1674,228 @@ async def run_once(
                 },
             )
 
-        if reason is None and all_flat:
-            exit_carry_rounds = 0
-            open_result = await _try_auto_open(
+        if (
+            reason is None
+            and not all_flat
+            and auto_switch
+            and current_structure is not None
+            and target_structure is not None
+            and current_structure.name != target_structure.name
+        ):
+            switch_ready, auto_switch_conclusion = await _switch_readiness(
                 var,
-                structure=selected,
-                positions=positions,
+                target=target_structure,
+                funding_availability=target_funding_availability,
+                funding_rate_overrides=target_funding_overrides,
                 schedule=schedule,
                 schedule_error=schedule_error,
                 market_status=market_status,
-                funding_availability=funding_availability,
-                kill_switch_path=kill_switch_path,
                 auto_open=auto_open,
                 auto_open_notional=auto_open_notional,
                 daily_attempts=daily_open_attempts,
                 incident=auto_open_incident,
+            )
+            _append_audit(
+                audit_path,
+                {
+                    "timestamp": observed_at,
+                    "event": "auto_switch_ready" if switch_ready else "auto_switch_deferred",
+                    "current_structure": current_structure.name,
+                    "target_structure": target_structure.name,
+                    "reason": auto_switch_conclusion,
+                    "daily_open_attempts": daily_open_attempts,
+                },
+            )
+
+        if reason is None and long_close_due and not switch_ready:
+            reason = (
+                f"XAUS 长休市 {schedule.closure_duration} 将在 "
+                f"{schedule.time_until_close} 后开始，目标结构暂不可开"
+            )
+
+        if reason is None and switch_ready:
+            assert current_structure is not None
+            assert target_structure is not None
+            auto_switch_attempted = True
+            _append_audit(
+                audit_path,
+                {
+                    "timestamp": observed_at,
+                    "event": "auto_switch_started",
+                    "current_structure": current_structure.name,
+                    "target_structure": target_structure.name,
+                    "dry_run": dry_run,
+                },
+            )
+            flatten_result = await _flatten(
+                var,
+                structure=current_structure,
+                positions=positions,
+                xaus_known_closed=False,
                 dry_run=dry_run,
                 audit_path=audit_path,
                 observed_at=observed_at,
             )
+            if not flatten_result.complete:
+                raise CloseActionError(
+                    f"切换旧结构未能全平：{flatten_result.message}"
+                )
+            if dry_run:
+                conclusion = (
+                    f"dry-run：将先平 {current_structure.name}，确认全平后再开 "
+                    f"{target_structure.name}"
+                )
+                auto_switch_conclusion = conclusion
+                auto_open_conclusion = "dry-run 未实际平仓，因此未发送目标开仓"
+                consecutive_failures = 0
+                persist_state("dry_run", conclusion, 0)
+                result_code = 0
+            else:
+                flat_result = await execution._await_flat(var, current_structure)
+                old_sizes = flat_result[:-1]
+                old_net_delta = flat_result[-1]
+                if any(size != 0 for size in old_sizes):
+                    detail = " ".join(
+                        f"{leg.underlying}={size}"
+                        for leg, size in zip(
+                            current_structure.legs,
+                            old_sizes,
+                            strict=True,
+                        )
+                    )
+                    raise CloseActionError(
+                        "切换平仓 accept 已返回，但旧结构仍未归零："
+                        f"{detail} 净 delta={old_net_delta}"
+                    )
+
+                target_positions = await execution._get_positions(
+                    var,
+                    target_structure,
+                )
+                if any(
+                    not position.is_flat
+                    for position in target_positions.values()
+                ):
+                    detail = " ".join(
+                        f"{underlying}={position.signed_size}"
+                        for underlying, position in target_positions.items()
+                    )
+                    raise CloseActionError(
+                        f"旧结构全平后目标结构仍有持仓，拒绝开仓：{detail}"
+                    )
+                _append_audit(
+                    audit_path,
+                    {
+                        "timestamp": observed_at,
+                        "event": "auto_switch_flat_confirmed",
+                        "current_structure": current_structure.name,
+                        "target_structure": target_structure.name,
+                    },
+                )
+
+                selected = target_structure
+                positions = target_positions
+                prices = {
+                    leg.underlying: execution._metadata_price(metadata, leg)
+                    for leg in selected.legs
+                }
+                funding_availability = target_funding_availability
+                open_result = await _try_auto_open(
+                    var,
+                    structure=selected,
+                    target_structure=target_structure,
+                    positions=positions,
+                    schedule=schedule,
+                    schedule_error=schedule_error,
+                    market_status=market_status,
+                    funding_availability=funding_availability,
+                    kill_switch_path=kill_switch_path,
+                    auto_open=auto_open,
+                    auto_open_notional=auto_open_notional,
+                    daily_attempts=daily_open_attempts,
+                    incident=auto_open_incident,
+                    dry_run=False,
+                    audit_path=audit_path,
+                    observed_at=observed_at,
+                    funding_rate_overrides=target_funding_overrides,
+                    enforce_min_carry=False,
+                )
+                auto_open_attempted = open_result.attempted
+                auto_open_conclusion = open_result.conclusion
+                daily_open_attempts = open_result.daily_attempts
+                auto_open_incident = open_result.incident
+                result_code = open_result.result_code
+                consecutive_failures = (
+                    previous_failures + 1 if result_code != 0 else 0
+                )
+                if result_code == 0:
+                    auto_switch_conclusion = (
+                        f"已从 {current_structure.name} 切换为 "
+                        f"{target_structure.name}"
+                    )
+                    conclusion = auto_switch_conclusion
+                    _append_audit(
+                        audit_path,
+                        {
+                            "timestamp": observed_at,
+                            "event": "auto_switch_succeeded",
+                            "current_structure": current_structure.name,
+                            "target_structure": target_structure.name,
+                            "daily_open_attempts": daily_open_attempts,
+                        },
+                    )
+                else:
+                    auto_switch_conclusion = (
+                        f"{current_structure.name} 已全平，但 "
+                        f"{target_structure.name} 开仓失败；账户保持空仓："
+                        f"{open_result.conclusion}"
+                    )
+                    conclusion = auto_switch_conclusion
+                    _append_audit(
+                        audit_path,
+                        {
+                            "timestamp": observed_at,
+                            "event": "auto_switch_open_failed",
+                            "current_structure": current_structure.name,
+                            "target_structure": target_structure.name,
+                            "message": open_result.conclusion,
+                            "daily_open_attempts": daily_open_attempts,
+                        },
+                    )
+                exit_carry_rounds = 0
+                persist_state(
+                    open_result.status,
+                    conclusion,
+                    consecutive_failures,
+                )
+        elif reason is None and all_flat:
+            exit_carry_rounds = 0
+            if auto_switch and target_structure is None:
+                open_result = AutoOpenResult(
+                    False,
+                    auto_switch_conclusion,
+                    daily_open_attempts,
+                )
+            else:
+                open_result = await _try_auto_open(
+                    var,
+                    structure=selected,
+                    target_structure=target_structure,
+                    positions=positions,
+                    schedule=schedule,
+                    schedule_error=schedule_error,
+                    market_status=market_status,
+                    funding_availability=funding_availability,
+                    kill_switch_path=kill_switch_path,
+                    auto_open=auto_open,
+                    auto_open_notional=auto_open_notional,
+                    daily_attempts=daily_open_attempts,
+                    incident=auto_open_incident,
+                    dry_run=dry_run,
+                    audit_path=audit_path,
+                    observed_at=observed_at,
+                    funding_rate_overrides=target_funding_overrides,
+                )
             auto_open_attempted = open_result.attempted
             auto_open_conclusion = open_result.conclusion
             daily_open_attempts = open_result.daily_attempts
@@ -1660,7 +2076,9 @@ async def run_once(
                 error=account_margin_error,
             ),
             "xaus_schedule": (
-                _schedule_payload(schedule) if selected.has_xaus else None
+                _schedule_payload(schedule)
+                if auto_switch or selected.has_xaus
+                else None
             ),
             "funding_availability": {
                 underlying: {
@@ -1683,6 +2101,15 @@ async def run_once(
             "auto_open_conclusion": auto_open_conclusion,
             "daily_open_attempts": daily_open_attempts,
             "auto_open_incident": auto_open_incident,
+            "auto_switch": auto_switch,
+            "auto_switch_attempted": auto_switch_attempted,
+            "auto_switch_conclusion": auto_switch_conclusion,
+            "observed_structure": (
+                current_structure.name if current_structure is not None else None
+            ),
+            "target_structure": (
+                target_structure.name if target_structure is not None else None
+            ),
         }
         _write_json(heartbeat_path, heartbeat)
         _append_audit(
@@ -1706,7 +2133,9 @@ async def _main(args: argparse.Namespace) -> int:
             structure=args.structure,
             dry_run=args.dry_run,
             auto_open=args.auto_open,
+            auto_switch=args.auto_switch,
             auto_open_notional=args.auto_open_notional,
+            switch_lead_time=timedelta(minutes=float(args.switch_lead_minutes)),
             kill_switch_path=args.kill_switch,
             heartbeat_path=args.heartbeat,
             state_path=args.state,
@@ -1735,6 +2164,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         default=True,
         help="关闭自动开仓，但保留全部自动平仓与风控",
+    )
+    parser.add_argument(
+        "--no-auto-switch",
+        dest="auto_switch",
+        action="store_false",
+        default=True,
+        help="关闭结构自动切换，但保留自动开仓与全部平仓风控",
+    )
+    parser.add_argument(
+        "--switch-lead-minutes",
+        type=Decimal,
+        default=os.environ.get(
+            "SWITCH_LEAD_TIME",
+            str(int(SWITCH_LEAD_TIME.total_seconds() // 60)),
+        ),
+        help="距 XAUS 长休市多少分钟开始切换；默认 60，可由 SWITCH_LEAD_TIME 覆盖",
     )
     parser.add_argument(
         "--auto-open-notional",

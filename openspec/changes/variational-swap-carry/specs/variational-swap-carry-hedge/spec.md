@@ -206,8 +206,10 @@ SHALL NOT 自动开反向仓。
 
 ### Requirement: 完整周循环无人值守守护进程
 系统 SHALL 提供每五分钟运行一轮的守护进程。守护进程 SHALL 先执行全部
-平仓与风控检查，命中任一检查后结束本轮；仅当两腿均为空仓且全部入场条件明确满足时，
-才以最低优先级自动建立「多 XAUS + 空 XAU」仓位。系统 SHALL NOT 自动补腿或翻向。
+平仓与风控检查，命中任一检查后结束本轮；否则按 XAUS 的权威交易时段在
+`XAUS_XAU`（多 XAUS + 空 XAU）与 `XAU_XAUT`（多 XAU + 空 XAUT）之间选择目标结构。
+实际结构不符时 SHALL 先平旧结构、确认三个受管标的均无旧仓，再开目标结构。
+系统 SHALL NOT 自动补腿，且 SHALL NOT 让两个结构同时持仓。
 当安全信息不完整时 SHALL 按失败关闭原则拒绝开仓，既有仓位继续按失败关闭原则退出。
 
 #### Scenario: 固定优先级自动处置
@@ -220,14 +222,26 @@ SHALL NOT 自动开反向仓。
 - **THEN** 不得假设安全，立即尝试清空两腿
 
 #### Scenario: 区分每日休市和长休市
-- **WHEN** `closure_duration > 4 小时` 且距休市不超过 30 分钟
-- **THEN** 清空两腿
+- **WHEN** `closure_duration > 4 小时` 且距休市不超过 `SWITCH_LEAD_TIME`（默认 60 分钟）
+- **THEN** 从 `XAUS_XAU` 切换至 `XAU_XAUT`
 - **WHEN** `closure_duration <= 4 小时`
-- **THEN** 持有穿过每日短休市，不因该窗口反复平仓
+- **THEN** 持有当前结构穿过每日短休市，不因该窗口反复切换
+
+#### Scenario: 长休市结束后恢复工作日结构
+- **WHEN** XAUS 已恢复可交易且目标结构各腿费率有效
+- **THEN** 从 `XAU_XAUT` 切换至 `XAUS_XAU`
+- **WHEN** XAUS 刚开市但费率尚不可用
+- **THEN** 本轮保留 `XAU_XAUT`，下一轮重新判断
+
+#### Scenario: 原子切换
+- **WHEN** 实际结构与目标结构不符
+- **THEN** 先以 `reduce_only` 平旧结构，并在确认全平后才开目标结构
+- **AND** 平仓失败时不打开目标结构并记录、告警
+- **AND** 平仓成功但开仓失败时保持空仓，记录失败并在后续轮次重试
 
 #### Scenario: 交易时段元数据不可信
 - **WHEN** 时段元数据缺失、畸形、陈旧或缺少完整休市长度
-- **THEN** 按不确定处理并尝试清空两腿
+- **THEN** 不执行结构切换；若现有结构含 XAUS，则按不确定处理并尝试清空两腿
 - **AND** 不得把陈旧元数据里的不可交易结果当作权威休市状态而跳过 XAUS 平仓尝试
 
 #### Scenario: XAUS 权威确认休市
@@ -241,10 +255,10 @@ SHALL NOT 自动开反向仓。
 
 #### Scenario: 自动开仓前置条件
 - **WHEN** 两腿均为空仓
-- **THEN** 仅在 XAUS 当前可交易、距下次休市超过 2 小时、净 carry 不低于 5% 年化、
+- **THEN** 对含 XAUS 的目标结构，仅在 XAUS 当前可交易、距下次休市超过 2 小时、净 carry 不低于 5% 年化、
   可用保证金足够、kill switch 不存在且当日尝试未达上限时尝试开仓
 - **AND** 任一条件缺失或不可读时跳过并记录明确原因
-- **AND** 每腿默认名义为 $500，可由命令行或 `AUTO_OPEN_NOTIONAL_USD` 覆盖，
+- **AND** 每腿默认名义为 $2,000，可由命令行或 `AUTO_OPEN_NOTIONAL_USD` 覆盖，
   且不得超过执行器的 $3,000 硬上限
 
 #### Scenario: 复用双腿执行与回滚
@@ -261,7 +275,7 @@ SHALL NOT 自动开反向仓。
 
 #### Scenario: 每日尝试上限
 - **WHEN** 当日自动开仓尝试达到 20 次
-- **THEN** 当日剩余轮次不再读取 carry、询价或下单
+- **THEN** 当日剩余轮次不再读取目标 carry、询价、开仓或切换结构
 
 #### Scenario: 自动开仓回滚失败
 - **WHEN** 第二腿失败且第一腿 `reduce_only` 回滚也失败
@@ -272,6 +286,15 @@ SHALL NOT 自动开反向仓。
 - **WHEN** 使用 `--no-auto-open`
 - **THEN** 跳过全部自动开仓动作
 - **AND** 保留 kill switch、失衡、强平距离和长休市等自动平仓能力
+
+#### Scenario: 单独关闭自动切换
+- **WHEN** 使用 `--no-auto-switch`
+- **THEN** 不因黄金现货时段切换结构
+- **AND** 保留 kill switch、失衡、强平距离、账户保证金率等既有风控
+
+#### Scenario: pre-close 冻结按目标结构生效
+- **WHEN** 目标结构为不含 XAUS 的 `XAU_XAUT`
+- **THEN** XAUS 的 pre-close 开仓冻结不得阻挡目标结构开仓
 
 #### Scenario: 每轮心跳与审计
 - **WHEN** 守护进程完成任意一轮，包括无动作、dry-run 或失败轮次
