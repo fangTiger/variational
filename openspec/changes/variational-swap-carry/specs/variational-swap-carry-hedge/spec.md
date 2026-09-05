@@ -201,4 +201,50 @@ SHALL NOT 自动开反向仓。
 
 #### Scenario: 告警送达验证
 - **WHEN** 部署或定期自检时
-- **THEN** 验证外部告警通道实际送达，而非仅写入本地日志
+- **THEN** v1 验证 macOS 本地通知能够调用，而非仅写入普通日志
+- **AND** 当前没有远程告警，安全处置 SHALL NOT 等待人工响应
+
+### Requirement: 只减仓无人值守守护进程
+系统 SHALL 提供每五分钟运行一轮的守护进程。守护进程 SHALL 只以
+`reduce_only` 减少或清空既有仓位，SHALL NOT 自动开仓、补腿或翻向。
+当安全信息不完整时 SHALL 按失败关闭原则退出仓位。
+
+#### Scenario: 固定优先级自动处置
+- **WHEN** kill switch、单腿或名义失衡、XAUS 强平距离不足、长休市临近中任一条件命中
+- **THEN** 守护进程按上述顺序执行首个命中的处置并结束本轮
+- **AND** kill switch 同时阻止人工 `open`
+
+#### Scenario: 权威强平价不可用
+- **WHEN** 已持有 XAUS 且 `get_liquidation_info` 未返回有效权威强平价
+- **THEN** 不得假设安全，立即尝试清空两腿
+
+#### Scenario: 区分每日休市和长休市
+- **WHEN** `closure_duration > 4 小时` 且距休市不超过 30 分钟
+- **THEN** 清空两腿
+- **WHEN** `closure_duration <= 4 小时`
+- **THEN** 持有穿过每日短休市，不因该窗口反复平仓
+
+#### Scenario: 交易时段元数据不可信
+- **WHEN** 时段元数据缺失、畸形、陈旧或缺少完整休市长度
+- **THEN** 按不确定处理并尝试清空两腿
+- **AND** 不得把陈旧元数据里的不可交易结果当作权威休市状态而跳过 XAUS 平仓尝试
+
+#### Scenario: XAUS 权威确认休市
+- **WHEN** 新鲜元数据确认 XAUS 休市且 XAUS 腿无法平仓
+- **THEN** 先平掉仍可交易的 XAU 腿（若存在）
+- **AND** 持久化 `pending_xaus_close`，不得报告全部平仓成功
+
+#### Scenario: 下单能力失效
+- **WHEN** 平仓遇到地区封锁、会话失效或有限次数重试耗尽
+- **THEN** 写入显著事故状态、累计连续失败数、弹 macOS 本地通知并非零退出
+
+#### Scenario: 每轮心跳与审计
+- **WHEN** 守护进程完成任意一轮，包括无动作、dry-run 或失败轮次
+- **THEN** 原子写入包含时间、结论、两腿名义、净 delta、XAUS 时段和连续失败数的心跳
+- **AND** 追加 JSONL 审计记录
+- **AND** `hedge_swap_carry status` 置顶显示心跳年龄，超过 15 分钟时标红
+
+#### Scenario: dry-run
+- **WHEN** 使用 `--dry-run`
+- **THEN** 完成同样的读取和判定并打印计划动作
+- **AND** 绝不调用报价接受接口，不得把计划动作记录成真实已平仓
