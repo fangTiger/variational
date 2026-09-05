@@ -233,7 +233,7 @@ def test_open_rejects_notional_over_hard_cap_without_any_order() -> None:
         asyncio.run(
             hedge_swap_carry.cmd_open(
                 client,
-                Decimal("100.01"),
+                hedge_swap_carry.MAX_NOTIONAL_USD + Decimal("0.01"),
                 yes=True,
                 now=OPEN_NOW,
             )

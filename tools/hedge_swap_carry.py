@@ -41,8 +41,11 @@ from engine.swap_trading_schedule import (  # noqa: E402
 )
 
 
+# 首仓决策值 $2,000/腿（2026-09-05），见
+# docs/plans/2026-09-05-swap-carry-首仓执行计划.md。
+# 硬上限取决策值的 1.5 倍：留出加仓余量，同时挡住"多打一个零"这类手滑。
 DEFAULT_NOTIONAL_USD = Decimal("50")
-MAX_NOTIONAL_USD = Decimal("100")
+MAX_NOTIONAL_USD = Decimal("3000")
 PRE_CLOSE_FREEZE = timedelta(minutes=30)
 XAUS_MIN_QTY = Decimal("0.00003")
 XAUS_QTY_STEP = Decimal("0.00001")
