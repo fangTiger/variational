@@ -7,6 +7,7 @@ import os
 from decimal import Decimal
 from pathlib import Path
 
+from panel.types import Metric, PanelAlert, SystemStatus
 from tools import hedge_panel
 
 
@@ -249,8 +250,113 @@ def test_build_page_never_touches_network() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
-    for forbidden in ("urlopen", "read_margin_snapshot", "_hl_info"):
+    for forbidden in ("urlopen", "read_margin_snapshot", "_hl_info", "collect"):
         assert forbidden not in called, f"build_page 不得直接调用 {forbidden}"
+
+
+def test_build_page_does_not_collect_swap_carry(monkeypatch) -> None:
+    """swap carry 必须由调用方采集，纯渲染不得触发行情请求。"""
+    def fail_if_called():
+        raise AssertionError("build_page 不得调用 swap carry provider")
+
+    monkeypatch.setattr(hedge_panel.swap_carry, "collect", fail_if_called)
+
+    html = hedge_panel.build_page(instances=(), now=NOW)
+
+    assert "swap carry 数据不可用" in html
+    assert 'class="overview"' in html
+
+
+def test_swap_carry_block_renders_summary_and_all_metric_tones() -> None:
+    """正常快照要完整展示摘要与指标，并复用页面既有配色 class。"""
+    status = SystemStatus(
+        name="Swap Carry（测试）",
+        alive=True,
+        summary="持仓中，净 carry +12.5%/年",
+        metrics=[
+            Metric("当前结构", "XAUS_XAU", "normal"),
+            Metric("守护进程心跳", "30 秒前", "good"),
+            Metric("会话剩余", "18.0 小时", "warn"),
+            Metric("净 delta", "+0.02000", "bad"),
+        ],
+    )
+    margin = {"legs": [], "spot": None, "error": None}
+
+    html = hedge_panel.build_page(
+        instances=(),
+        now=NOW,
+        margin_snapshot=margin,
+        swap_carry_status=status,
+    )
+
+    assert "Swap Carry（测试）" in html
+    assert "持仓中，净 carry +12.5%/年" in html
+    for label, value in (
+        ("当前结构", "XAUS_XAU"),
+        ("守护进程心跳", "30 秒前"),
+        ("会话剩余", "18.0 小时"),
+        ("净 delta", "+0.02000"),
+    ):
+        assert label in html and value in html
+    for css_class in ("pnl-flat", "exposure-good", "exposure-warn", "exposure-bad"):
+        assert f'class="mono {css_class}"' in html
+    assert "● 存活" in html
+    assert html.index('aria-label="保证金与强平距离"') < html.index(
+        'aria-label="swap carry"'
+    ) < html.index('class="overview"')
+
+
+def test_missing_swap_carry_status_keeps_rest_of_page() -> None:
+    """快照缺失时显示不可用，且总览与实例卡仍正常渲染。"""
+    html = hedge_panel.build_page(
+        instances=(),
+        now=NOW,
+        swap_carry_status=None,
+    )
+
+    assert "swap carry 数据不可用" in html
+    assert 'class="overview"' in html
+    assert '<section class="cards">' in html
+    assert html.endswith("</html>")
+
+
+def test_render_html_catches_swap_carry_collect_exception(monkeypatch) -> None:
+    """调用方必须捕获 provider 异常并把 None 交给纯渲染函数。"""
+    def fail_to_collect():
+        raise RuntimeError("模拟采集失败")
+
+    monkeypatch.setattr(hedge_panel.swap_carry, "collect", fail_to_collect)
+
+    html = hedge_panel.render_html(instances=(), now=NOW)
+
+    assert "swap carry 数据不可用" in html
+    assert 'class="overview"' in html
+    assert "模拟采集失败" not in html
+
+
+def test_swap_carry_alerts_distinguish_critical_from_warning() -> None:
+    """严重与警告告警都展示动作指引，严重项必须有更强的视觉强调。"""
+    status = SystemStatus(
+        name="Swap Carry（测试）",
+        alive=False,
+        summary="需要人工处理",
+        alerts=[
+            PanelAlert("session", "critical", "会话即将过期", "重新导出会话"),
+            PanelAlert("guard", "warning", "守护心跳陈旧", "检查守护进程"),
+        ],
+    )
+
+    html = hedge_panel.build_page(
+        instances=(),
+        now=NOW,
+        swap_carry_status=status,
+    )
+
+    assert "会话即将过期" in html and "重新导出会话" in html
+    assert "守护心跳陈旧" in html and "检查守护进程" in html
+    assert 'class="swap-carry-alert critical interlock-alert"' in html
+    assert 'class="swap-carry-alert warning warnings"' in html
+    assert "● 未存活" in html
 
 
 def test_portfolio_cumulative_pnl_sums_each_account_delta_with_sources(tmp_path) -> None:

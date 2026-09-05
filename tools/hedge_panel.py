@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlsplit
 
+from panel.providers import swap_carry
+from panel.types import SystemStatus
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PORTFOLIO_EQUITY_PATH = PROJECT_ROOT / "data" / "portfolio_equity.jsonl"
@@ -1288,6 +1291,88 @@ def _render_ledger_realized(items: list[dict]) -> str:
     )
 
 
+_SWAP_CARRY_TONE_CLASS = {
+    "normal": "pnl-flat",
+    "good": "exposure-good",
+    "warn": "exposure-warn",
+    "bad": "exposure-bad",
+}
+
+
+def _swap_carry_alive(status: SystemStatus | None) -> tuple[str, str]:
+    """把 provider 的三态存活值映射到页面现有状态样式。"""
+    if status is None or status.alive is None:
+        return "read-status", "● 未知"
+    if status.alive:
+        return "status running", "● 存活"
+    return "status stopped", "● 未存活"
+
+
+def _render_swap_carry(status: SystemStatus | None) -> str:
+    """渲染调用方注入的 swap carry 快照；缺失时局部降级。"""
+    status_class, status_text = _swap_carry_alive(status)
+    if status is None:
+        return (
+            '  <section class="margin-block swap-carry-block" '
+            'aria-label="swap carry">\n'
+            '    <div class="swap-carry-head">\n'
+            f"      <h3>{_text(swap_carry.NAME)}</h3>\n"
+            f'      <span class="{status_class}">{status_text}</span>\n'
+            "    </div>\n"
+            '    <p class="margin-error">swap carry 数据不可用</p>\n'
+            "  </section>\n"
+        )
+
+    metric_rows = "".join(
+        "      <tr>"
+        f"<td>{_text(metric.label)}</td>"
+        f'<td class="mono {_SWAP_CARRY_TONE_CLASS.get(metric.tone, "pnl-flat")}">'
+        f"{_text(metric.value)}</td></tr>\n"
+        for metric in status.metrics
+    )
+    metrics = (
+        '    <table class="margin-table swap-carry-metrics">\n'
+        f"{metric_rows}"
+        "    </table>\n"
+        if metric_rows
+        else ""
+    )
+    error = (
+        f'    <p class="margin-error">采集异常：{_text(status.error)}</p>\n'
+        if status.error
+        else ""
+    )
+    alert_items = "".join(
+        (
+            f'      <li class="swap-carry-alert {alert.level} '
+            f'{"interlock-alert" if alert.level == "critical" else "warnings"}">'
+            f"<strong>{'🔴' if alert.level == 'critical' else '⚠'} "
+            f"{_text(alert.title)}</strong>"
+            f"<span>→ {_text(alert.action)}</span></li>\n"
+        )
+        for alert in status.alerts
+    )
+    alerts = (
+        '    <section class="swap-carry-alert-block" aria-label="swap carry 告警">\n'
+        "      <h3>告警</h3>\n"
+        f'      <ul class="swap-carry-alerts">\n{alert_items}      </ul>\n'
+        "    </section>\n"
+        if alert_items
+        else ""
+    )
+    return (
+        '  <section class="margin-block swap-carry-block" '
+        'aria-label="swap carry">\n'
+        '    <div class="swap-carry-head">\n'
+        f"      <h3>{_text(status.name)}</h3>\n"
+        f'      <span class="{status_class}">{status_text}</span>\n'
+        "    </div>\n"
+        f'    <p class="swap-carry-summary">{_text(status.summary)}</p>\n'
+        f"{metrics}{error}{alerts}"
+        "  </section>\n"
+    )
+
+
 def build_page(
     *,
     instances: Iterable[InstanceConfig] = DEFAULT_INSTANCES,
@@ -1295,10 +1380,11 @@ def build_page(
     portfolio_volume_path: Path | str = DEFAULT_PORTFOLIO_VOLUME_PATH,
     now: Decimal | int | str | None = None,
     margin_snapshot: dict | None = None,
+    swap_carry_status: SystemStatus | None = None,
 ) -> str:
     """采集全部实例并渲染自包含深色 HTML。
 
-    ``margin_snapshot`` 由调用方提供（见 ``read_margin_snapshot``）。
+    ``margin_snapshot`` 与 ``swap_carry_status`` 均由调用方提供。
     刻意不在此处发网络请求——``build_page`` 必须保持纯函数，
     否则测试会真的去打行情接口，既慢又不确定。
     """
@@ -1362,6 +1448,7 @@ def build_page(
     margin_block = (
         _render_margin(margin_snapshot) if margin_snapshot is not None else ""
     )
+    swap_carry_block = _render_swap_carry(swap_carry_status)
     ledger_block = _render_ledger_realized(read_ledger_realized(configs))
     portfolio_pnl = _render_portfolio_pnl(portfolio_summary)
     portfolio_volume = _render_portfolio_volume(portfolio_volume_summary)
@@ -1406,6 +1493,14 @@ def build_page(
       .margin-empty { color: var(--muted); font-size: 13px; }
       .margin-spot { color: var(--muted); font-size: 12px; margin-top: 8px; }
       .margin-block small { display: block; margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+      .swap-carry-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 8px; }
+      .swap-carry-head h3 { margin-bottom: 0; }
+      .swap-carry-summary { margin-bottom: 10px; color: var(--muted); font-size: 13px; }
+      .swap-carry-metrics td:last-child { text-align: right; }
+      .swap-carry-alert-block { margin-top: 12px; }
+      .swap-carry-alerts { margin: 7px 0 0; padding: 0; list-style: none; }
+      .swap-carry-alert { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px 12px; }
+      .swap-carry-alert + .swap-carry-alert { margin-top: 7px; }
       .mono, .net-value {
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         font-variant-numeric: tabular-nums;
@@ -1659,6 +1754,7 @@ def build_page(
     {portfolio_volume}
     {portfolio_pnl}
     {margin_block}
+    {swap_carry_block}
     <section class="overview" aria-label="总览">
       <div class="{exposure_summary_class}">
         <span>{len(snapshots)} 个实例净敞口合计</span>
@@ -1689,13 +1785,20 @@ def render_html(
     portfolio_equity_path: Path | str = DEFAULT_PORTFOLIO_EQUITY_PATH,
     portfolio_volume_path: Path | str = DEFAULT_PORTFOLIO_VOLUME_PATH,
     now: Decimal | int | str | None = None,
+    margin_snapshot: dict | None = None,
 ) -> str:
-    """提供与其他本地面板一致的 HTML 渲染入口。"""
+    """采集 swap carry 后调用纯渲染入口；失败时只降级该区块。"""
+    try:
+        swap_carry_status = swap_carry.collect()
+    except Exception:  # noqa: BLE001 白屏比局部数据不可用更危险
+        swap_carry_status = None
     return build_page(
         instances=instances,
         portfolio_equity_path=portfolio_equity_path,
         portfolio_volume_path=portfolio_volume_path,
         now=now,
+        margin_snapshot=margin_snapshot,
+        swap_carry_status=swap_carry_status,
     )
 
 
@@ -1716,7 +1819,7 @@ class HedgePanelHandler(http.server.BaseHTTPRequestHandler):
         # 只有真实服务时才去打行情接口；build_page 本身保持纯函数。
         address = str(self.margin_address or "").strip()
         margin_snapshot = read_margin_snapshot(address) if address else None
-        body = build_page(
+        body = render_html(
             instances=self.instances,
             portfolio_equity_path=self.portfolio_equity_path,
             portfolio_volume_path=self.portfolio_volume_path,
