@@ -205,6 +205,219 @@ def test_get_position_pnl_uses_upnl_entry_and_mark_value() -> None:
     )
 
 
+def _liquidation_client(
+    positions: list[dict],
+    *,
+    quote: dict | None = None,
+    raw_responses: dict[str, object] | None = None,
+) -> tuple[VariationalClient, list[tuple]]:
+    """构造严格的强平价测试客户端，未配置调用一律抛错。"""
+    client = object.__new__(VariationalClient)
+    calls: list[tuple] = []
+
+    async def get_positions():
+        calls.append(("positions",))
+        return positions
+
+    async def request_quote(market: str, side: str, qty: Decimal):
+        calls.append(("quote", market, side, qty))
+        if quote is None:
+            raise AssertionError("测试桩未配置调用：request_quote")
+        return quote
+
+    async def raw(path: str):
+        calls.append(("raw", path))
+        if raw_responses is None or path not in raw_responses:
+            raise AssertionError(f"测试桩未配置调用：raw({path!r})")
+        return raw_responses[path]
+
+    client.get_positions = get_positions
+    client.request_quote = request_quote
+    client.raw = raw
+    return client, calls
+
+
+def test_liquidation_info_reads_authoritative_position_price() -> None:
+    """持仓响应有权威强平价时直接返回，不得询价或读取账户权益。"""
+    client, calls = _liquidation_client(
+        [
+            {
+                "position_info": {
+                    "instrument": {"underlying": "BTC"},
+                    "qty": "-0.01",
+                    "avg_entry_price": "61000",
+                },
+                "price_info": {"underlying_price": "60000"},
+                "estimated_liquidation_price": "64250.5",
+            }
+        ]
+    )
+
+    result = asyncio.run(client.get_liquidation_info("BTC"))
+
+    assert result == (Decimal("60000"), Decimal("64250.5"))
+    assert calls == [("positions",)]
+
+
+def test_isolated_liquidation_uses_quote_api_value_without_account_equity() -> None:
+    """isolated 空腿使用 ask 强平价，绝不能读取账户总权益自算。"""
+    client, calls = _liquidation_client(
+        [
+            {
+                "position_info": {
+                    "instrument": {"underlying": "XAUS"},
+                    "qty": "-1",
+                    "avg_entry_price": "4470",
+                },
+                "price_info": {"underlying_price": "4460"},
+            }
+        ],
+        quote={
+            "mark_price": "4460",
+            "margin_requirements": {
+                "margin_mode": "isolated",
+                "estimated_liquidation_price_bid": "4345.64",
+                "estimated_liquidation_price_ask": "4568.72",
+            },
+        },
+    )
+
+    result = asyncio.run(client.get_liquidation_info("XAUS"))
+
+    assert result == (Decimal("4460"), Decimal("4568.72"))
+    assert not any(call == ("raw", "/portfolio") for call in calls)
+
+
+def test_isolated_liquidation_without_api_price_returns_none(caplog) -> None:
+    """isolated 腿缺权威强平价时宁可无数据，也不能产出偏乐观旧值。"""
+    client, calls = _liquidation_client(
+        [
+            {
+                "position_info": {
+                    "instrument": {"underlying": "XAUS"},
+                    "qty": "-1",
+                    "avg_entry_price": "4470",
+                },
+                "price_info": {"underlying_price": "4460"},
+            }
+        ],
+        quote={"margin_requirements": {"margin_mode": "isolated"}},
+    )
+
+    result = asyncio.run(client.get_liquidation_info("XAUS"))
+
+    assert result is None
+    assert not any(call == ("raw", "/portfolio") for call in calls)
+    assert "isolated" in caplog.text
+
+
+def test_liquidation_fallback_reads_asset_maintenance_margin() -> None:
+    """全仓自算降级必须采用标的 MM，不能沿用默认 10%。"""
+    client, calls = _liquidation_client(
+        [
+            {
+                "position_info": {
+                    "instrument": {"underlying": "BTC"},
+                    "qty": "-1",
+                    "avg_entry_price": "100",
+                },
+                "price_info": {"underlying_price": "100"},
+            }
+        ],
+        quote={"margin_requirements": {}},
+        raw_responses={
+            "/settlement_pools/details": {
+                "margin_params": {
+                    "params": {
+                        "asset_params": {
+                            "BTC": {
+                                "futures_maintenance_margin": "0.0125",
+                            }
+                        },
+                        "default_asset_param": {
+                            "futures_maintenance_margin": "0.1"
+                        },
+                        "use_default_asset_param": False,
+                    }
+                }
+            },
+            "/portfolio": {"balance": "5", "upnl": "0"},
+        },
+    )
+
+    result = asyncio.run(client.get_liquidation_info("BTC"))
+
+    assert result == (
+        Decimal("100"),
+        (Decimal("-100") - Decimal("5"))
+        / (Decimal("-1") - Decimal("0.0125")),
+    )
+    assert ("raw", "/settlement_pools/details") in calls
+    assert result[1] != (Decimal("-100") - Decimal("5")) / Decimal("-1.1")
+
+
+def test_liquidation_fallback_honors_default_asset_param_switch() -> None:
+    """配置明确启用默认参数时，必须忽略同名标的覆盖值。"""
+    client, _ = _liquidation_client(
+        [
+            {
+                "position_info": {
+                    "instrument": {"underlying": "BTC"},
+                    "qty": "-1",
+                    "avg_entry_price": "100",
+                },
+                "price_info": {"underlying_price": "100"},
+            }
+        ],
+        quote={"margin_requirements": {}},
+        raw_responses={
+            "/settlement_pools/details": {
+                "margin_params": {
+                    "params": {
+                        "asset_params": {
+                            "BTC": {"futures_maintenance_margin": "0.0125"}
+                        },
+                        "default_asset_param": {
+                            "futures_maintenance_margin": "0.1"
+                        },
+                        "use_default_asset_param": True,
+                    }
+                }
+            },
+            "/portfolio": {"balance": "5", "upnl": "0"},
+        },
+    )
+
+    result = asyncio.run(client.get_liquidation_info("BTC"))
+
+    assert result == (
+        Decimal("100"),
+        (Decimal("-100") - Decimal("5")) / Decimal("-1.1"),
+    )
+
+
+def test_liquidation_info_exact_match_does_not_match_xaus_for_xau() -> None:
+    """强平价查询默认精确匹配，XAU 不得命中 XAUS。"""
+    client, calls = _liquidation_client(
+        [
+            {
+                "position_info": {
+                    "instrument": {"underlying": "XAUS"},
+                    "qty": "-1",
+                    "avg_entry_price": "4470",
+                },
+                "price_info": {"underlying_price": "4460"},
+                "estimated_liquidation_price": "4568.72",
+            }
+        ]
+    )
+
+    result = asyncio.run(client.get_liquidation_info("XAU"))
+
+    assert result is None
+    assert calls == [("positions",)]
+
+
 def test_get_min_order_size_uses_quote_quantity_limits() -> None:
     """最小量只能采用报价返回的明确数量限制。"""
     client, calls = _client_with_quote(_SYMMETRIC)

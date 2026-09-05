@@ -1,4 +1,4 @@
-"""资金费归一化与方向选择测试。"""
+"""资金费归一化、方向选择与方向状态持久化测试。"""
 
 from __future__ import annotations
 
@@ -55,26 +55,116 @@ def test_extended_funding_rate_is_visibly_uncalibrated() -> None:
     assert "未经校准" in view.pretty()
 
 
-def test_direction_flip_produces_warning(monkeypatch) -> None:
-    """连续观测的推荐方向翻转时不得静默改变建议。"""
-    monkeypatch.setattr(monitor, "_last_recommended_direction", None, raising=False)
+def test_compute_funding_view_is_pure_and_returns_direction() -> None:
+    """相同显式输入必须得到相同结果，且模块不得保留方向状态。"""
+    first = compute_funding_view(
+        Decimal("0"),
+        Decimal("0.00001"),
+        previous_direction="short_variational",
+    )
+    second = compute_funding_view(
+        Decimal("0"),
+        Decimal("0.00001"),
+        previous_direction="short_variational",
+    )
 
-    first = compute_funding_view(Decimal("0.10"), Decimal("0"))
-    second = compute_funding_view(Decimal("0"), Decimal("0.00001"))
-
-    assert "Variational 做空" in first.recommended
-    assert "Variational 做多" in second.recommended
-    assert any("方向翻转" in warning for warning in second.warnings)
-    assert "⚠️" in second.pretty()
+    assert first == second
+    assert first.direction == "long_variational"
+    assert any("方向翻转" in warning for warning in first.warnings)
+    assert not hasattr(monitor, "_last_recommended_direction")
 
 
-def test_close_funding_rates_produce_unstable_direction_warning(monkeypatch) -> None:
+def test_close_funding_rates_produce_unstable_direction_warning() -> None:
     """两腿折算费率相同或接近时必须提示方向不稳健。"""
-    monkeypatch.setattr(monitor, "_last_recommended_direction", None, raising=False)
-
     view = compute_funding_view(Decimal("0.00876"), Decimal("0.000001"))
 
     assert any("不稳健" in warning for warning in view.warnings)
+
+
+def test_direction_flip_is_detected_across_independent_calls(tmp_path) -> None:
+    """每次重新读取同一状态文件，模拟两个一次性 CLI 进程。"""
+    state_path = tmp_path / "funding_direction.json"
+
+    first = monitor.compute_funding_view_with_state(
+        Decimal("0.10"),
+        Decimal("0"),
+        venue="variational",
+        market="BTC",
+        state_path=state_path,
+    )
+    second = monitor.compute_funding_view_with_state(
+        Decimal("0"),
+        Decimal("0.00001"),
+        venue="variational",
+        market="BTC",
+        state_path=state_path,
+    )
+
+    assert first.direction == "short_variational"
+    assert not any("方向翻转" in warning for warning in first.warnings)
+    assert second.direction == "long_variational"
+    assert any("与上次运行相比方向翻转" in warning for warning in second.warnings)
+
+
+def test_direction_state_is_isolated_by_venue_and_market(tmp_path) -> None:
+    """一个标的的方向不得污染另一个标的或交易场所。"""
+    state_path = tmp_path / "funding_direction.json"
+    monitor.compute_funding_view_with_state(
+        Decimal("0.10"),
+        Decimal("0"),
+        venue="variational",
+        market="BTC",
+        state_path=state_path,
+    )
+
+    other_market = monitor.compute_funding_view_with_state(
+        Decimal("0"),
+        Decimal("0.00001"),
+        venue="variational",
+        market="XAU",
+        state_path=state_path,
+    )
+    other_venue = monitor.compute_funding_view_with_state(
+        Decimal("0"),
+        Decimal("0.00001"),
+        venue="extended",
+        market="BTC",
+        state_path=state_path,
+    )
+
+    assert not any("方向翻转" in warning for warning in other_market.warnings)
+    assert not any("方向翻转" in warning for warning in other_venue.warnings)
+
+
+def test_direction_state_corruption_and_write_failure_do_not_crash(
+    tmp_path, caplog
+) -> None:
+    """状态损坏或父路径不可写时降级成无历史方向并记录日志。"""
+    corrupt_path = tmp_path / "corrupt.json"
+    corrupt_path.write_text("{broken", encoding="utf-8")
+
+    corrupt_view = monitor.compute_funding_view_with_state(
+        Decimal("0.10"),
+        Decimal("0"),
+        venue="variational",
+        market="BTC",
+        state_path=corrupt_path,
+    )
+
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("占位", encoding="utf-8")
+    blocked_view = monitor.compute_funding_view_with_state(
+        Decimal("0.10"),
+        Decimal("0"),
+        venue="variational",
+        market="BTC",
+        state_path=blocked_parent / "state.json",
+    )
+
+    assert corrupt_view.direction == "short_variational"
+    assert blocked_view.direction == "short_variational"
+    assert "读取资金方向状态失败" in caplog.text
+    assert "写入资金方向状态失败" in caplog.text
 
 
 def test_run_grid_trend_aware_cli_defaults_and_overrides() -> None:

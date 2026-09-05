@@ -12,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from tracking.direction_state import FundingDirectionStateStore
 from tracking.monitor import compute_funding_view
 
 UNDERLYING = "BTC"
@@ -19,7 +20,12 @@ EXT_MARKET = "BTC-USD"
 EQUITY_FILE = Path(__file__).resolve().parent.parent / "data" / "equity_track.jsonl"
 
 
-async def build_snapshot(var: Any, ext: Any) -> dict:
+async def build_snapshot(
+    var: Any,
+    ext: Any,
+    *,
+    previous_direction: str | None = None,
+) -> dict:
     """采集一次两账户权益/持仓/积分/资金费快照。"""
     port = await var.raw("/portfolio")
     var_equity = Decimal(str(port["balance"])) + Decimal(str(port.get("upnl", "0")))
@@ -30,7 +36,11 @@ async def build_snapshot(var: Any, ext: Any) -> dict:
     stats = await ext._client.info.get_market_statistics(market_name=EXT_MARKET)
     mark = Decimal(str(stats.data.mark_price))
     var_rate = await var.get_funding_rate(UNDERLYING)
-    fv = compute_funding_view(var_rate, Decimal(str(stats.data.funding_rate)))
+    fv = compute_funding_view(
+        var_rate,
+        Decimal(str(stats.data.funding_rate)),
+        previous_direction=previous_direction,
+    )
 
     vp = await var.get_position(UNDERLYING)
     ep = await ext.get_position(EXT_MARKET)
@@ -47,6 +57,7 @@ async def build_snapshot(var: Any, ext: Any) -> dict:
         "points_total": float(pts["total_points"]),
         "carry_pct_8h": float(fv.carry_short_var_pct_8h),
         "annualized_pct_est": float(fv.annualized_pct),
+        "funding_direction": fv.direction,
         "extended_funding_calibrated": fv.extended_calibrated,
         "funding_warnings": [
             "Extended 资金费单位未经校准，carry 与年化估算不可全信。",
@@ -55,11 +66,30 @@ async def build_snapshot(var: Any, ext: Any) -> dict:
     }
 
 
-async def snapshot_and_append(var: Any, ext: Any) -> dict:
+async def snapshot_and_append(
+    var: Any,
+    ext: Any,
+    *,
+    equity_file: str | Path | None = None,
+    direction_state_file: str | Path | None = None,
+) -> dict:
     """采集快照并追加到 EQUITY_FILE，返回该快照。"""
-    snap = await build_snapshot(var, ext)
-    EQUITY_FILE.parent.mkdir(exist_ok=True)
-    with EQUITY_FILE.open("a", encoding="utf-8") as f:
+    store = (
+        FundingDirectionStateStore()
+        if direction_state_file is None
+        else FundingDirectionStateStore(direction_state_file)
+    )
+    previous_direction = store.load("variational", UNDERLYING)
+    snap = await build_snapshot(
+        var,
+        ext,
+        previous_direction=previous_direction,
+    )
+    store.save("variational", UNDERLYING, snap["funding_direction"])
+
+    target = EQUITY_FILE if equity_file is None else Path(equity_file)
+    target.parent.mkdir(exist_ok=True)
+    with target.open("a", encoding="utf-8") as f:
         f.write(json.dumps(snap, ensure_ascii=False) + "\n")
     return snap
 

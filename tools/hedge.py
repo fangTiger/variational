@@ -35,7 +35,7 @@ from adapters.variational_client import (  # noqa: E402
     VariationalClient,
     VariationalJurisdictionError,
 )
-from tracking.monitor import compute_funding_view  # noqa: E402
+from tracking.monitor import compute_funding_view_with_state  # noqa: E402
 
 UNDERLYING = "BTC"
 EXT_MARKET = "BTC-USD"
@@ -71,7 +71,12 @@ async def cmd_status(var: VariationalClient, ext: ExtendedClient) -> None:
     stats = await ext._client.info.get_market_statistics(market_name=EXT_MARKET)
     mark = Decimal(str(stats.data.mark_price))
     var_rate = await var.get_funding_rate(UNDERLYING)
-    fv = compute_funding_view(var_rate, Decimal(str(stats.data.funding_rate)))
+    fv = compute_funding_view_with_state(
+        var_rate,
+        Decimal(str(stats.data.funding_rate)),
+        venue="variational",
+        market=UNDERLYING,
+    )
     pts = await var.get_points_summary()
     print(f"BTC 价格≈{mark}")
     print(f"Variational 持仓={vs}（名义≈${abs(vs)*mark:.2f}）")

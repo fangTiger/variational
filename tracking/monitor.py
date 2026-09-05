@@ -17,9 +17,11 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from infra.logger import get_logger
+from tracking.direction_state import FundingDirectionStateStore
 from tracking.metrics import MetricsTracker, Snapshot
 
 if TYPE_CHECKING:  # 仅类型检查导入，避免纯逻辑测试被 x10 依赖拖累
@@ -33,10 +35,6 @@ _SECONDS_PER_YEAR = Decimal(365 * 24 * 60 * 60)
 _PER_YEAR_FROM_8H = Decimal(3 * 365)
 _UNSTABLE_RELATIVE_GAP = Decimal("0.10")
 
-# 仅记录当前进程最近一次观测，用于识别监控循环中的方向翻转。
-_last_recommended_direction: str | None = None
-
-
 @dataclass
 class FundingView:
     """两腿预测资金费对比与方向建议（费率均折算为每 8 小时百分比）。"""
@@ -45,6 +43,7 @@ class FundingView:
     ext_pct_8h: Decimal          # Extended 每 8h 费率（%）
     # 方案一：Variational 做空 + Extended 做多 的净 carry（% / 8h）
     carry_short_var_pct_8h: Decimal
+    direction: str               # 机器可读方向，供调用方显式保存
     recommended: str             # 推荐方向说明
     annualized_pct: Decimal      # 推荐方向的年化 carry（%）
     extended_calibrated: bool    # Extended 原始费率单位是否已经结算记录校准
@@ -80,6 +79,7 @@ def compute_funding_view(
     *,
     var_interval_s: int = 28800,
     ext_interval_s: int = 3600,
+    previous_direction: str | None = None,
 ) -> FundingView:
     """把两腿原始费率归一化到 %/8h 并计算净 carry。
 
@@ -112,18 +112,13 @@ def compute_funding_view(
         best = -carry_short_var
 
     warnings: list[str] = []
-    global _last_recommended_direction
-    if (
-        _last_recommended_direction is not None
-        and direction != _last_recommended_direction
-    ):
+    if previous_direction is not None and direction != previous_direction:
         warning = (
-            "推荐方向翻转：与当前进程上一次资金费观测的推荐方向相反；"
+            "与上次运行相比方向翻转：本次推荐方向与上一次资金费观测相反；"
             "Extended 单位未经校准，请勿据此自动换向。"
         )
         warnings.append(warning)
         logger.warning(warning)
-    _last_recommended_direction = direction
 
     if _funding_rates_are_close(var_pct_8h, ext_pct_8h):
         warning = (
@@ -137,11 +132,43 @@ def compute_funding_view(
         var_pct_8h=var_pct_8h,
         ext_pct_8h=ext_pct_8h,
         carry_short_var_pct_8h=carry_short_var,
+        direction=direction,
         recommended=recommended,
         annualized_pct=best * _PER_YEAR_FROM_8H,
         extended_calibrated=False,
         warnings=tuple(warnings),
     )
+
+
+def compute_funding_view_with_state(
+    var_rate_raw: Decimal,
+    ext_rate_raw: Decimal,
+    *,
+    venue: str,
+    market: str,
+    state_path: str | Path | None = None,
+    var_interval_s: int = 28800,
+    ext_interval_s: int = 3600,
+) -> FundingView:
+    """读取上次方向、计算本次视图并保存方向。
+
+    状态读写失败由存储层降级处理，不会阻断本次资金费计算。
+    """
+    store = (
+        FundingDirectionStateStore()
+        if state_path is None
+        else FundingDirectionStateStore(state_path)
+    )
+    previous_direction = store.load(venue, market)
+    view = compute_funding_view(
+        var_rate_raw,
+        ext_rate_raw,
+        var_interval_s=var_interval_s,
+        ext_interval_s=ext_interval_s,
+        previous_direction=previous_direction,
+    )
+    store.save(venue, market, view.direction)
+    return view
 
 
 @dataclass
@@ -171,6 +198,7 @@ async def gather(
     *,
     underlying: str = "BTC",
     ext_market: str = "BTC-USD",
+    previous_direction: str | None = None,
 ) -> MonitorSnapshot:
     """采集两腿积分与资金费，组装监控快照。"""
     # 积分
@@ -198,7 +226,11 @@ async def gather(
     var_rate = await var.get_funding_rate(underlying)
     ext_stats = await ext._client.info.get_market_statistics(market_name=ext_market)
     ext_rate = Decimal(str(ext_stats.data.funding_rate))
-    funding = compute_funding_view(var_rate, ext_rate)
+    funding = compute_funding_view(
+        var_rate,
+        ext_rate,
+        previous_direction=previous_direction,
+    )
 
     # 持仓（入金前均为 0）
     var_pos = await var.get_position(underlying)
@@ -218,10 +250,14 @@ async def gather(
 
 
 async def run_once(
-    var: VariationalClient, ext: ExtendedClient, tracker: MetricsTracker
+    var: VariationalClient,
+    ext: ExtendedClient,
+    tracker: MetricsTracker,
+    *,
+    previous_direction: str | None = None,
 ) -> MonitorSnapshot:
     """采集一次、打印、并记入 tracker。"""
-    snap = await gather(var, ext)
+    snap = await gather(var, ext, previous_direction=previous_direction)
     logger.info("\n%s", snap.pretty())
     tracker.record(
         Snapshot(

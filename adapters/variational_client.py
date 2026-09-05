@@ -597,12 +597,13 @@ class VariationalClient(ExchangeAdapter):
         return MarketPrice(market, Decimal(str(q["bid"])), Decimal(str(q["ask"])))
 
     async def get_liquidation_info(
-        self, market: str, maint: Decimal = Decimal("0.1"), *, exact: bool = False
+        self, market: str, *, exact: bool = True
     ) -> tuple[Decimal, Decimal] | None:
-        """计算 (mark, liquidation_price)。Variational 不直接给清仓价，用维持保证金(10%)推算。
+        """返回 ``(mark, liquidation_price)``，优先采用 API 权威值。
 
-        清仓条件：equity + s·(P−M) = maint·|s|·P  → P = (s·M − E) / (s − maint·|s|)
-        （s 为有符号数量，空头 s<0；E=balance+upnl；M=标记价）
+        ``/positions`` 没有强平价时，再从 ``/quotes/indicative`` 的
+        ``margin_requirements`` 读取对应方向的估算值。仅全仓腿在两处都缺失时
+        才允许按账户权益降级自算；isolated 腿绝不使用账户总权益。
         """
         data = await self.get_positions()
         items = data if isinstance(data, list) else (data or {}).get("positions", [])
@@ -614,12 +615,75 @@ class VariationalClient(ExchangeAdapter):
                 break
         if not pos:
             return None
-        info = pos["position_info"]
-        s = Decimal(str(info["qty"]))
+        info = pos.get("position_info", pos)
+        s = Decimal(str(info.get("qty", info.get("size", "0"))))
         if s == 0:
             return None
-        price_info = pos.get("price_info", {})
-        mark = Decimal(str(price_info.get("underlying_price") or info.get("avg_entry_price")))
+
+        price_info = pos.get("price_info")
+        if not isinstance(price_info, dict):
+            price_info = {}
+        mark = self._decimal_or_none(
+            price_info.get("underlying_price")
+            or pos.get("mark_price")
+            or info.get("mark_price")
+            or info.get("avg_entry_price")
+        )
+        position_liquidation = self._decimal_or_none(
+            pos.get("estimated_liquidation_price")
+            or info.get("estimated_liquidation_price")
+            or price_info.get("estimated_liquidation_price")
+        )
+        if mark is not None and position_liquidation is not None:
+            return mark, position_liquidation
+
+        side = "buy" if s > 0 else "sell"
+        try:
+            quote = await self.request_quote(market, side, abs(s))
+        except Exception as exc:  # noqa: BLE001 缺少保证金模式时不能冒险自算
+            logger.warning("读取 %s indicative 强平价失败，返回无数据：%s", market, exc)
+            return None
+        if not isinstance(quote, dict):
+            logger.warning("读取 %s indicative 强平价失败：响应不是对象", market)
+            return None
+
+        mark = mark or self._decimal_or_none(quote.get("mark_price"))
+        if mark is not None and position_liquidation is not None:
+            return mark, position_liquidation
+
+        margin_requirements = quote.get("margin_requirements")
+        if not isinstance(margin_requirements, dict):
+            margin_requirements = {}
+        liquidation_key = (
+            "estimated_liquidation_price_bid"
+            if s > 0
+            else "estimated_liquidation_price_ask"
+        )
+        quote_liquidation = self._decimal_or_none(
+            margin_requirements.get(liquidation_key)
+        )
+        if mark is not None and quote_liquidation is not None:
+            return mark, quote_liquidation
+
+        margin_mode = margin_requirements.get("margin_mode")
+        if margin_mode is None:
+            margin_mode = pos.get("margin_mode", info.get("margin_mode"))
+        if str(margin_mode or "").lower() == "isolated":
+            logger.warning(
+                "%s isolated 持仓缺少 API 强平价，拒绝使用账户总权益自算",
+                market,
+            )
+            return None
+        if margin_mode not in (None, "", "cross", "cross_margin"):
+            logger.warning("%s 保证金模式未知，拒绝自算强平价：%r", market, margin_mode)
+            return None
+        if mark is None:
+            logger.warning("%s 缺少有效标记价，无法降级计算强平价", market)
+            return None
+
+        maint = await self._get_maintenance_margin(market)
+        if maint is None:
+            return None
         port = await self.raw("/portfolio")
         equity = Decimal(str(port["balance"])) + Decimal(str(port.get("upnl", "0")))
         denom = s - maint * abs(s)
@@ -629,6 +693,74 @@ class VariationalClient(ExchangeAdapter):
         if liq <= 0:
             return None
         return mark, liq
+
+    @staticmethod
+    def _find_margin_params(payload: Any) -> dict[str, Any] | None:
+        """从结算池响应中找到 ``margin_params`` 对象。"""
+        if isinstance(payload, dict):
+            margin_params = payload.get("margin_params")
+            if isinstance(margin_params, dict):
+                return margin_params
+            for value in payload.values():
+                found = VariationalClient._find_margin_params(value)
+                if found is not None:
+                    return found
+        elif isinstance(payload, list):
+            for value in payload:
+                found = VariationalClient._find_margin_params(value)
+                if found is not None:
+                    return found
+        return None
+
+    async def _get_maintenance_margin(self, market: str) -> Decimal | None:
+        """读取指定标的维持保证金率，不使用写死默认值。"""
+        try:
+            payload = await self.raw("/settlement_pools/details")
+        except Exception as exc:  # noqa: BLE001 缺失参数时宁可不提供强平价
+            logger.warning("读取 %s 维持保证金参数失败：%s", market, exc)
+            return None
+        margin_params = self._find_margin_params(payload)
+        params = margin_params.get("params") if margin_params is not None else None
+        if not isinstance(params, dict):
+            logger.warning("%s 维持保证金响应缺少 margin_params.params", market)
+            return None
+
+        asset_params = params.get("asset_params")
+        asset_param = None
+        if isinstance(asset_params, dict):
+            asset_param = next(
+                (
+                    value
+                    for asset, value in asset_params.items()
+                    if str(asset).upper() == market.upper() and isinstance(value, dict)
+                ),
+                None,
+            )
+        default_asset_param = params.get("default_asset_param")
+        if not isinstance(default_asset_param, dict):
+            default_asset_param = None
+
+        use_default_asset_param = params.get("use_default_asset_param")
+        if use_default_asset_param is True:
+            selected = default_asset_param
+        elif use_default_asset_param is False:
+            selected = asset_param
+        else:
+            logger.warning(
+                "%s margin_params.params 缺少有效 use_default_asset_param，"
+                "拒绝猜测维持保证金",
+                market,
+            )
+            return None
+
+        maint = self._decimal_or_none(
+            selected.get("futures_maintenance_margin")
+            if isinstance(selected, dict)
+            else None
+        )
+        if maint is None:
+            logger.warning("%s 缺少有效 futures_maintenance_margin", market)
+        return maint
 
     @staticmethod
     def _instrument(
