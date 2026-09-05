@@ -89,6 +89,39 @@ def _metadata(
     }
 
 
+def _margin_requirements(
+    *,
+    qty: Decimal,
+    isolated: bool,
+) -> dict[str, object]:
+    """按真实 indicative quote schema 构造保证金字段。"""
+    bid_initial = qty * Decimal("3999") * Decimal("0.05")
+    ask_initial = qty * Decimal("4001") * Decimal("0.05")
+    requirements: dict[str, object] = {
+        "existing_margin": {
+            "initial_margin": "89.252347",
+            "maintenance_margin": "44.626173",
+        },
+        "bid_margin_delta": {
+            "initial_margin": str(bid_initial),
+            "maintenance_margin": str(bid_initial / Decimal("2")),
+        },
+        "ask_margin_delta": {
+            "initial_margin": str(ask_initial),
+            "maintenance_margin": str(ask_initial / Decimal("2")),
+        },
+        "bid_max_notional_delta": "1000000",
+        "ask_max_notional_delta": "1000000",
+        "estimated_fees_bid": "0",
+        "estimated_fees_ask": "0",
+        "estimated_liquidation_price_bid": "3500",
+        "estimated_liquidation_price_ask": "4500",
+    }
+    if isolated:
+        requirements["margin_mode"] = "isolated"
+    return requirements
+
+
 class StrictGuardClient:
     """只允许测试显式配置的调用；遗漏编排时立即失败。"""
 
@@ -163,10 +196,10 @@ class StrictGuardClient:
             "quote_id": quote_id,
             "bid": "3999",
             "ask": "4001",
-            "margin_requirements": {
-                "initial_margin": "0.05",
-                "margin_mode": "isolated" if underlying == "XAUS" else "cross",
-            },
+            "margin_requirements": _margin_requirements(
+                qty=qty,
+                isolated=underlying == "XAUS",
+            ),
         }
 
     async def get_swap_funding(self, underlying: str) -> object:

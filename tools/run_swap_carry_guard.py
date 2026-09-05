@@ -217,30 +217,40 @@ def _liquidation_distance(info: object, position: Position) -> Decimal:
 
 
 def _imbalance_reason(
-    xaus_position: Position,
-    xau_position: Position,
-    xaus_notional: Decimal | None,
-    xau_notional: Decimal | None,
+    structure: execution.CarryStructure | str,
+    positions: Mapping[str, Position],
 ) -> str | None:
-    """识别单腿、方向异常及超过阈值的双腿名义差。"""
-    if xaus_position.is_flat != xau_position.is_flat:
-        remaining = "XAU" if xaus_position.is_flat else "XAUS"
-        return f"单腿失衡：只剩 {remaining}"
-    if xaus_position.is_flat and xau_position.is_flat:
+    """识别缺腿、方向异常及超过阈值的权重比例偏离。"""
+    selected = execution.resolve_structure(structure)
+    open_legs = [
+        leg for leg in selected.legs if not positions[leg.underlying].is_flat
+    ]
+    if not open_legs:
         return None
-    if xaus_position.signed_size <= 0 or xau_position.signed_size >= 0:
+    if len(open_legs) != len(selected.legs):
+        remaining = "、".join(leg.underlying for leg in open_legs)
+        return f"缺腿失衡：只剩 {remaining}"
+    direction_errors = []
+    for leg in selected.legs:
+        size = positions[leg.underlying].signed_size
+        correct = size > 0 if leg.open_side is execution.Side.BUY else size < 0
+        if not correct:
+            direction_errors.append(f"{leg.underlying}={size}")
+    if direction_errors:
         return (
-            "持仓方向异常："
-            f"XAUS={xaus_position.signed_size} XAU={xau_position.signed_size}"
+            "持仓方向异常：" + " ".join(direction_errors)
         )
-    if xaus_notional is None or xau_notional is None:
-        return None
-    larger = max(xaus_notional, xau_notional)
+
+    normalized = [
+        abs(positions[leg.underlying].signed_size) / leg.weight
+        for leg in selected.legs
+    ]
+    larger = max(normalized)
     if larger == 0:
         return None
-    ratio = abs(xaus_notional - xau_notional) / larger
+    ratio = (larger - min(normalized)) / larger
     if ratio > IMBALANCE_RATIO:
-        return f"双腿名义失衡 {ratio:.2%}，超过阈值 {IMBALANCE_RATIO:.2%}"
+        return f"结构权重比例失衡 {ratio:.2%}，超过阈值 {IMBALANCE_RATIO:.2%}"
     return None
 
 
@@ -291,8 +301,8 @@ def _is_safe_open_rejection(error: SystemExit) -> bool:
 async def _try_auto_open(
     var: Any,
     *,
-    xaus_position: Position,
-    xau_position: Position,
+    structure: execution.CarryStructure | str,
+    positions: Mapping[str, Position],
     schedule: SwapTradingSchedule | None,
     schedule_error: str | None,
     market_status: str | None,
@@ -306,6 +316,7 @@ async def _try_auto_open(
     observed_at: datetime,
 ) -> AutoOpenResult:
     """逐项失败关闭地判定入场，并把成交委托给人工执行器。"""
+    selected = execution.resolve_structure(structure)
 
     def skip(
         reason: str,
@@ -350,10 +361,13 @@ async def _try_auto_open(
         return skip(
             f"当日自动开仓尝试已达上限 {MAX_DAILY_OPEN_ATTEMPTS} 次"
         )
-    if not xaus_position.is_flat or not xau_position.is_flat:
+    if any(not position.is_flat for position in positions.values()):
+        detail = " ".join(
+            f"{leg.underlying}={positions[leg.underlying].signed_size}"
+            for leg in selected.legs
+        )
         return skip(
-            "账户并非两腿都为空仓："
-            f"XAUS={xaus_position.signed_size} XAU={xau_position.signed_size}"
+            f"账户并非结构全部为空仓：{detail}"
         )
     if kill_switch_path.exists():
         return skip("kill switch 已激活，禁止自动开仓")
@@ -363,33 +377,25 @@ async def _try_auto_open(
     except SystemExit as exc:
         return skip(str(exc))
 
-    if schedule_error is not None:
-        return skip(f"XAUS 时段元数据不可用，禁止自动开仓：{schedule_error}")
-    if schedule is None or not schedule.metadata_is_fresh:
-        detail = schedule.reason if schedule is not None else "无解析结果"
-        return skip(f"XAUS 时段元数据不安全，禁止自动开仓：{detail}")
-    if market_status != "open" or not schedule.is_tradable:
-        return skip(f"XAUS 当前不可交易，禁止自动开仓：{schedule.reason}")
-    if schedule.time_until_close is None:
-        return skip("XAUS 缺少距下次休市时间，禁止自动开仓")
-    if schedule.time_until_close <= MIN_TIME_TO_CLOSE:
-        return skip(
-            f"XAUS 距休市 {schedule.time_until_close}，"
-            f"未超过最短开仓窗口 {MIN_TIME_TO_CLOSE}"
-        )
+    if selected.has_xaus:
+        if schedule_error is not None:
+            return skip(f"XAUS 时段元数据不可用，禁止自动开仓：{schedule_error}")
+        if schedule is None or not schedule.metadata_is_fresh:
+            detail = schedule.reason if schedule is not None else "无解析结果"
+            return skip(f"XAUS 时段元数据不安全，禁止自动开仓：{detail}")
+        if market_status != "open" or not schedule.is_tradable:
+            return skip(f"XAUS 当前不可交易，禁止自动开仓：{schedule.reason}")
+        if schedule.time_until_close is None:
+            return skip("XAUS 缺少距下次休市时间，禁止自动开仓")
+        if schedule.time_until_close <= MIN_TIME_TO_CLOSE:
+            return skip(
+                f"XAUS 距休市 {schedule.time_until_close}，"
+                f"未超过最短开仓窗口 {MIN_TIME_TO_CLOSE}"
+            )
 
     try:
-        xaus_rate = execution._swap_long_rate(
-            await var.get_swap_funding(execution.XAUS_LEG.underlying)
-        )
-        xau_rate = execution._decimal(
-            await var.get_funding_rate(
-                execution.XAU_LEG.underlying,
-                execution.XAU_LEG.instrument_type,
-            ),
-            label="XAU 永续资金费率",
-        )
-        net_carry = xaus_rate + xau_rate
+        rates = await execution._load_funding_rates(var, selected)
+        net_carry = execution._weighted_net_carry(selected, rates)
     except Exception as exc:  # noqa: BLE001 入场数据不确定时只跳过，不升级故障
         return skip(f"净 carry 读取失败，按不确定处理：{type(exc).__name__}: {exc}")
 
@@ -405,6 +411,7 @@ async def _try_auto_open(
         {
             "timestamp": observed_at,
             "event": "auto_open_attempt",
+            "structure": selected.name,
             "notional_usd": target_notional,
             "net_carry_annual": net_carry,
             "daily_open_attempts": attempt_number,
@@ -415,6 +422,7 @@ async def _try_auto_open(
         await execution.cmd_open(
             var,
             target_notional,
+            structure=selected,
             yes=True,
             dry_run=dry_run,
             now=observed_at,
@@ -422,7 +430,8 @@ async def _try_auto_open(
     except SystemExit as exc:
         if _is_skew_rejection(exc):
             conclusion = (
-                "XAUS 开仓因 OI 偏斜被拒；本轮结束，下一轮退避后可重试："
+                f"{selected.legs[0].underlying} 开仓因 OI 偏斜被拒；"
+                "本轮结束，下一轮退避后可重试："
                 f"{exc}"
             )
             _append_audit(
@@ -461,7 +470,8 @@ async def _try_auto_open(
     except Exception as exc:  # noqa: BLE001 报价或执行器未知错误必须显著记录
         if _is_skew_rejection(exc):
             conclusion = (
-                "XAUS 开仓因 OI 偏斜被拒；本轮结束，下一轮退避后可重试："
+                f"{selected.legs[0].underlying} 开仓因 OI 偏斜被拒；"
+                "本轮结束，下一轮退避后可重试："
                 f"{exc}"
             )
             _append_audit(
@@ -589,29 +599,31 @@ async def _close_leg(
 async def _flatten(
     var: Any,
     *,
-    xaus_position: Position,
-    xau_position: Position,
-    schedule: SwapTradingSchedule | None,
+    structure: execution.CarryStructure | str,
+    positions: Mapping[str, Position],
     xaus_known_closed: bool,
     dry_run: bool,
     audit_path: Path,
     observed_at: datetime,
 ) -> FlattenResult:
     """按时段能力清空仓位；XAUS 明确休市时保留显著待处理状态。"""
-    if xaus_position.is_flat and xau_position.is_flat:
+    selected = execution.resolve_structure(structure)
+    if all(position.is_flat for position in positions.values()):
         return FlattenResult(True, False, "当前已空仓")
 
-    if xaus_known_closed:
-        if not xau_position.is_flat:
+    if selected.has_xaus and xaus_known_closed:
+        for leg in selected.legs:
+            if leg.underlying == "XAUS":
+                continue
             await _close_leg(
                 var,
-                xau_position,
-                execution.XAU_LEG,
+                positions[leg.underlying],
+                leg,
                 dry_run=dry_run,
                 audit_path=audit_path,
                 observed_at=observed_at,
             )
-        if not xaus_position.is_flat:
+        if not positions["XAUS"].is_flat:
             message = "XAUS 当前休市无法平仓，已记录待处理状态"
             print(f"🚨 {message}")
             _append_audit(
@@ -624,22 +636,13 @@ async def _flatten(
                 },
             )
             return FlattenResult(False, True, message)
-        return FlattenResult(True, False, "XAU 已平仓")
+        return FlattenResult(True, False, "其余腿已平仓")
 
-    if not xaus_position.is_flat:
+    for leg in selected.legs:
         await _close_leg(
             var,
-            xaus_position,
-            execution.XAUS_LEG,
-            dry_run=dry_run,
-            audit_path=audit_path,
-            observed_at=observed_at,
-        )
-    if not xau_position.is_flat:
-        await _close_leg(
-            var,
-            xau_position,
-            execution.XAU_LEG,
+            positions[leg.underlying],
+            leg,
             dry_run=dry_run,
             audit_path=audit_path,
             observed_at=observed_at,
@@ -650,6 +653,7 @@ async def _flatten(
 async def run_once(
     var: Any,
     *,
+    structure: execution.CarryStructure | str = execution.XAUS_XAU,
     dry_run: bool = False,
     auto_open: bool = True,
     auto_open_notional: Decimal = AUTO_OPEN_NOTIONAL_USD,
@@ -660,6 +664,7 @@ async def run_once(
     audit_path: Path = DEFAULT_AUDIT_LOG,
 ) -> int:
     """先执行全部平仓风控，再以最低优先级判定自动开仓。"""
+    selected = execution.resolve_structure(structure)
     observed_at = now or datetime.now(timezone.utc)
     if observed_at.tzinfo is None:
         raise ValueError("now 必须包含时区")
@@ -673,10 +678,10 @@ async def run_once(
     auto_open_attempted = False
     auto_open_conclusion = "未进入自动开仓判定"
     result_code = 1
-    xaus_position: Position | None = None
-    xau_position: Position | None = None
-    xaus_price: Decimal | None = None
-    xau_price: Decimal | None = None
+    positions: dict[str, Position] = {}
+    prices: dict[str, Decimal | None] = {
+        leg.underlying: None for leg in selected.legs
+    }
     schedule: SwapTradingSchedule | None = None
     schedule_error: str | None = None
     market_status: str | None = None
@@ -702,6 +707,7 @@ async def run_once(
         {
             "timestamp": observed_at,
             "event": "round_started",
+            "structure": selected.name,
             "dry_run": dry_run,
             "kill_switch": kill_switch_path.exists(),
             "auto_open": auto_open,
@@ -711,25 +717,32 @@ async def run_once(
         },
     )
     try:
-        xaus_position = await execution._get_position(var, execution.XAUS_LEG)
-        xau_position = await execution._get_position(var, execution.XAU_LEG)
+        positions = await execution._get_positions(var, selected)
 
-        try:
-            metadata, record, schedule = await execution._load_schedule(
-                var, now=observed_at
+        if selected.has_xaus:
+            try:
+                metadata, record, schedule = await execution._load_schedule(
+                    var, now=observed_at
+                )
+                raw_market_status = record.get("market_status")
+                if (
+                    not isinstance(raw_market_status, str)
+                    or not raw_market_status.strip()
+                ):
+                    schedule_error = "XAUS market_status 元数据缺失"
+                else:
+                    market_status = raw_market_status.strip().lower()
+                for leg in selected.legs:
+                    prices[leg.underlying] = execution._metadata_price(metadata, leg)
+            except Exception as exc:  # noqa: BLE001 时段读取失败后仍要尝试降险
+                schedule_error = f"{type(exc).__name__}: {exc}"
+
+        notionals = {
+            leg.underlying: _position_notional(
+                positions[leg.underlying], prices[leg.underlying]
             )
-            raw_market_status = record.get("market_status")
-            if not isinstance(raw_market_status, str) or not raw_market_status.strip():
-                schedule_error = "XAUS market_status 元数据缺失"
-            else:
-                market_status = raw_market_status.strip().lower()
-            xaus_price = execution._metadata_price(metadata, execution.XAUS_LEG)
-            xau_price = execution._metadata_price(metadata, execution.XAU_LEG)
-        except Exception as exc:  # noqa: BLE001 时段读取失败后仍要尝试降险
-            schedule_error = f"{type(exc).__name__}: {exc}"
-
-        xaus_notional = _position_notional(xaus_position, xaus_price)
-        xau_notional = _position_notional(xau_position, xau_price)
+            for leg in selected.legs
+        }
 
         reason: str | None = None
         state_status = "healthy"
@@ -739,16 +752,17 @@ async def run_once(
             reason = "kill switch 已激活"
             state_status = "kill_switch_active"
         else:
-            # 优先级 2：单腿、方向或名义失衡。
-            reason = _imbalance_reason(
-                xaus_position,
-                xau_position,
-                xaus_notional,
-                xau_notional,
-            )
+            # 优先级 2：缺腿、方向或结构权重比例失衡。
+            reason = _imbalance_reason(selected, positions)
 
-        # 优先级 3：权威强平价缺失也视为不安全。
-        if reason is None and not xaus_position.is_flat:
+        # 优先级 3：XAUS 权威强平价缺失也视为不安全。
+        xaus_position = positions.get("XAUS")
+        if (
+            reason is None
+            and selected.has_xaus
+            and xaus_position is not None
+            and not xaus_position.is_flat
+        ):
             try:
                 liquidation_info = await var.get_liquidation_info(
                     execution.XAUS_LEG.underlying,
@@ -763,15 +777,17 @@ async def run_once(
             except Exception as exc:  # noqa: BLE001 读不到权威值必须平仓
                 reason = f"XAUS 强平价不可用，按不安全处理：{exc}"
 
-        if reason is None and not (
-            xaus_position.is_flat and xau_position.is_flat
-        ) and (xaus_notional is None or xau_notional is None):
-            reason = "无法确认双腿名义，不能验证失衡阈值"
+        all_flat = all(position.is_flat for position in positions.values())
+        if (
+            reason is None
+            and selected.has_xaus
+            and not all_flat
+            and any(value is None for value in notionals.values())
+        ):
+            reason = "无法确认结构各腿名义，不能验证失衡阈值"
 
         # 优先级 4：交易时段必须新鲜、完整；每日短休市明确穿越。
-        if reason is None and not (
-            xaus_position.is_flat and xau_position.is_flat
-        ):
+        if reason is None and selected.has_xaus and not all_flat:
             if schedule_error is not None:
                 reason = f"XAUS 时段元数据不可用：{schedule_error}"
             elif schedule is None or not schedule.metadata_is_fresh:
@@ -794,11 +810,11 @@ async def run_once(
                         f"{schedule.time_until_close} 后开始"
                     )
 
-        if reason is None and xaus_position.is_flat and xau_position.is_flat:
+        if reason is None and all_flat:
             open_result = await _try_auto_open(
                 var,
-                xaus_position=xaus_position,
-                xau_position=xau_position,
+                structure=selected,
+                positions=positions,
                 schedule=schedule,
                 schedule_error=schedule_error,
                 market_status=market_status,
@@ -822,7 +838,7 @@ async def run_once(
             )
             persist_state(open_result.status, conclusion, consecutive_failures)
         elif reason is None:
-            auto_open_conclusion = "已有双腿持仓，自动开仓不适用"
+            auto_open_conclusion = "已有结构持仓，自动开仓不适用"
             conclusion = "无需动作：仓位与风控检查正常"
             consecutive_failures = 0
             _append_audit(
@@ -842,11 +858,11 @@ async def run_once(
             print(f"守护进程命中风控：{reason}")
             flatten_result = await _flatten(
                 var,
-                xaus_position=xaus_position,
-                xau_position=xau_position,
-                schedule=schedule,
+                structure=selected,
+                positions=positions,
                 xaus_known_closed=(
-                    schedule is not None
+                    selected.has_xaus
+                    and schedule is not None
                     and schedule.metadata_is_fresh
                     and market_status is not None
                     and market_status != "open"
@@ -858,23 +874,36 @@ async def run_once(
             conclusion = f"{reason}；{flatten_result.message}"
             if flatten_result.complete:
                 if not dry_run:
-                    xaus_size, xau_size, net_delta = await execution._await_flat(var)
-                    xaus_position = Position(
-                        execution.XAUS_LEG.underlying, xaus_size
-                    )
-                    xau_position = Position(execution.XAU_LEG.underlying, xau_size)
-                    if xaus_size != 0 or xau_size != 0:
+                    flat_result = await execution._await_flat(var, selected)
+                    sizes = flat_result[:-1]
+                    net_delta = flat_result[-1]
+                    positions = {
+                        leg.underlying: Position(leg.underlying, size)
+                        for leg, size in zip(selected.legs, sizes, strict=True)
+                    }
+                    if any(size != 0 for size in sizes):
+                        detail = " ".join(
+                            f"{leg.underlying}={size}"
+                            for leg, size in zip(
+                                selected.legs, sizes, strict=True
+                            )
+                        )
                         raise CloseActionError(
                             "平仓 accept 已返回，但轮询后仓位仍未归零："
-                            f"XAUS={xaus_size} XAU={xau_size} 净 delta={net_delta}"
+                            f"{detail} 净 delta={net_delta}"
                         )
                     _append_audit(
                         audit_path,
                         {
                             "timestamp": observed_at,
                             "event": "flat_confirmed",
-                            "xaus_size": xaus_size,
-                            "xau_size": xau_size,
+                            "structure": selected.name,
+                            "positions": {
+                                leg.underlying: size
+                                for leg, size in zip(
+                                    selected.legs, sizes, strict=True
+                                )
+                            },
                             "net_delta": net_delta,
                         },
                     )
@@ -914,25 +943,48 @@ async def run_once(
     finally:
         # 成交或部分失败后重新读仓，令心跳反映本轮结束时的真实快照。
         try:
-            xaus_position = await execution._get_position(var, execution.XAUS_LEG)
-            xau_position = await execution._get_position(var, execution.XAU_LEG)
+            positions = await execution._get_positions(var, selected)
         except Exception as exc:  # noqa: BLE001 心跳仍需保存其他已知字段
             conclusion = f"{conclusion}；结束读仓失败：{type(exc).__name__}: {exc}"
 
-        xaus_notional = _position_notional(xaus_position, xaus_price)
-        xau_notional = _position_notional(xau_position, xau_price)
+        notionals = {
+            leg.underlying: _position_notional(
+                positions.get(leg.underlying), prices[leg.underlying]
+            )
+            for leg in selected.legs
+        }
         net_delta = (
-            xaus_position.signed_size + xau_position.signed_size
-            if xaus_position is not None and xau_position is not None
+            sum(
+                (
+                    positions[leg.underlying].signed_size
+                    for leg in selected.legs
+                ),
+                Decimal("0"),
+            )
+            if len(positions) == len(selected.legs)
             else None
         )
         heartbeat = {
             "timestamp": observed_at.isoformat(),
+            "structure": selected.name,
             "conclusion": conclusion,
-            "xaus_notional": _format_money(xaus_notional),
-            "xau_notional": _format_money(xau_notional),
+            "legs": {
+                leg.underlying: {
+                    "size": str(positions[leg.underlying].signed_size)
+                    if leg.underlying in positions
+                    else None,
+                    "weight": str(leg.weight),
+                    "notional": _format_money(notionals[leg.underlying]),
+                }
+                for leg in selected.legs
+            },
+            # 保留旧字段，避免既有 XAUS_XAU 监控消费者失效。
+            "xaus_notional": _format_money(notionals.get("XAUS")),
+            "xau_notional": _format_money(notionals.get("XAU")),
             "net_delta": str(net_delta) if net_delta is not None else None,
-            "xaus_schedule": _schedule_payload(schedule),
+            "xaus_schedule": (
+                _schedule_payload(schedule) if selected.has_xaus else None
+            ),
             "consecutive_failures": consecutive_failures,
             "dry_run": dry_run,
             "auto_open_attempted": auto_open_attempted,
@@ -959,6 +1011,7 @@ async def _main(args: argparse.Namespace) -> int:
     try:
         return await run_once(
             var,
+            structure=args.structure,
             dry_run=args.dry_run,
             auto_open=args.auto_open,
             auto_open_notional=args.auto_open_notional,
@@ -977,6 +1030,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Variational swap carry 无人值守周循环守护进程"
     )
     parser.add_argument("--once", action="store_true", help="执行一轮后退出")
+    parser.add_argument(
+        "--structure",
+        choices=tuple(execution.STRUCTURES),
+        default=execution.DEFAULT_STRUCTURE.name,
+        help=f"carry 结构，默认 {execution.DEFAULT_STRUCTURE.name}",
+    )
     parser.add_argument("--dry-run", action="store_true", help="判定并询价，但不 accept")
     parser.add_argument(
         "--no-auto-open",

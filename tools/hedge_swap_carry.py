@@ -1,8 +1,8 @@
-"""Variational swap carry 双腿人工执行工具：open / status / close。
+"""Variational swap carry 多腿人工执行工具：open / status / close。
 
-固定结构为先多 XAUS swap，再空 XAU RWA 永续。两腿使用相同黄金数量，
-第二腿失败时立即用 ``reduce_only`` 回滚 XAUS；回滚失败则停止全部动作并要求
-人工介入。本工具只供人工值守、小额实盘，不包含自动入场退出或持久化状态机。
+结构由具名配置定义，腿顺序就是开仓及优先平仓顺序。第一腿成交后，其余腿按
+相对权重配平；任一后续腿失败时，对所有已开腿逐一执行 ``reduce_only`` 回滚。
+本工具只供人工值守、小额实盘，不包含持久化状态机。
 
 用法（实盘 accept 必须在放行 IP 上执行）：
     PYTHONPATH=. .venv/bin/python -m tools.hedge_swap_carry status
@@ -78,13 +78,66 @@ _ANSI_RESET = "\033[0m"
 
 @dataclass(frozen=True)
 class CarryLeg:
-    """Swap carry 单腿的固定 Variational 合约参数。"""
+    """Swap carry 单腿的 Variational 合约参数与相对权重。"""
 
     underlying: str
     open_side: Side
     instrument_type: str
     funding_interval_s: int
-    kind: str
+    kind: str | None
+    weight: Decimal
+
+    def __post_init__(self) -> None:
+        """拒绝无法参与可靠配平的非法腿配置。"""
+        weight = Decimal(str(self.weight))
+        if not weight.is_finite() or weight <= 0:
+            raise ValueError(f"{self.underlying} 权重必须为有限正数")
+
+
+@dataclass(frozen=True)
+class CarryStructure:
+    """具名 carry 结构；腿顺序同时约束开仓和风险退出顺序。"""
+
+    name: str
+    legs: tuple[CarryLeg, ...]
+
+    def __post_init__(self) -> None:
+        """结构加载时校验唯一标的、受限腿顺序和 delta 中性。"""
+        if not self.name.strip():
+            raise ValueError("carry 结构名不能为空")
+        if len(self.legs) < 2:
+            raise ValueError(f"{self.name} 至少需要两条腿")
+        underlyings = [leg.underlying for leg in self.legs]
+        if len(set(underlyings)) != len(underlyings):
+            raise ValueError(f"{self.name} 不允许重复标的")
+        if "XAUS" in underlyings and underlyings[0] != "XAUS":
+            raise ValueError(f"{self.name} 的受限腿 XAUS 必须排在最前")
+        long_weight = sum(
+            (leg.weight for leg in self.legs if leg.open_side is Side.BUY),
+            Decimal("0"),
+        )
+        short_weight = sum(
+            (leg.weight for leg in self.legs if leg.open_side is Side.SELL),
+            Decimal("0"),
+        )
+        if long_weight != short_weight:
+            raise ValueError(
+                f"{self.name} 不是 delta 中性结构："
+                f"多腿权重={long_weight}，空腿权重={short_weight}"
+            )
+
+    @property
+    def has_xaus(self) -> bool:
+        """返回结构是否包含有休市窗口的 XAUS。"""
+        return any(leg.underlying == "XAUS" for leg in self.legs)
+
+    @property
+    def neutral_weight(self) -> Decimal:
+        """返回 delta 中性结构任意一侧的总权重。"""
+        return sum(
+            (leg.weight for leg in self.legs if leg.open_side is Side.BUY),
+            Decimal("0"),
+        )
 
 
 @dataclass(frozen=True)
@@ -111,6 +164,7 @@ XAUS_LEG = CarryLeg(
     instrument_type="swap",
     funding_interval_s=0,
     kind="commodity",
+    weight=Decimal("1"),
 )
 XAU_LEG = CarryLeg(
     underlying="XAU",
@@ -118,15 +172,58 @@ XAU_LEG = CarryLeg(
     instrument_type="perpetual_rwa_future",
     funding_interval_s=3600,
     kind="commodity",
+    weight=Decimal("1"),
+)
+XAU_LONG_LEG = CarryLeg(
+    underlying="XAU",
+    open_side=Side.BUY,
+    instrument_type="perpetual_rwa_future",
+    funding_interval_s=3600,
+    kind="commodity",
+    weight=Decimal("1"),
+)
+XAUT_LEG = CarryLeg(
+    underlying="XAUT",
+    open_side=Side.SELL,
+    instrument_type="perpetual_future",
+    funding_interval_s=3600,
+    kind=None,
+    weight=Decimal("1"),
+)
+XAUT_DOUBLE_LEG = CarryLeg(
+    underlying="XAUT",
+    open_side=Side.SELL,
+    instrument_type="perpetual_future",
+    funding_interval_s=3600,
+    kind=None,
+    weight=Decimal("2"),
 )
 
+XAUS_XAU = CarryStructure("XAUS_XAU", (XAUS_LEG, XAU_LEG))
+XAU_XAUT = CarryStructure("XAU_XAUT", (XAU_LONG_LEG, XAUT_LEG))
+TRIPLE = CarryStructure("TRIPLE", (XAUS_LEG, XAU_LONG_LEG, XAUT_DOUBLE_LEG))
+STRUCTURES = {
+    structure.name: structure for structure in (XAUS_XAU, XAU_XAUT, TRIPLE)
+}
+DEFAULT_STRUCTURE = XAU_XAUT
 
-def _opening_plan() -> tuple[CarryLeg, CarryLeg]:
-    """返回不可调换的开仓顺序，并守住唯一允许方向。"""
-    plan = (XAUS_LEG, XAU_LEG)
-    if XAUS_LEG.open_side is not Side.BUY or XAU_LEG.open_side is not Side.SELL:
-        raise RuntimeError("swap carry 方向配置错误：只允许多 XAUS + 空 XAU")
-    return plan
+
+def resolve_structure(value: CarryStructure | str) -> CarryStructure:
+    """把结构对象或名称解析为已校验的具名结构。"""
+    if isinstance(value, CarryStructure):
+        return value
+    try:
+        return STRUCTURES[str(value).strip().upper()]
+    except KeyError as exc:
+        choices = "、".join(STRUCTURES)
+        raise ValueError(f"未知 carry 结构 {value!r}；可选：{choices}") from exc
+
+
+def _opening_plan(
+    structure: CarryStructure | str = XAUS_XAU,
+) -> tuple[CarryLeg, ...]:
+    """返回结构声明的不可调换开仓顺序。"""
+    return resolve_structure(structure).legs
 
 
 def remove_proxy_environment(
@@ -285,11 +382,39 @@ async def _get_position(var: Any, leg: CarryLeg) -> Position:
     return await var.get_position(leg.underlying, exact=True)
 
 
-async def _net_delta(var: Any) -> tuple[Decimal, Decimal, Decimal]:
-    """返回 XAUS、XAU 有符号数量及两者净 delta。"""
-    xaus = await _get_position(var, XAUS_LEG)
-    xau = await _get_position(var, XAU_LEG)
-    return xaus.signed_size, xau.signed_size, xaus.signed_size + xau.signed_size
+async def _get_positions(
+    var: Any,
+    structure: CarryStructure | str,
+) -> dict[str, Position]:
+    """按结构顺序读取全部精确仓位。"""
+    selected = resolve_structure(structure)
+    positions: dict[str, Position] = {}
+    for leg in selected.legs:
+        positions[leg.underlying] = await _get_position(var, leg)
+    return positions
+
+
+def _positions_net_delta(
+    structure: CarryStructure | str,
+    positions: Mapping[str, Position],
+) -> Decimal:
+    """按实际有符号数量加总结构净 delta。"""
+    selected = resolve_structure(structure)
+    return sum(
+        (positions[leg.underlying].signed_size for leg in selected.legs),
+        Decimal("0"),
+    )
+
+
+async def _net_delta(
+    var: Any,
+    structure: CarryStructure | str = XAUS_XAU,
+) -> tuple[Decimal, ...]:
+    """兼容返回各腿有符号数量，并在末尾附加净 delta。"""
+    selected = resolve_structure(structure)
+    positions = await _get_positions(var, selected)
+    sizes = tuple(positions[leg.underlying].signed_size for leg in selected.legs)
+    return (*sizes, _positions_net_delta(selected, positions))
 
 
 async def _request_quote(
@@ -357,18 +482,31 @@ def _quantity_constraints(
     return minimum, step
 
 
-def _initial_margin_ratio(payload: Mapping[str, Any]) -> Decimal:
-    """严格读取报价声明的初始保证金率；缺失时禁止开仓。"""
+def _initial_margin_ratio(
+    payload: Mapping[str, Any],
+    side: Side,
+    notional_usd: Decimal,
+) -> Decimal:
+    """按方向读取初始保证金金额，并除以本腿名义得到保证金率。"""
     requirements = payload.get("margin_requirements")
     if not isinstance(requirements, Mapping):
         raise ValueError("报价缺少 margin_requirements")
-    ratio = _decimal(
-        requirements.get("initial_margin"),
-        label="initial_margin",
+
+    delta_key = "ask_margin_delta" if side is Side.BUY else "bid_margin_delta"
+    margin_delta = requirements.get(delta_key)
+    if not isinstance(margin_delta, Mapping):
+        raise ValueError(f"报价缺少 margin_requirements.{delta_key}")
+    initial_margin = _decimal(
+        margin_delta.get("initial_margin"),
+        label=f"{delta_key}.initial_margin",
         positive=True,
     )
+    notional = _decimal(notional_usd, label="本腿名义", positive=True)
+    ratio = initial_margin / notional
     if ratio > 1:
-        raise ValueError("initial_margin 必须是不超过 1 的比例")
+        raise ValueError(
+            f"{delta_key}.initial_margin 除以本腿名义后必须是不超过 1 的比例"
+        )
     return ratio
 
 
@@ -390,14 +528,19 @@ def _prepare_quote(
     是比缺字段严重得多的后果。此时 ``initial_margin_ratio`` 记为 0。
     """
     price = _quote_price(payload, side)
-    margin_ratio = _initial_margin_ratio(payload) if require_margin else Decimal(0)
+    notional_usd = qty * price
+    margin_ratio = (
+        _initial_margin_ratio(payload, side, notional_usd)
+        if require_margin
+        else Decimal(0)
+    )
     return PreparedQuote(
         leg=leg,
         side=side,
         qty=qty,
         payload=payload,
         execution_price=price,
-        notional_usd=qty * price,
+        notional_usd=notional_usd,
         initial_margin_ratio=margin_ratio,
     )
 
@@ -405,80 +548,107 @@ def _prepare_quote(
 async def _prepare_open_quotes(
     var: Any,
     target_notional: Decimal,
-) -> tuple[PreparedQuote, PreparedQuote, Decimal]:
-    """询价并生成两腿同数量计划；全程不 accept。"""
-    xaus_probe = await _request_quote(var, XAUS_LEG, Side.BUY, XAUS_MIN_QTY)
-    xau_probe = await _request_quote(var, XAU_LEG, Side.SELL, XAU_PROBE_QTY)
-    xaus_minimum, xaus_step = _quantity_constraints(
-        xaus_probe,
-        Side.BUY,
-        fallback_minimum=XAUS_MIN_QTY,
-        fallback_step=XAUS_QTY_STEP,
-    )
-    xau_minimum, xau_step = _quantity_constraints(
-        xau_probe,
-        Side.SELL,
-        fallback_minimum=XAU_FALLBACK_QTY_STEP,
-        fallback_step=XAU_FALLBACK_QTY_STEP,
-    )
-    common_step = max(xaus_step, xau_step)
-    common_minimum = max(xaus_minimum, xau_minimum)
-    reference_price = _quote_price(xaus_probe, Side.BUY)
-    qty = _round_qty(target_notional / reference_price, common_step)
-    if qty < common_minimum:
-        raise SystemExit(
-            f"❌ 目标名义过小：qty={qty}，双腿共同最小数量为 {common_minimum}"
+    structure: CarryStructure | str = XAUS_XAU,
+) -> tuple[tuple[PreparedQuote, ...], Decimal]:
+    """询价并按相对权重生成全部腿的计划；全程不 accept。"""
+    selected = resolve_structure(structure)
+    probes: list[Mapping[str, Any]] = []
+    constraints: list[tuple[Decimal, Decimal]] = []
+    first_leg = selected.legs[0]
+    for leg in selected.legs:
+        fallback_minimum = (
+            XAUS_MIN_QTY if leg.underlying == "XAUS" else XAU_FALLBACK_QTY_STEP
+        )
+        fallback_step = (
+            XAUS_QTY_STEP if leg.underlying == "XAUS" else XAU_FALLBACK_QTY_STEP
+        )
+        probe_qty = XAUS_MIN_QTY if leg.underlying == "XAUS" else XAU_PROBE_QTY
+        payload = await _request_quote(var, leg, leg.open_side, probe_qty)
+        probes.append(payload)
+        constraints.append(
+            _quantity_constraints(
+                payload,
+                leg.open_side,
+                fallback_minimum=fallback_minimum,
+                fallback_step=fallback_step,
+            )
         )
 
-    xaus_payload = await _request_quote(var, XAUS_LEG, Side.BUY, qty)
-    xau_payload = await _request_quote(var, XAU_LEG, Side.SELL, qty)
-    xaus_quote = _prepare_quote(XAUS_LEG, Side.BUY, qty, xaus_payload)
-    xau_quote = _prepare_quote(XAU_LEG, Side.SELL, qty, xau_payload)
-    for quote in (xaus_quote, xau_quote):
+    first_minimum = max(
+        minimum * first_leg.weight / leg.weight
+        for leg, (minimum, _step) in zip(selected.legs, constraints, strict=True)
+    )
+    first_step = max(
+        step * first_leg.weight / leg.weight
+        for leg, (_minimum, step) in zip(selected.legs, constraints, strict=True)
+    )
+    reference_price = _quote_price(probes[0], first_leg.open_side)
+    first_qty = _round_qty(target_notional / reference_price, first_step)
+    if first_qty < first_minimum:
+        raise SystemExit(
+            f"❌ 目标名义过小：第一腿 qty={first_qty}，"
+            f"按结构权重折算的最小数量为 {first_minimum}"
+        )
+
+    quotes: list[PreparedQuote] = []
+    for leg, (_minimum, step) in zip(selected.legs, constraints, strict=True):
+        qty = first_qty * leg.weight / first_leg.weight
+        if _round_qty(qty, step) != qty:
+            raise SystemExit(
+                f"❌ {selected.name} 权重无法按 {leg.underlying} 数量步长 {step} 精确配平"
+            )
+        payload = await _request_quote(var, leg, leg.open_side, qty)
+        quotes.append(_prepare_quote(leg, leg.open_side, qty, payload))
+
+    for quote in quotes:
         if quote.notional_usd > MAX_NOTIONAL_USD:
             raise SystemExit(
                 f"❌ {quote.leg.underlying} 报价名义 ${quote.notional_usd:.2f} "
                 f"超过硬上限 ${MAX_NOTIONAL_USD}"
             )
-    return xaus_quote, xau_quote, common_step
+    return tuple(quotes), first_step
 
 
 async def _check_margin(
     var: Any,
-    xaus_quote: PreparedQuote,
-    xau_quote: PreparedQuote,
+    *quotes: PreparedQuote,
 ) -> None:
-    """确认账户权益足以覆盖两腿报价的初始保证金。"""
+    """确认账户权益足以覆盖全部腿报价的初始保证金。"""
     balance = await var.get_balance()
     equity = _decimal(getattr(balance, "equity", None), label="账户权益", positive=True)
-    required = xaus_quote.required_margin_usd + xau_quote.required_margin_usd
+    required = sum(
+        (quote.required_margin_usd for quote in quotes),
+        Decimal("0"),
+    )
     print(
-        f"保证金检查：两腿所需≈${required:.4f}，"
+        f"保证金检查：{len(quotes)} 腿所需≈${required:.4f}，"
         f"当前可用抵押依据（账户权益）=${equity:.4f}"
     )
     if equity < required:
         raise SystemExit(
-            f"❌ 可用保证金不足：两腿需要约 ${required:.4f}，账户权益 ${equity:.4f}"
+            f"❌ 可用保证金不足：全部腿需要约 ${required:.4f}，"
+            f"账户权益 ${equity:.4f}"
         )
 
 
 def _print_open_plan(
-    xaus_quote: PreparedQuote,
-    xau_quote: PreparedQuote,
+    structure: CarryStructure | str,
+    quotes: Sequence[PreparedQuote],
 ) -> None:
-    """在任何 accept 前输出完整双腿动作。"""
-    print("swap carry 开仓计划（固定顺序，不可调换）：")
-    print(
-        f"  [1/2] 买入 XAUS {xaus_quote.qty}，"
-        f"名义≈${xaus_quote.notional_usd:.2f}，isolated"
-    )
-    print(
-        f"  [2/2] 卖出 XAU  {xau_quote.qty}，"
-        f"名义≈${xau_quote.notional_usd:.2f}，全仓"
-    )
+    """在任何 accept 前输出完整多腿动作。"""
+    selected = resolve_structure(structure)
+    print(f"swap carry 开仓计划：结构={selected.name}（固定顺序，不可调换）")
+    for index, quote in enumerate(quotes, 1):
+        action = "买入" if quote.side is Side.BUY else "卖出"
+        mode = "isolated" if quote.leg.underlying == "XAUS" else "全仓"
+        print(
+            f"  [{index}/{len(quotes)}] {action} {quote.leg.underlying} "
+            f"{quote.qty}（权重 {quote.leg.weight}），"
+            f"名义≈${quote.notional_usd:.2f}，{mode}"
+        )
     print(
         f"  预计初始保证金合计≈$"
-        f"{xaus_quote.required_margin_usd + xau_quote.required_margin_usd:.4f}"
+        f"{sum((quote.required_margin_usd for quote in quotes), Decimal('0')):.4f}"
     )
 
 
@@ -498,59 +668,111 @@ async def _accept_quote(var: Any, quote: PreparedQuote, *, reduce_only: bool) ->
 async def _confirm_first_leg_qty(
     var: Any,
     expected_qty: Decimal,
+    leg: CarryLeg = XAUS_LEG,
 ) -> Decimal:
     """轮询第一腿实仓数量；持续延迟时按 RFQ 的全量成交数量继续配平。"""
     for attempt in range(1, _CONFIRM_TRIES + 1):
-        position = await _get_position(var, XAUS_LEG)
-        if position.signed_size > 0:
+        position = await _get_position(var, leg)
+        correct_direction = (
+            position.signed_size > 0
+            if leg.open_side is Side.BUY
+            else position.signed_size < 0
+        )
+        if correct_direction:
             print(
-                f"   第 {attempt} 次回读确认 XAUS 成交数量 Q={position.signed_size}"
+                f"   第 {attempt} 次回读确认 {leg.underlying} "
+                f"成交数量 Q={abs(position.signed_size)}"
             )
-            return position.signed_size
-        if position.signed_size < 0:
+            return abs(position.signed_size)
+        if position.signed_size != 0:
             raise RuntimeError(
-                f"XAUS 回读方向异常：{position.signed_size}，停止自动动作并人工检查"
+                f"{leg.underlying} 回读方向异常：{position.signed_size}，"
+                "停止自动动作并人工检查"
             )
         if attempt < _CONFIRM_TRIES:
             await asyncio.sleep(_POLL_DELAY_S)
     print(
-        "⚠️ /positions 在轮询窗口内仍未反映 XAUS 成交；"
+        f"⚠️ /positions 在轮询窗口内仍未反映 {leg.underlying} 成交；"
         f"RFQ accept 已返回成交编号，按已报全量 Q={expected_qty} 继续配平，"
         "禁止据即时零仓误判失败"
     )
     return expected_qty
 
 
-async def _rollback_first_leg(var: Any, qty: Decimal) -> None:
-    """对第一腿执行 reduce_only 回滚；任何失败都升级为人工事故。"""
-    try:
-        payload = await _request_quote(var, XAUS_LEG, Side.SELL, qty)
-        quote = _prepare_quote(XAUS_LEG, Side.SELL, qty, payload)
-        print(f">>> 回滚：reduce_only 卖出 XAUS {qty}，避免留下裸 isolated 腿")
-        result = await _accept_quote(var, quote, reduce_only=True)
-        print(f"   XAUS 已回滚：{_format_result(result)}")
-    except Exception as exc:  # noqa: BLE001 回滚失败必须统一升级，不得继续任何动作
+async def _rollback_opened_legs(
+    var: Any,
+    opened_quotes: Sequence[PreparedQuote],
+) -> None:
+    """按结构顺序逐一 reduce_only 回滚所有已确认开出的腿。"""
+    failures: list[str] = []
+    for opened in opened_quotes:
+        close_side = Side.SELL if opened.side is Side.BUY else Side.BUY
+        try:
+            payload = await _request_quote(
+                var,
+                opened.leg,
+                close_side,
+                opened.qty,
+            )
+            quote = _prepare_quote(
+                opened.leg,
+                close_side,
+                opened.qty,
+                payload,
+                require_margin=False,
+            )
+            print(
+                f">>> 回滚：reduce_only {close_side.value.lower()} "
+                f"{opened.leg.underlying} {opened.qty}"
+            )
+            result = await _accept_quote(var, quote, reduce_only=True)
+            print(
+                f"   {opened.leg.underlying} 已回滚：{_format_result(result)}"
+            )
+        except Exception as exc:  # noqa: BLE001 必须继续尝试回滚其余已开腿
+            failures.append(f"{opened.leg.underlying}: {exc}")
+    if failures:
         message = (
-            "🚨🚨🚨 最高级别告警：第二腿失败且 XAUS reduce_only 回滚失败！\n"
-            f"   回滚错误：{exc}\n"
-            "   已停止一切自动动作，请立即人工处理当前裸 XAUS isolated 仓位。"
+            "🚨🚨🚨 最高级别告警：后续腿失败且已开腿 reduce_only 回滚失败！\n"
+            f"   回滚错误：{'；'.join(failures)}\n"
+            "   已停止一切自动动作，请立即人工处理当前裸仓。"
         )
         print(message)
-        raise SystemExit(message) from exc
+        raise SystemExit(message)
+
+
+async def _rollback_first_leg(var: Any, qty: Decimal) -> None:
+    """保留旧调用入口，并委托给通用多腿回滚。"""
+    await _rollback_opened_legs(
+        var,
+        (
+            PreparedQuote(
+                leg=XAUS_LEG,
+                side=Side.BUY,
+                qty=qty,
+                payload={},
+                execution_price=Decimal("0"),
+                notional_usd=Decimal("0"),
+                initial_margin_ratio=Decimal("0"),
+            ),
+        ),
+    )
 
 
 async def _await_net_delta(
     var: Any,
     tolerance: Decimal,
-) -> tuple[Decimal, Decimal, Decimal]:
-    """轮询最终净 delta，容忍第二腿后的 /positions 最终一致延迟。"""
-    result = await _net_delta(var)
+    structure: CarryStructure | str = XAUS_XAU,
+) -> tuple[Decimal, ...]:
+    """轮询最终净 delta，容忍后续腿的 /positions 最终一致延迟。"""
+    selected = resolve_structure(structure)
+    result = await _net_delta(var, selected)
     for attempt in range(_FLAT_TRIES):
-        if abs(result[2]) <= tolerance and result[0] != 0 and result[1] != 0:
+        if abs(result[-1]) <= tolerance and all(size != 0 for size in result[:-1]):
             return result
         if attempt + 1 < _FLAT_TRIES:
             await asyncio.sleep(_POLL_DELAY_S)
-            result = await _net_delta(var)
+            result = await _net_delta(var, selected)
     return result
 
 
@@ -558,84 +780,146 @@ async def cmd_open(
     var: Any,
     notional: Decimal = DEFAULT_NOTIONAL_USD,
     *,
+    structure: CarryStructure | str = XAUS_XAU,
     yes: bool = False,
     dry_run: bool = False,
     now: datetime | None = None,
 ) -> None:
-    """检查全部前置条件，并按固定顺序开出两腿。"""
+    """检查全部前置条件，并按结构顺序开出所有腿。"""
+    selected = resolve_structure(structure)
     if SWAP_CARRY_KILL_SWITCH.exists():
         raise SystemExit(
             f"❌ kill switch 已激活（{SWAP_CARRY_KILL_SWITCH}），拒绝 open"
         )
     target_notional = _validate_notional(notional)
-    _metadata, _record, schedule = await _load_schedule(var, now=now)
-    _guard_open_schedule(schedule)
+    schedule: SwapTradingSchedule | None = None
+    if selected.has_xaus:
+        _metadata, _record, schedule = await _load_schedule(var, now=now)
+        _guard_open_schedule(schedule)
 
-    xaus_size, xau_size, _net = await _net_delta(var)
-    if xaus_size != 0 or xau_size != 0:
+    initial_positions = await _get_positions(var, selected)
+    if any(not position.is_flat for position in initial_positions.values()):
+        detail = " ".join(
+            f"{leg.underlying}={initial_positions[leg.underlying].signed_size}"
+            for leg in selected.legs
+        )
         raise SystemExit(
-            f"❌ 已有目标持仓（XAUS={xaus_size} XAU={xau_size}），请先处理后再 open"
+            f"❌ 已有目标持仓（{detail}），请先处理后再 open"
         )
 
-    xaus_quote, xau_quote, tolerance = await _prepare_open_quotes(
-        var, target_notional
+    quotes, tolerance = await _prepare_open_quotes(
+        var,
+        target_notional,
+        selected,
     )
-    await _check_margin(var, xaus_quote, xau_quote)
-    _print_open_plan(xaus_quote, xau_quote)
-    print(
-        f"XAUS 距下次休市 {schedule.time_until_close}，"
-        f"休市时刻={schedule.next_close_at.isoformat() if schedule.next_close_at else '无数据'}"
-    )
+    await _check_margin(var, *quotes)
+    _print_open_plan(selected, quotes)
+    if schedule is not None:
+        print(
+            f"XAUS 距下次休市 {schedule.time_until_close}，"
+            "休市时刻="
+            f"{schedule.next_close_at.isoformat() if schedule.next_close_at else '无数据'}"
+        )
 
     if dry_run:
-        print("[DRY-RUN] 全部检查与双腿报价已完成；未调用 accept，不会成交。")
+        print("[DRY-RUN] 全部检查与多腿报价已完成；未调用 accept，不会成交。")
         return
     if not yes:
         print("未提供 --yes：仅完成检查与报价，未调用 accept。确认后请加 --yes。")
         return
 
-    print(f">>> [1/2] 买入受限腿 XAUS {xaus_quote.qty} …")
+    opened: list[PreparedQuote] = []
+    first_quote = quotes[0]
+    print(
+        f">>> [1/{len(quotes)}] {first_quote.side.value.lower()} "
+        f"{first_quote.leg.underlying} {first_quote.qty} …"
+    )
     try:
-        first_result = await _accept_quote(var, xaus_quote, reduce_only=False)
+        first_result = await _accept_quote(var, first_quote, reduce_only=False)
     except VariationalJurisdictionError as exc:
         raise SystemExit(
-            f"❌ XAUS accept 被地区封锁：{exc}\n   需在放行 IP 上执行。"
+            f"❌ {first_quote.leg.underlying} accept 被地区封锁：{exc}\n"
+            "   需在放行 IP 上执行。"
         ) from exc
     except Exception as exc:  # noqa: BLE001 第一腿未确认成交时不得继续
-        raise SystemExit(f"❌ XAUS 第一腿下单失败，已停止：{exc}") from exc
-    print(f"   XAUS accept 成功：{_format_result(first_result)}")
-
-    filled_qty = await _confirm_first_leg_qty(var, xaus_quote.qty)
-    if filled_qty != xau_quote.qty:
-        # RFQ 按设计全量成交；若权威仓位返回不同 Q，则必须按 Q 重新询价第二腿。
-        second_payload = await _request_quote(var, XAU_LEG, Side.SELL, filled_qty)
-        xau_quote = _prepare_quote(XAU_LEG, Side.SELL, filled_qty, second_payload)
-        if xau_quote.notional_usd > MAX_NOTIONAL_USD:
-            print(
-                f"❌ 回读 Q 对应 XAU 名义 ${xau_quote.notional_usd:.2f} 超过硬上限"
-            )
-            await _rollback_first_leg(var, filled_qty)
-            raise SystemExit("第一腿已回滚，未继续第二腿。")
-
-    print(f">>> [2/2] 按成交 Q={filled_qty} 卖出 XAU …")
-    try:
-        second_result = await _accept_quote(var, xau_quote, reduce_only=False)
-        print(f"   XAU accept 成功：{_format_result(second_result)}")
-    except VariationalJurisdictionError as exc:
-        print(f"❌ XAU 第二腿被地区封锁：{exc}；需在放行 IP 上执行。")
-        await _rollback_first_leg(var, filled_qty)
         raise SystemExit(
-            "第二腿被地区封锁，本次 XAUS 已回滚；后续需在放行 IP 上执行。"
+            f"❌ {first_quote.leg.underlying} 第一腿下单失败，已停止：{exc}"
         ) from exc
-    except Exception as exc:  # noqa: BLE001 明确失败统一走第一腿回滚
-        print(f"❌ XAU 第二腿下单失败：{exc}")
-        await _rollback_first_leg(var, filled_qty)
-        raise SystemExit("第二腿失败，本次 XAUS 已回滚，未留下目标裸仓。") from exc
-
-    xaus_size, xau_size, net = await _await_net_delta(var, tolerance)
-    neutral = abs(net) <= tolerance
+    opened.append(first_quote)
     print(
-        f"\n开仓完成：XAUS={xaus_size} XAU={xau_size} 净 delta={net} "
+        f"   {first_quote.leg.underlying} accept 成功："
+        f"{_format_result(first_result)}"
+    )
+
+    try:
+        filled_qty = await _confirm_first_leg_qty(
+            var,
+            first_quote.qty,
+            first_quote.leg,
+        )
+    except Exception as exc:  # noqa: BLE001 首腿回读异常也必须回滚
+        await _rollback_opened_legs(var, opened)
+        raise SystemExit(f"第一腿回读失败，已回滚：{exc}") from exc
+
+    for index, planned_quote in enumerate(quotes[1:], 2):
+        expected_qty = (
+            filled_qty * planned_quote.leg.weight / first_quote.leg.weight
+        )
+        quote = planned_quote
+        try:
+            if expected_qty != planned_quote.qty:
+                payload = await _request_quote(
+                    var,
+                    planned_quote.leg,
+                    planned_quote.side,
+                    expected_qty,
+                )
+                quote = _prepare_quote(
+                    planned_quote.leg,
+                    planned_quote.side,
+                    expected_qty,
+                    payload,
+                )
+                if quote.notional_usd > MAX_NOTIONAL_USD:
+                    raise ValueError(
+                        f"回读 Q 对应名义 ${quote.notional_usd:.2f} 超过硬上限"
+                    )
+            print(
+                f">>> [{index}/{len(quotes)}] 按第一腿成交 Q={filled_qty} "
+                f"{quote.side.value.lower()} {quote.leg.underlying} {quote.qty} …"
+            )
+            result = await _accept_quote(var, quote, reduce_only=False)
+            opened.append(quote)
+            print(
+                f"   {quote.leg.underlying} accept 成功：{_format_result(result)}"
+            )
+        except VariationalJurisdictionError as exc:
+            print(
+                f"❌ {quote.leg.underlying} 第 {index} 腿被地区封锁：{exc}；"
+                "需在放行 IP 上执行。"
+            )
+            await _rollback_opened_legs(var, opened)
+            raise SystemExit(
+                f"第 {index} 腿被地区封锁，已开腿已回滚；"
+                "后续需在放行 IP 上执行。"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 任一后续腿失败都回滚全部已开腿
+            print(f"❌ {quote.leg.underlying} 第 {index} 腿下单失败：{exc}")
+            await _rollback_opened_legs(var, opened)
+            raise SystemExit(
+                f"第 {index} 腿失败，已开腿已回滚，未留下目标裸仓。"
+            ) from exc
+
+    result = await _await_net_delta(var, tolerance, selected)
+    sizes = result[:-1]
+    net = result[-1]
+    neutral = abs(net) <= tolerance
+    detail = " ".join(
+        f"{leg.underlying}={size}"
+        for leg, size in zip(selected.legs, sizes, strict=True)
+    )
+    print(
+        f"\n开仓完成：结构={selected.name} {detail} 净 delta={net} "
         f"{'✅ 近似中性' if neutral else '🚨 有敞口，请立即人工检查'}"
     )
 
@@ -692,6 +976,48 @@ def _swap_long_rate(snapshot: object) -> Decimal:
     return _decimal(value, label="XAUS 多头资金费率")
 
 
+async def _funding_rate_for_leg(var: Any, leg: CarryLeg) -> Decimal:
+    """读取统一口径费率：正数表示多头支付、空头收取。"""
+    if leg.instrument_type == "swap":
+        if leg.open_side is not Side.BUY:
+            raise ValueError("当前只支持读取 swap 多腿费率")
+        signed_long_rate = _swap_long_rate(await var.get_swap_funding(leg.underlying))
+        return -signed_long_rate
+    return _decimal(
+        await var.get_funding_rate(leg.underlying, leg.instrument_type),
+        label=f"{leg.underlying} 永续资金费率",
+    )
+
+
+def _weighted_net_carry(
+    structure: CarryStructure | str,
+    rates: Mapping[str, Decimal],
+) -> Decimal:
+    """按方向和权重计算净 carry，并按单侧中性权重归一化。"""
+    selected = resolve_structure(structure)
+    numerator = sum(
+        (
+            rates[leg.underlying] * leg.weight
+            * (Decimal("1") if leg.open_side is Side.SELL else Decimal("-1"))
+            for leg in selected.legs
+        ),
+        Decimal("0"),
+    )
+    return numerator / selected.neutral_weight
+
+
+async def _load_funding_rates(
+    var: Any,
+    structure: CarryStructure | str,
+) -> dict[str, Decimal]:
+    """按结构顺序读取全部腿的统一口径费率。"""
+    selected = resolve_structure(structure)
+    rates: dict[str, Decimal] = {}
+    for leg in selected.legs:
+        rates[leg.underlying] = await _funding_rate_for_leg(var, leg)
+    return rates
+
+
 def _transfer_underlying(row: Mapping[str, Any]) -> str | None:
     """按真实 /transfers schema 提取 reference_instrument.underlying。"""
     reference = row.get("reference_instrument")
@@ -707,8 +1033,9 @@ async def _settled_funding_by_leg(
     var: Any,
     *,
     since: datetime | None = None,
+    structure: CarryStructure | str = XAUS_XAU,
 ) -> dict[str, Decimal]:
-    """分页读取 /transfers，并按真实已结算 qty 汇总两腿资金费。
+    """分页读取 /transfers，并按真实已结算 qty 汇总结构各腿资金费。
 
     ``since`` 用于面板的本周口径；人工 status 不传时继续展示全部历史。
     """
@@ -716,7 +1043,8 @@ async def _settled_funding_by_leg(
         if since.tzinfo is None:
             raise ValueError("资金费起始时间必须包含时区")
         since = since.astimezone(timezone.utc)
-    totals = {XAUS_LEG.underlying: Decimal("0"), XAU_LEG.underlying: Decimal("0")}
+    selected = resolve_structure(structure)
+    totals = {leg.underlying: Decimal("0") for leg in selected.legs}
     offset = 0
     object_count: int | None = None
     seen = 0
@@ -760,47 +1088,58 @@ async def _settled_funding_by_leg(
         offset += _TRANSFER_PAGE_LIMIT
 
 
-async def cmd_status(var: Any, *, now: datetime | None = None) -> None:
-    """输出仓位、强平、carry、时段及实际已结算资金费快照。"""
+async def cmd_status(
+    var: Any,
+    *,
+    structure: CarryStructure | str = XAUS_XAU,
+    now: datetime | None = None,
+) -> None:
+    """输出结构、仓位、强平、carry 与实际已结算资金费快照。"""
+    selected = resolve_structure(structure)
     observed_at = now or datetime.now(timezone.utc)
     _print_guard_status(observed_at)
-    xaus_position = await _get_position(var, XAUS_LEG)
-    xau_position = await _get_position(var, XAU_LEG)
-    net = xaus_position.signed_size + xau_position.signed_size
-    print("swap carry 状态（目标：多 XAUS + 空 XAU）")
-    if xaus_position.is_flat != xau_position.is_flat:
-        remaining = "XAU" if xaus_position.is_flat else "XAUS"
+    positions = await _get_positions(var, selected)
+    net = _positions_net_delta(selected, positions)
+    print(f"swap carry 状态：结构={selected.name}")
+    flat_legs = [
+        leg.underlying for leg in selected.legs if positions[leg.underlying].is_flat
+    ]
+    if flat_legs and len(flat_legs) != len(selected.legs):
+        remaining = "、".join(
+            leg.underlying
+            for leg in selected.legs
+            if not positions[leg.underlying].is_flat
+        )
         print(
-            f"🚨🚨🚨 单腿裸仓告警：只剩 {remaining} 腿！"
+            f"🚨🚨🚨 缺腿裸仓告警：只剩 {remaining}！"
             "请停止开仓并立即人工处理。"
         )
 
     metadata: object | None = None
     schedule: SwapTradingSchedule | None = None
-    try:
-        metadata, _record, schedule = await _load_schedule(var, now=now)
-    except Exception as exc:  # noqa: BLE001 status 必须保留其他只读信息
-        print(f"⚠️ XAUS 时段元数据读取失败，按不可交易处理：{exc}")
+    if selected.has_xaus:
+        try:
+            metadata, _record, schedule = await _load_schedule(var, now=now)
+        except Exception as exc:  # noqa: BLE001 status 必须保留其他只读信息
+            print(f"⚠️ XAUS 时段元数据读取失败，按不可交易处理：{exc}")
+    else:
+        try:
+            metadata = await var.get_supported_assets()
+        except Exception as exc:  # noqa: BLE001 名义失败不遮蔽仓位
+            print(f"⚠️ 合约元数据读取失败：{exc}")
 
-    xaus_price = _metadata_price(metadata, XAUS_LEG) if metadata is not None else None
-    xau_price = _metadata_price(metadata, XAU_LEG) if metadata is not None else None
-    xaus_notional = (
-        abs(xaus_position.signed_size) * xaus_price if xaus_price is not None else None
-    )
-    xau_notional = (
-        abs(xau_position.signed_size) * xau_price if xau_price is not None else None
-    )
-    print(
-        f"XAUS 数量={xaus_position.signed_size}，名义="
-        f"{'$' + format(xaus_notional, '.2f') if xaus_notional is not None else '无数据'}"
-    )
-    print(
-        f"XAU  数量={xau_position.signed_size}，名义="
-        f"{'$' + format(xau_notional, '.2f') if xau_notional is not None else '无数据'}"
-    )
+    for leg in selected.legs:
+        position = positions[leg.underlying]
+        price = _metadata_price(metadata, leg) if metadata is not None else None
+        notional = abs(position.signed_size) * price if price is not None else None
+        print(
+            f"{leg.underlying:<4} 数量={position.signed_size}，权重={leg.weight}，名义="
+            f"{'$' + format(notional, '.2f') if notional is not None else '无数据'}"
+        )
     print(f"净 delta={net} {'✅ 近似中性' if abs(net) <= XAUS_QTY_STEP else '⚠️ 有敞口'}")
 
-    for leg, position in ((XAUS_LEG, xaus_position), (XAU_LEG, xau_position)):
+    for leg in selected.legs:
+        position = positions[leg.underlying]
         try:
             info = await var.get_liquidation_info(leg.underlying, exact=True)
             text = _format_liquidation(info, position)
@@ -808,44 +1147,47 @@ async def cmd_status(var: Any, *, now: datetime | None = None) -> None:
             text = f"无数据（{exc}）"
         print(f"{leg.underlying} 强平：{text}")
 
-    xaus_rate: Decimal | None = None
-    xau_rate: Decimal | None = None
-    try:
-        xaus_rate = _swap_long_rate(await var.get_swap_funding(XAUS_LEG.underlying))
-        print(f"XAUS 多头当前资金费率={xaus_rate:.4%} 年化")
-    except Exception as exc:  # noqa: BLE001
-        print(f"⚠️ XAUS 资金费率读取失败：{exc}")
-    try:
-        xau_rate = _decimal(
-            await var.get_funding_rate(
-                XAU_LEG.underlying, XAU_LEG.instrument_type
-            ),
-            label="XAU 永续资金费率",
+    rates: dict[str, Decimal] = {}
+    for leg in selected.legs:
+        try:
+            rate = await _funding_rate_for_leg(var, leg)
+            rates[leg.underlying] = rate
+            side_name = "多头" if leg.open_side is Side.BUY else "空头"
+            contribution = rate if leg.open_side is Side.SELL else -rate
+            print(
+                f"{leg.underlying} {side_name}当前资金费率收益="
+                f"{contribution:.4%} 年化"
+            )
+        except Exception as exc:  # noqa: BLE001 单腿失败后继续展示其余腿
+            print(f"⚠️ {leg.underlying} 资金费率读取失败：{exc}")
+    if len(rates) == len(selected.legs):
+        print(
+            f"净 carry={_weighted_net_carry(selected, rates):.4%} "
+            "年化（未扣摩擦）"
         )
-        print(f"XAU 空头当前资金费率收益={xau_rate:.4%} 年化")
-    except Exception as exc:  # noqa: BLE001
-        print(f"⚠️ XAU 资金费率读取失败：{exc}")
-    if xaus_rate is not None and xau_rate is not None:
-        print(f"净 carry={xaus_rate + xau_rate:.4%} 年化（未扣摩擦）")
     else:
         print("净 carry=无数据")
 
-    if schedule is not None:
-        print(
-            f"XAUS 时段={'可交易' if schedule.is_tradable else '不可交易'}；"
-            f"距下次休市={_format_duration(schedule.time_until_close)}；"
-            f"原因={schedule.reason}"
-        )
-    else:
-        print("XAUS 时段=不可交易；距下次休市=无数据")
+    if selected.has_xaus:
+        if schedule is not None:
+            print(
+                f"XAUS 时段={'可交易' if schedule.is_tradable else '不可交易'}；"
+                f"距下次休市={_format_duration(schedule.time_until_close)}；"
+                f"原因={schedule.reason}"
+            )
+        else:
+            print("XAUS 时段=不可交易；距下次休市=无数据")
 
     try:
-        settled = await _settled_funding_by_leg(var)
-        total = settled[XAUS_LEG.underlying] + settled[XAU_LEG.underlying]
+        settled = await _settled_funding_by_leg(var, structure=selected)
+        total = sum(settled.values(), Decimal("0"))
+        detail = "，".join(
+            f"{leg.underlying}={settled[leg.underlying]} USDC"
+            for leg in selected.legs
+        )
         print(
             "累计已结算资金费（/transfers 实际扣款）："
-            f"XAUS={settled[XAUS_LEG.underlying]} USDC，"
-            f"XAU={settled[XAU_LEG.underlying]} USDC，"
+            f"{detail}，"
             f"合计={total} USDC"
         )
     except Exception as exc:  # noqa: BLE001
@@ -917,63 +1259,66 @@ async def _close_position_quote(
     return _prepare_quote(leg, side, qty, payload, require_margin=False)
 
 
-async def _await_flat(var: Any) -> tuple[Decimal, Decimal, Decimal]:
-    """轮询两腿归零，容忍平仓后的 /positions 最终一致延迟。"""
-    result = await _net_delta(var)
+async def _await_flat(
+    var: Any,
+    structure: CarryStructure | str = XAUS_XAU,
+) -> tuple[Decimal, ...]:
+    """轮询结构全部腿归零，容忍平仓后的 /positions 最终一致延迟。"""
+    selected = resolve_structure(structure)
+    result = await _net_delta(var, selected)
     for attempt in range(_FLAT_TRIES):
-        if result[0] == 0 and result[1] == 0:
+        if all(size == 0 for size in result[:-1]):
             return result
         if attempt + 1 < _FLAT_TRIES:
             await asyncio.sleep(_POLL_DELAY_S)
-            result = await _net_delta(var)
+            result = await _net_delta(var, selected)
     return result
 
 
 async def cmd_close(
     var: Any,
     *,
+    structure: CarryStructure | str = XAUS_XAU,
     yes: bool = False,
     dry_run: bool = False,
     now: datetime | None = None,
 ) -> None:
-    """优先平受限 XAUS，再平 XAU；时段元数据异常不阻挡减仓尝试。"""
+    """按结构顺序平全部腿；XAUS 时段元数据异常不阻挡减仓尝试。"""
+    selected = resolve_structure(structure)
     schedule: SwapTradingSchedule | None = None
     market_status: str | None = None
-    try:
-        _metadata, record, schedule = await _load_schedule(var, now=now)
-        market_status = str(record.get("market_status") or "").strip().lower()
-    except Exception as exc:  # noqa: BLE001 平仓不能被元数据缺失阻挡
-        print(f"⚠️ XAUS 时段状态无法确认，但平仓优先，将继续尝试：{exc}")
+    if selected.has_xaus:
+        try:
+            _metadata, record, schedule = await _load_schedule(var, now=now)
+            market_status = str(record.get("market_status") or "").strip().lower()
+        except Exception as exc:  # noqa: BLE001 平仓不能被元数据缺失阻挡
+            print(f"⚠️ XAUS 时段状态无法确认，但平仓优先，将继续尝试：{exc}")
 
-    if market_status and market_status != "open":
-        message = (
-            "⚠️ XAUS 腿此刻平不掉（交易所 market_status 非 open），"
-            "XAU 腿 24/7 可平。为避免自动制造另一条裸腿，本工具未下任何单，"
-            "请人工决定是否单独处理 XAU。"
-        )
-        print(message)
-        raise SystemExit(message)
-    if schedule is not None and not schedule.is_tradable:
-        print(
-            f"⚠️ XAUS 时段守卫报告不可交易（{schedule.reason}），"
-            "但 close 不受开仓守卫阻挡，将继续尝试 reduce_only。"
-        )
+        if market_status and market_status != "open":
+            message = (
+                "⚠️ XAUS 腿此刻平不掉（交易所 market_status 非 open），"
+                "其余腿 24/7 可平。为避免自动制造裸腿，本工具未下任何单，"
+                "请人工决定是否单独处理其他腿。"
+            )
+            print(message)
+            raise SystemExit(message)
+        if schedule is not None and not schedule.is_tradable:
+            print(
+                f"⚠️ XAUS 时段守卫报告不可交易（{schedule.reason}），"
+                "但 close 不受开仓守卫阻挡，将继续尝试 reduce_only。"
+            )
 
-    xaus_position = await _get_position(var, XAUS_LEG)
-    xau_position = await _get_position(var, XAU_LEG)
-    xaus_quote = await _close_position_quote(var, XAUS_LEG, xaus_position)
-    xau_quote = await _close_position_quote(var, XAU_LEG, xau_position)
-    print("swap carry 平仓计划（受限腿优先）：")
-    print(
-        f"  [1/2] XAUS："
-        f"{xaus_quote.side.value.lower() + ' ' + str(xaus_quote.qty) if xaus_quote else '无持仓'}"
-        "，reduce_only"
-    )
-    print(
-        f"  [2/2] XAU ："
-        f"{xau_quote.side.value.lower() + ' ' + str(xau_quote.qty) if xau_quote else '无持仓'}"
-        "，reduce_only"
-    )
+    positions = await _get_positions(var, selected)
+    quotes = [
+        await _close_position_quote(var, leg, positions[leg.underlying])
+        for leg in selected.legs
+    ]
+    print(f"swap carry 平仓计划：结构={selected.name}（结构顺序）：")
+    for index, (leg, quote) in enumerate(zip(selected.legs, quotes, strict=True), 1):
+        action = (
+            f"{quote.side.value.lower()} {quote.qty}" if quote is not None else "无持仓"
+        )
+        print(f"  [{index}/{len(quotes)}] {leg.underlying}：{action}，reduce_only")
 
     if dry_run:
         print("[DRY-RUN] 平仓报价已完成；未调用 accept，不会成交。")
@@ -982,40 +1327,40 @@ async def cmd_close(
         print("未提供 --yes：仅完成平仓报价，未调用 accept。确认后请加 --yes。")
         return
 
-    if xaus_quote is not None:
+    for index, quote in enumerate(quotes, 1):
+        if quote is None:
+            continue
         print(
-            f">>> [1/2] reduce_only {xaus_quote.side.value.lower()} "
-            f"XAUS {xaus_quote.qty} …"
+            f">>> [{index}/{len(quotes)}] reduce_only "
+            f"{quote.side.value.lower()} {quote.leg.underlying} {quote.qty} …"
         )
         try:
-            result = await _accept_quote(var, xaus_quote, reduce_only=True)
-            print(f"   XAUS 平仓 accept 成功：{_format_result(result)}")
+            result = await _accept_quote(var, quote, reduce_only=True)
+            print(
+                f"   {quote.leg.underlying} 平仓 accept 成功："
+                f"{_format_result(result)}"
+            )
         except VariationalJurisdictionError as exc:
             raise SystemExit(
-                f"❌ XAUS 平仓被地区封锁：{exc}\n   需在放行 IP 上执行；已停止平 XAU。"
-            ) from exc
-        except Exception as exc:  # noqa: BLE001 XAUS 未平时不能自动拆 XAU
-            raise SystemExit(f"❌ XAUS 平仓失败：{exc}；已停止平 XAU。") from exc
-
-    if xau_quote is not None:
-        print(
-            f">>> [2/2] reduce_only {xau_quote.side.value.lower()} "
-            f"XAU {xau_quote.qty} …"
-        )
-        try:
-            result = await _accept_quote(var, xau_quote, reduce_only=True)
-            print(f"   XAU 平仓 accept 成功：{_format_result(result)}")
-        except VariationalJurisdictionError as exc:
-            raise SystemExit(
-                f"❌ XAU 平仓被地区封锁：{exc}\n   需在放行 IP 上执行。"
+                f"❌ {quote.leg.underlying} 平仓被地区封锁：{exc}\n"
+                "   需在放行 IP 上执行；已停止后续腿。"
             ) from exc
         except Exception as exc:  # noqa: BLE001
-            raise SystemExit(f"❌ XAU 平仓失败：{exc}，请立即人工检查。") from exc
+            raise SystemExit(
+                f"❌ {quote.leg.underlying} 平仓失败：{exc}，"
+                "已停止后续腿，请立即人工检查。"
+            ) from exc
 
-    xaus_size, xau_size, net = await _await_flat(var)
-    flat = xaus_size == 0 and xau_size == 0
+    result = await _await_flat(var, selected)
+    sizes = result[:-1]
+    net = result[-1]
+    flat = all(size == 0 for size in sizes)
+    detail = " ".join(
+        f"{leg.underlying}={size}"
+        for leg, size in zip(selected.legs, sizes, strict=True)
+    )
     print(
-        f"\n平仓后：XAUS={xaus_size} XAU={xau_size} 净 delta={net} "
+        f"\n平仓后：结构={selected.name} {detail} 净 delta={net} "
         f"{'✅ 均已归零' if flat else '🚨 仍有持仓，请立即人工检查'}"
     )
 
@@ -1025,16 +1370,22 @@ async def _main(args: argparse.Namespace) -> int:
     var = await _load()
     try:
         if args.cmd == "status":
-            await cmd_status(var)
+            await cmd_status(var, structure=args.structure)
         elif args.cmd == "open":
             await cmd_open(
                 var,
                 Decimal(str(args.notional)),
+                structure=args.structure,
                 yes=args.yes,
                 dry_run=args.dry_run,
             )
         elif args.cmd == "close":
-            await cmd_close(var, yes=args.yes, dry_run=args.dry_run)
+            await cmd_close(
+                var,
+                structure=args.structure,
+                yes=args.yes,
+                dry_run=args.dry_run,
+            )
         return 0
     finally:
         await var.close()
@@ -1054,22 +1405,40 @@ def _add_execution_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_structure_flag(parser: argparse.ArgumentParser) -> None:
+    """为命令添加统一具名结构选择。"""
+    parser.add_argument(
+        "--structure",
+        choices=tuple(STRUCTURES),
+        default=DEFAULT_STRUCTURE.name,
+        help=f"carry 结构，默认 {DEFAULT_STRUCTURE.name}",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
     parser = argparse.ArgumentParser(
-        description="Variational XAUS swap / XAU 永续人工 carry 对冲"
+        description="Variational 可配置多腿 swap carry 对冲"
     )
     subparsers = parser.add_subparsers(dest="cmd", required=True)
-    subparsers.add_parser("status", help="查看仓位、强平、资金费与交易时段")
-    open_parser = subparsers.add_parser("open", help="先多 XAUS，再空 XAU")
+    status_parser = subparsers.add_parser(
+        "status", help="查看结构、仓位、强平、资金费与交易时段"
+    )
+    _add_structure_flag(status_parser)
+    open_parser = subparsers.add_parser("open", help="按结构顺序开仓")
+    _add_structure_flag(open_parser)
     open_parser.add_argument(
         "--notional",
         type=Decimal,
         default=DEFAULT_NOTIONAL_USD,
-        help=f"每腿目标名义美元，默认 {DEFAULT_NOTIONAL_USD}，硬上限 {MAX_NOTIONAL_USD}",
+        help=(
+            f"第一腿目标名义美元，默认 {DEFAULT_NOTIONAL_USD}，"
+            f"任一腿硬上限 {MAX_NOTIONAL_USD}"
+        ),
     )
     _add_execution_flags(open_parser)
-    close_parser = subparsers.add_parser("close", help="先平 XAUS，再平 XAU")
+    close_parser = subparsers.add_parser("close", help="按结构顺序平仓")
+    _add_structure_flag(close_parser)
     _add_execution_flags(close_parser)
     return parser
 

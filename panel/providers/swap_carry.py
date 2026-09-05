@@ -1,4 +1,4 @@
-"""Swap carry provider：只读采集 XAUS 多腿与 XAU 空腿状态。"""
+"""Swap carry provider：按当前具名结构只读采集多腿状态。"""
 
 from __future__ import annotations
 
@@ -17,9 +17,13 @@ from tools import run_swap_carry_guard as guard
 NAME = "Swap Carry（XAUS/XAU）"
 
 
-def _leg_value(size: Decimal, notional: Decimal | None) -> str:
-    """格式化单腿数量与绝对名义。"""
-    value = f"{size:+.5f}"
+def _leg_value(
+    size: Decimal,
+    notional: Decimal | None,
+    weight: Decimal,
+) -> str:
+    """格式化单腿权重、数量与绝对名义。"""
+    value = f"权重={weight} / {size:+.5f}"
     if notional is not None:
         value += f" / ${notional:,.2f}"
     else:
@@ -139,24 +143,34 @@ def _week_start(observed_at: datetime) -> datetime:
     return midnight - timedelta(days=midnight.weekday())
 
 
-def _funding_value(settled: Mapping[str, Decimal]) -> str:
-    """格式化两腿本周实际结算扣款。"""
-    xaus = settled[carry.XAUS_LEG.underlying]
-    xau = settled[carry.XAU_LEG.underlying]
-    total = xaus + xau
-    return f"XAUS {xaus:+.2f} / XAU {xau:+.2f} / 合计 {total:+.2f} USDC"
+def _funding_value(
+    settled: Mapping[str, Decimal],
+    structure: carry.CarryStructure | str,
+) -> str:
+    """按结构顺序格式化本周各腿实际结算扣款。"""
+    selected = carry.resolve_structure(structure)
+    total = sum(
+        (settled[leg.underlying] for leg in selected.legs),
+        Decimal("0"),
+    )
+    details = " / ".join(
+        f"{leg.underlying} {settled[leg.underlying]:+.2f}"
+        for leg in selected.legs
+    )
+    return f"{details} / 合计 {total:+.2f} USDC"
 
 
 async def _collect(
     client: Any,
     *,
+    structure: carry.CarryStructure | str,
     heartbeat_path: Path,
     state_path: Path,
     observed_at: datetime,
 ) -> SystemStatus:
     """执行一轮只读采集；账户仓位是卡片成立所需的核心数据。"""
-    xaus_position = await carry._get_position(client, carry.XAUS_LEG)
-    xau_position = await carry._get_position(client, carry.XAU_LEG)
+    selected = carry.resolve_structure(structure)
+    positions = await carry._get_positions(client, selected)
 
     alive, heartbeat_metric, heartbeat_alert = _read_heartbeat(
         heartbeat_path,
@@ -164,98 +178,79 @@ async def _collect(
     )
     alerts = [alert for alert in (heartbeat_alert, _guard_alert(state_path)) if alert]
 
-    single_leg = xaus_position.is_flat != xau_position.is_flat
-    if single_leg:
-        remaining = "XAU" if xaus_position.is_flat else "XAUS"
+    open_legs = [
+        leg for leg in selected.legs if not positions[leg.underlying].is_flat
+    ]
+    missing_legs = 0 < len(open_legs) < len(selected.legs)
+    if missing_legs:
+        remaining = "、".join(leg.underlying for leg in open_legs)
         alerts.append(
             PanelAlert(
                 key="swap_carry_single_leg",
                 level="critical",
-                title=f"Swap carry 单腿裸仓：只剩 {remaining}",
-                action="停止新增仓位并立即人工恢复对冲或安全减掉剩余单腿",
+                title=f"Swap carry 缺腿裸仓：只剩 {remaining}",
+                action="停止新增仓位并立即人工恢复对冲或安全减掉全部剩余腿",
             )
         )
 
     metadata: object | None = None
     schedule = None
-    try:
-        metadata, _record, schedule = await carry._load_schedule(
-            client,
-            now=observed_at,
+    if selected.has_xaus:
+        try:
+            metadata, _record, schedule = await carry._load_schedule(
+                client,
+                now=observed_at,
+            )
+        except Exception:  # noqa: BLE001 时段和名义独立降级
+            pass
+
+    notionals: dict[str, Decimal | None] = {}
+    for leg in selected.legs:
+        price = (
+            carry._metadata_price(metadata, leg)
+            if metadata is not None
+            else None
         )
-    except Exception:  # noqa: BLE001 时段和名义独立降级
-        pass
+        notionals[leg.underlying] = (
+            abs(positions[leg.underlying].signed_size) * price
+            if price is not None
+            else None
+        )
 
-    xaus_price = (
-        carry._metadata_price(metadata, carry.XAUS_LEG)
-        if metadata is not None
-        else None
-    )
-    xau_price = (
-        carry._metadata_price(metadata, carry.XAU_LEG)
-        if metadata is not None
-        else None
-    )
-    xaus_notional = (
-        abs(xaus_position.signed_size) * xaus_price
-        if xaus_price is not None
-        else None
-    )
-    xau_notional = (
-        abs(xau_position.signed_size) * xau_price
-        if xau_price is not None
-        else None
-    )
-
-    net_delta = xaus_position.signed_size + xau_position.signed_size
+    net_delta = carry._positions_net_delta(selected, positions)
     net_tone = "good" if abs(net_delta) <= carry.XAUS_QTY_STEP else "bad"
 
-    xaus_liquidation, xaus_distance = await _liquidation_metric(
-        client,
-        label="XAUS 强平",
-        underlying=carry.XAUS_LEG.underlying,
-        position=xaus_position,
-    )
-    xau_liquidation, _xau_distance = await _liquidation_metric(
-        client,
-        label="XAU 强平",
-        underlying=carry.XAU_LEG.underlying,
-        position=xau_position,
-    )
-    if (
-        xaus_distance is not None
-        and xaus_distance < guard.LIQUIDATION_ALERT_RATIO
-    ):
+    liquidation_metrics: list[Metric] = []
+    xaus_distance: Decimal | None = None
+    for leg in selected.legs:
+        metric, distance = await _liquidation_metric(
+            client,
+            label=f"{leg.underlying} 强平",
+            underlying=leg.underlying,
+            position=positions[leg.underlying],
+        )
+        liquidation_metrics.append(metric)
+        if leg.underlying == "XAUS":
+            xaus_distance = distance
+    if xaus_distance is not None and xaus_distance < guard.LIQUIDATION_ALERT_RATIO:
         alerts.append(
             PanelAlert(
                 key="swap_carry_xaus_liquidation",
                 level="critical",
                 title=f"XAUS 强平距离仅 {xaus_distance:.2%}",
-                action="立即人工核对保证金，并优先安全减小 XAUS 与 XAU 两腿仓位",
+                action="立即人工核对保证金，并按结构顺序安全减小各腿仓位",
             )
         )
 
-    xaus_rate: Decimal | None = None
-    xau_rate: Decimal | None = None
-    try:
-        xaus_rate = carry._swap_long_rate(
-            await client.get_swap_funding(carry.XAUS_LEG.underlying)
-        )
-    except Exception:  # noqa: BLE001 单项失败后仍继续读取 XAU
-        pass
-    try:
-        xau_rate = carry._decimal(
-            await client.get_funding_rate(
-                carry.XAU_LEG.underlying,
-                carry.XAU_LEG.instrument_type,
-            ),
-            label="XAU 永续资金费率",
-        )
-    except Exception:  # noqa: BLE001 单项失败只令净 carry 无数据
-        pass
+    rates: dict[str, Decimal] = {}
+    for leg in selected.legs:
+        try:
+            rates[leg.underlying] = await carry._funding_rate_for_leg(client, leg)
+        except Exception:  # noqa: BLE001 单腿失败只令净 carry 无数据
+            continue
     net_carry = (
-        xaus_rate + xau_rate
-        if xaus_rate is not None and xau_rate is not None
+        carry._weighted_net_carry(selected, rates)
+        if len(rates) == len(selected.legs)
         else None
     )
     if net_carry is not None and net_carry < 0:
@@ -264,7 +259,7 @@ async def _collect(
                 key="swap_carry_negative_carry",
                 level="warning",
                 title=f"Swap carry 已转负至 {net_carry:.1%}/年",
-                action="停止加仓并人工复核两腿资金费；确认持续为负后择机平掉双腿",
+                action="停止加仓并人工复核各腿资金费；确认持续为负后择机平掉结构",
             )
         )
 
@@ -272,8 +267,12 @@ async def _collect(
         settled = await carry._settled_funding_by_leg(
             client,
             since=_week_start(observed_at),
+            structure=selected,
         )
-        funding_metric = Metric("本周已结算资金费", _funding_value(settled))
+        funding_metric = Metric(
+            "本周已结算资金费",
+            _funding_value(settled, selected),
+        )
     except Exception:  # noqa: BLE001 资金费失败不遮蔽仓位与风险
         funding_metric = Metric("本周已结算资金费", "无数据")
 
@@ -282,22 +281,41 @@ async def _collect(
     else:
         carry_value = f"{net_carry:+.1%}"
 
-    metrics = [
-        Metric("XAUS 多腿", _leg_value(xaus_position.signed_size, xaus_notional)),
-        Metric("XAU 空腿", _leg_value(xau_position.signed_size, xau_notional)),
+    metrics = [Metric("当前结构", selected.name)]
+    metrics.extend(
+        Metric(
+            f"{leg.underlying} {'多腿' if leg.open_side is carry.Side.BUY else '空腿'}",
+            _leg_value(
+                positions[leg.underlying].signed_size,
+                notionals[leg.underlying],
+                leg.weight,
+            ),
+        )
+        for leg in selected.legs
+    )
+    metrics.extend([
         Metric("净 delta", f"{net_delta:+.5f}", net_tone),
         Metric("净 carry 年化", carry_value, _carry_tone(net_carry)),
-        xaus_liquidation,
-        xau_liquidation,
-        _schedule_metric(schedule),
+        *liquidation_metrics,
+    ])
+    if selected.has_xaus:
+        metrics.append(_schedule_metric(schedule))
+    metrics.extend([
         heartbeat_metric,
         funding_metric,
-    ]
+    ])
 
-    if single_leg:
-        summary = "单腿持仓，需立即处理"
-    elif xaus_position.is_flat and xau_position.is_flat:
-        summary = "空仓，可交易" if schedule is not None and schedule.is_tradable else "空仓，等待开市"
+    if missing_legs:
+        summary = "缺腿持仓，需立即处理"
+    elif not open_legs:
+        if selected.has_xaus:
+            summary = (
+                "空仓，可交易"
+                if schedule is not None and schedule.is_tradable
+                else "空仓，等待开市"
+            )
+        else:
+            summary = "空仓，24/7 可交易"
     elif net_carry is None:
         summary = "持仓中，净 carry 无数据"
     else:
@@ -315,6 +333,7 @@ async def _collect(
 def collect(
     *,
     client: Any | None = None,
+    structure: carry.CarryStructure | str = carry.XAUS_XAU,
     heartbeat_path: Path = carry.SWAP_CARRY_GUARD_HEARTBEAT,
     state_path: Path = carry.SWAP_CARRY_GUARD_STATE,
     now: datetime | None = None,
@@ -331,6 +350,7 @@ def collect(
         try:
             return await _collect(
                 client,
+                structure=structure,
                 heartbeat_path=heartbeat_path,
                 state_path=state_path,
                 observed_at=observed_at.astimezone(timezone.utc),

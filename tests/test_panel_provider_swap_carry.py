@@ -221,10 +221,10 @@ def test_normal_position_reports_all_metrics_and_weekly_actual_funding(tmp_path)
     assert status.error is None
     assert status.summary == "持仓中，净 carry +8.2%/年"
     assert (metrics["XAUS 多腿"].value, metrics["XAUS 多腿"].tone) == (
-        "+0.01250 / $50.00",
+        "权重=1 / +0.01250 / $50.00",
         "normal",
     )
-    assert metrics["XAU 空腿"].value == "-0.01250 / $50.00"
+    assert metrics["XAU 空腿"].value == "权重=1 / -0.01250 / $50.00"
     assert (metrics["净 delta"].value, metrics["净 delta"].tone) == (
         "+0.00000",
         "good",

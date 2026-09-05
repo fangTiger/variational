@@ -58,6 +58,38 @@ def _metadata(*, market_status: str = "open") -> dict[str, object]:
     }
 
 
+def _margin_requirements(
+    *,
+    bid_initial: Decimal,
+    ask_initial: Decimal,
+    margin_mode: str | None = None,
+) -> dict[str, object]:
+    """按真实 indicative quote schema 构造保证金字段。"""
+    requirements: dict[str, object] = {
+        "existing_margin": {
+            "initial_margin": "89.252347",
+            "maintenance_margin": "44.626173",
+        },
+        "bid_margin_delta": {
+            "initial_margin": str(bid_initial),
+            "maintenance_margin": str(bid_initial / Decimal("2")),
+        },
+        "ask_margin_delta": {
+            "initial_margin": str(ask_initial),
+            "maintenance_margin": str(ask_initial / Decimal("2")),
+        },
+        "bid_max_notional_delta": "1000000",
+        "ask_max_notional_delta": "1000000",
+        "estimated_fees_bid": "0",
+        "estimated_fees_ask": "0",
+        "estimated_liquidation_price_bid": "3500",
+        "estimated_liquidation_price_ask": "4500",
+    }
+    if margin_mode is not None:
+        requirements["margin_mode"] = margin_mode
+    return requirements
+
+
 class StrictFakeVariational:
     """仅执行显式配置的调用；任何漏配都立即失败。"""
 
@@ -142,10 +174,11 @@ class StrictFakeVariational:
             },
         }
         if self.include_quote_margin:
-            result["margin_requirements"] = {
-                "initial_margin": "0.05",
-                "margin_mode": "isolated" if underlying == "XAUS" else "cross",
-            }
+            result["margin_requirements"] = _margin_requirements(
+                bid_initial=qty * Decimal("3999") * Decimal("0.05"),
+                ask_initial=qty * Decimal("4001") * Decimal("0.05"),
+                margin_mode="isolated" if underlying == "XAUS" else None,
+            )
         return result
 
     async def get_balance(self) -> object:
@@ -444,7 +477,7 @@ def test_status_warns_loudly_when_only_one_leg_remains(capsys) -> None:
 
     output = capsys.readouterr().out
     assert "🚨" in output
-    assert "单腿" in output
+    assert "缺腿裸仓告警" in output
     assert "XAUS" in output
 
 
@@ -466,6 +499,75 @@ def test_open_rejects_when_equity_cannot_cover_both_initial_margins() -> None:
         )
 
     assert client.accept_calls == []
+
+
+def test_initial_margin_ratio_uses_real_directional_margin_delta_schema() -> None:
+    """保证金率必须由真实方向金额除以本腿名义得到，不能回退默认比例。"""
+    from tools import hedge_swap_carry
+
+    requirements = _margin_requirements(
+        bid_initial=Decimal("63.207623"),
+        ask_initial=Decimal("110.956"),
+    )
+    payload = {"margin_requirements": requirements}
+
+    assert "initial_margin" not in requirements
+    buy_ratio = hedge_swap_carry._initial_margin_ratio(
+        payload,
+        Side.BUY,
+        Decimal("0.5") * Decimal("4438.93"),
+    )
+    sell_ratio = hedge_swap_carry._initial_margin_ratio(
+        payload,
+        Side.SELL,
+        Decimal("0.5") * Decimal("4423.35"),
+    )
+
+    assert f"{buy_ratio:.3%}" == "4.999%"
+    assert f"{sell_ratio:.3%}" == "2.858%"
+    assert buy_ratio != Decimal("0.05")
+    assert sell_ratio != Decimal("0.05")
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({}, "margin_requirements"),
+        (
+            {"margin_requirements": {"initial_margin": "0.05"}},
+            "ask_margin_delta",
+        ),
+        (
+            {
+                "margin_requirements": {
+                    "ask_margin_delta": {"initial_margin": "非法值"}
+                }
+            },
+            "不是有效十进制数",
+        ),
+        (
+            {
+                "margin_requirements": {
+                    "ask_margin_delta": {"initial_margin": "101"}
+                }
+            },
+            "不超过 1",
+        ),
+    ],
+)
+def test_initial_margin_ratio_rejects_missing_invalid_and_over_one(
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    """开仓不得用旧顶层字段或默认值掩盖方向保证金字段异常。"""
+    from tools import hedge_swap_carry
+
+    with pytest.raises(ValueError, match=message):
+        hedge_swap_carry._initial_margin_ratio(
+            payload,
+            Side.BUY,
+            Decimal("100"),
+        )
 
 
 def test_leg_descriptors_are_fixed_to_xaus_long_then_xau_short() -> None:
@@ -577,8 +679,8 @@ def test_status_reports_liquidation_carry_schedule_and_actual_transfers(capsys) 
     asyncio.run(hedge_swap_carry.cmd_status(client, now=OPEN_NOW))
 
     output = capsys.readouterr().out
-    assert "XAUS 数量=0.0125，名义=$50.00" in output
-    assert "XAU  数量=-0.0125，名义=$50.00" in output
+    assert "XAUS 数量=0.0125，权重=1，名义=$50.00" in output
+    assert "XAU  数量=-0.0125，权重=1，名义=$50.00" in output
     assert "净 delta=0.0000" in output
     assert "XAUS 强平：无数据" in output
     assert "XAU 强平：强平价=4500" in output
