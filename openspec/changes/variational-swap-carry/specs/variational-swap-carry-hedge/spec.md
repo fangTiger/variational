@@ -258,6 +258,32 @@ SHALL NOT 自动开反向仓。
 - **THEN** 对含 XAUS 的目标结构，仅在 XAUS 当前可交易、距下次休市超过 2 小时、净 carry 不低于 5% 年化、
   可用保证金足够、kill switch 不存在且当日尝试未达上限时尝试开仓
 - **AND** 任一条件缺失或不可读时跳过并记录明确原因
+
+### Requirement: Variational 会话到期预警
+系统 SHALL 从当前会话 Cookie 的 `vr-token` JWT payload 只读解析 `exp`，
+SHALL NOT 校验签名或输出 token 值。无后缀 token 优先；仅存在钱包后缀 token 时，
+系统 SHALL 只读取与当前钱包地址匹配的值。解析失败 SHALL 降级为无数据而不抛异常。
+
+#### Scenario: 会话进入 24 小时预警窗口
+- **WHEN** 会话剩余时间小于 24 小时且不少于 6 小时
+- **THEN** 守护进程把 UTC 到期时间和剩余小时写入心跳与审计
+- **AND** 弹 macOS 本地通知，同类通知每两小时最多一次
+
+#### Scenario: 会话进入 6 小时严重窗口
+- **WHEN** 会话剩余时间小于 6 小时
+- **THEN** 守护进程每轮弹 macOS 本地通知
+- **AND** 审计记录标记为 `critical`
+
+#### Scenario: 会话已经过期
+- **WHEN** JWT 的 `exp` 不晚于当前时间
+- **THEN** 守护进程拒绝自动开仓与结构切换，并写明「会话已过期，需人工刷新 Cookie」
+- **AND** 不得仅因会话过期触发平仓或调用交易 API
+
+#### Scenario: 面板显示剩余时间
+- **WHEN** 面板读取守护心跳
+- **THEN** 显示会话剩余小时，并按 `>48h`、`24~48h`、`6~24h`、`<6h` 分别使用
+  `good`、`normal`、`warn`、`bad` 色调
+- **AND** 小于 6 小时或已过期时产出 `critical` 告警和 Cookie 重新导出指引
 - **AND** 每腿默认名义为 $2,000，可由命令行或 `AUTO_OPEN_NOTIONAL_USD` 覆盖，
   且不得超过执行器的 $3,000 硬上限
 
@@ -302,6 +328,27 @@ SHALL NOT 自动开反向仓。
 - **AND** 心跳记录本轮是否尝试开仓、开仓结论与当日已尝试次数
 - **AND** 追加 JSONL 审计记录
 - **AND** `hedge_swap_carry status` 置顶显示心跳年龄，超过 15 分钟时标红
+
+### Requirement: 面板按守护心跳解释当前结构
+面板 SHALL 只使用守护进程心跳的合法 `structure` 字段解释 carry 持仓，
+SHALL NOT 使用模块默认结构猜测腿方向或判定缺腿。面板 SHALL 从 `/positions`
+读取全账户持仓，并忽略属于 timed_volume 策略的 BTC 持仓对 carry 告警的影响。
+
+#### Scenario: 心跳结构合法
+- **WHEN** 心跳的 `structure` 是已定义的 carry 结构
+- **THEN** 面板按该结构标注多空腿并判定缺腿裸仓
+- **AND** 不得因旧默认结构与真实结构不同而产生缺腿告警
+
+#### Scenario: 心跳结构不可用
+- **WHEN** 心跳缺失、没有 `structure` 字段或该字段不是合法结构
+- **THEN** 面板显示「结构未知（守护心跳不可用）」并按 `/positions` 原样列出全部实际持仓
+- **AND** 只产出 warning 级结构告警，动作指引为检查守护进程是否在运行
+- **AND** 不得猜测腿方向或产出缺腿裸仓告警
+
+#### Scenario: 存在结构外残留腿
+- **WHEN** 合法心跳结构之外仍有非零、非 BTC 的账户持仓
+- **THEN** 面板展示该实际持仓并产出 critical 级残留腿告警
+- **AND** BTC 持仓可以展示，但不得触发 carry 结构告警
 
 #### Scenario: dry-run
 - **WHEN** 使用 `--dry-run`

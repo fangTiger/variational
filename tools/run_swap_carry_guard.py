@@ -23,9 +23,11 @@ from typing import Any, Mapping, Sequence  # noqa: E402
 
 from adapters.base import Position, Side  # noqa: E402
 from adapters.variational_client import (  # noqa: E402
+    SessionExpiry,
     VariationalAuthError,
     VariationalJurisdictionError,
     VariationalRequestError,
+    get_session_expiry,
 )
 from engine.swap_trading_schedule import (  # noqa: E402
     SwapTradingSchedule,
@@ -55,6 +57,9 @@ MAX_DAILY_OPEN_ATTEMPTS = 20
 SWITCH_LEAD_TIME = timedelta(minutes=60)
 EXIT_CARRY_ANNUAL = Decimal("0")
 EXIT_CARRY_CONSECUTIVE_ROUNDS = 3
+SESSION_WARNING_THRESHOLD = timedelta(hours=24)
+SESSION_CRITICAL_THRESHOLD = timedelta(hours=6)
+SESSION_WARNING_COOLDOWN = timedelta(hours=2)
 
 
 @dataclass(frozen=True)
@@ -133,6 +138,10 @@ class CloseActionError(RuntimeError):
     """有限次数重试后仍无法完成的平仓错误。"""
 
 
+class _SessionExpiredPreflight(RuntimeError):
+    """会话已过期，必须在任何账户或交易调用前结束本轮。"""
+
+
 def _json_default(value: object) -> str:
     """把审计载荷中的时间和十进制数稳定转换为字符串。"""
     if isinstance(value, datetime):
@@ -197,6 +206,69 @@ def _read_exit_carry_rounds(path: Path) -> int:
         return 0
 
 
+def _read_session_alert_at(path: Path) -> datetime | None:
+    """读取跨进程通知冷却时间；损坏值按从未通知处理。"""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = payload.get("last_session_expiry_alert_at")
+        if not isinstance(raw, str):
+            return None
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _warn_session_expiry(
+    expiry: SessionExpiry | None,
+    *,
+    observed_at: datetime,
+    previous_alert_at: datetime | None,
+    audit_path: Path,
+) -> datetime | None:
+    """按剩余时间弹本地通知，并为普通预警应用持久化冷却。"""
+    if expiry is None or expiry.remaining >= SESSION_WARNING_THRESHOLD:
+        return previous_alert_at
+
+    expired = expiry.remaining <= timedelta(0)
+    critical = expiry.remaining < SESSION_CRITICAL_THRESHOLD
+    should_notify = critical or previous_alert_at is None
+    if not should_notify and previous_alert_at is not None:
+        should_notify = observed_at - previous_alert_at >= SESSION_WARNING_COOLDOWN
+
+    if expired:
+        title = "Swap carry 会话已过期"
+        message = "会话已过期，需人工刷新 Cookie"
+    else:
+        title = "Swap carry 会话即将过期"
+        message = (
+            f"Variational 会话剩余 {expiry.hours_left:.1f} 小时；"
+            "请按文档重新导出 Cookie"
+        )
+
+    notification_sent = False
+    if should_notify:
+        notification_sent = notify(title, message)
+        previous_alert_at = observed_at
+
+    _append_audit(
+        audit_path,
+        {
+            "timestamp": observed_at,
+            "event": "session_expiry_warning",
+            "level": "critical" if critical else "warning",
+            "message": message,
+            "session_expires_at": expiry.expires_at.isoformat(),
+            "session_hours_left": expiry.hours_left,
+            "notification_attempted": should_notify,
+            "notification_sent": notification_sent,
+        },
+    )
+    return previous_alert_at
+
+
 def _state_payload(
     *,
     observed_at: datetime,
@@ -207,6 +279,7 @@ def _state_payload(
     daily_open_attempts: int = 0,
     auto_open_incident: bool = False,
     exit_carry_consecutive_rounds: int = 0,
+    last_session_expiry_alert_at: datetime | None = None,
 ) -> dict[str, object]:
     """构造供人工 status 置顶显示的显著状态。"""
     return {
@@ -218,6 +291,11 @@ def _state_payload(
         "daily_open_attempts": daily_open_attempts,
         "auto_open_incident": auto_open_incident,
         "exit_carry_consecutive_rounds": exit_carry_consecutive_rounds,
+        "last_session_expiry_alert_at": (
+            last_session_expiry_alert_at.isoformat()
+            if last_session_expiry_alert_at is not None
+            else None
+        ),
     }
 
 
@@ -1308,11 +1386,30 @@ async def run_once(
     if observed_at.tzinfo is None:
         raise ValueError("now 必须包含时区")
     observed_at = observed_at.astimezone(timezone.utc)
+    session_expiry = get_session_expiry(now=observed_at)
+    session_expires_at = (
+        session_expiry.expires_at.isoformat()
+        if session_expiry is not None
+        else None
+    )
+    session_hours_left = (
+        session_expiry.hours_left if session_expiry is not None else None
+    )
+    session_is_expired = (
+        session_expiry is not None
+        and session_expiry.remaining <= timedelta(0)
+    )
     previous_failures = _read_failure_count(state_path)
     daily_open_attempts, auto_open_incident = _read_auto_open_state(
         state_path, observed_at
     )
     exit_carry_rounds = _read_exit_carry_rounds(state_path)
+    last_session_expiry_alert_at = _warn_session_expiry(
+        session_expiry,
+        observed_at=observed_at,
+        previous_alert_at=_read_session_alert_at(state_path),
+        audit_path=audit_path,
+    )
     consecutive_failures = previous_failures
     conclusion = "本轮尚未完成"
     auto_open_attempted = False
@@ -1323,7 +1420,9 @@ async def run_once(
     )
     result_code = 1
     positions: dict[str, Position] = {}
-    prices: dict[str, Decimal | None] = {}
+    prices: dict[str, Decimal | None] = {
+        leg.underlying: None for leg in configured_structure.legs
+    }
     portfolio_positions: dict[str, Position] = {}
     account_positions_payload: object | None = None
     current_structure: execution.CarryStructure | None = None
@@ -1363,6 +1462,7 @@ async def run_once(
                 daily_open_attempts=daily_open_attempts,
                 auto_open_incident=auto_open_incident,
                 exit_carry_consecutive_rounds=exit_carry_rounds,
+                last_session_expiry_alert_at=last_session_expiry_alert_at,
             ),
         )
 
@@ -1381,9 +1481,13 @@ async def run_once(
             "daily_open_attempts": daily_open_attempts,
             "auto_open_incident": auto_open_incident,
             "exit_carry_consecutive_rounds": exit_carry_rounds,
+            "session_expires_at": session_expires_at,
+            "session_hours_left": session_hours_left,
         },
     )
     try:
+        if session_is_expired:
+            raise _SessionExpiredPreflight
         if auto_switch:
             account_positions_payload = await var.get_positions()
             portfolio_positions = _carry_positions_from_payload(
@@ -1991,6 +2095,13 @@ async def run_once(
                     "pending_xaus_close", conclusion, consecutive_failures
                 )
                 result_code = 1
+    except _SessionExpiredPreflight:
+        consecutive_failures = previous_failures + 1
+        conclusion = "会话已过期，需人工刷新 Cookie"
+        auto_open_conclusion = f"{conclusion}；禁止自动开仓"
+        auto_switch_conclusion = f"{conclusion}；禁止自动切换"
+        persist_state("session_expired", conclusion, consecutive_failures)
+        result_code = 1
     except (VariationalJurisdictionError, VariationalAuthError) as exc:
         consecutive_failures = previous_failures + 1
         category = (
@@ -2012,14 +2123,17 @@ async def run_once(
         result_code = 1
     finally:
         # 成交或部分失败后重新读仓，令心跳反映本轮结束时的真实快照。
-        try:
-            positions = await execution._get_positions(var, selected)
-        except Exception as exc:  # noqa: BLE001 心跳仍需保存其他已知字段
-            conclusion = f"{conclusion}；结束读仓失败：{type(exc).__name__}: {exc}"
+        if not session_is_expired:
+            try:
+                positions = await execution._get_positions(var, selected)
+            except Exception as exc:  # noqa: BLE001 心跳仍需保存其他已知字段
+                conclusion = (
+                    f"{conclusion}；结束读仓失败：{type(exc).__name__}: {exc}"
+                )
 
         notionals = {
             leg.underlying: _position_notional(
-                positions.get(leg.underlying), prices[leg.underlying]
+                positions.get(leg.underlying), prices.get(leg.underlying)
             )
             for leg in selected.legs
         }
@@ -2110,6 +2224,8 @@ async def run_once(
             "target_structure": (
                 target_structure.name if target_structure is not None else None
             ),
+            "session_expires_at": session_expires_at,
+            "session_hours_left": session_hours_left,
         }
         _write_json(heartbeat_path, heartbeat)
         _append_audit(

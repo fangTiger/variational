@@ -10,12 +10,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any
@@ -77,6 +79,19 @@ class VariationalBalance:
     equity: Decimal
     balance: Decimal
     upnl: Decimal
+
+
+@dataclass(frozen=True)
+class SessionExpiry:
+    """从会话 JWT 声明读取的到期信息。"""
+
+    expires_at: datetime
+    remaining: timedelta
+
+    @property
+    def hours_left(self) -> float:
+        """返回带小数的剩余小时数；已过期时为负数。"""
+        return self.remaining.total_seconds() / 3600
 
 
 @dataclass(frozen=True)
@@ -1074,6 +1089,70 @@ def _parse_cookie_header(cookie_str: str) -> dict[str, str]:
             k, v = part.split("=", 1)
             out[k.strip()] = v.strip()
     return out
+
+
+def get_session_expiry(
+    cookies: Mapping[str, str] | str | None = None,
+    *,
+    wallet_address: str | None = None,
+    now: datetime | None = None,
+) -> SessionExpiry | None:
+    """只读解析 Variational 会话 JWT 的 ``exp`` 声明。
+
+    不进行签名校验，因为本地进程不是令牌验证方。任何 Cookie、JWT、JSON 或
+    时间戳格式问题都降级为 ``None``，且本函数不会记录凭证内容。
+    """
+    try:
+        source = os.getenv("VARIATIONAL_COOKIE", "") if cookies is None else cookies
+        parsed = _parse_cookie_header(source) if isinstance(source, str) else source
+        if not isinstance(parsed, Mapping):
+            return None
+
+        # 新会话使用无后缀名称；只要它存在，就不得回退到可能已过期的旧值。
+        if "vr-token" in parsed:
+            token = parsed.get("vr-token")
+        else:
+            wallet = (
+                wallet_address
+                if wallet_address is not None
+                else os.getenv("VARIATIONAL_WALLET_ADDRESS", "")
+            ).strip().lower()
+            token = None
+            if wallet:
+                expected_name = f"vr-token-{wallet}"
+                for name, value in parsed.items():
+                    if name.lower() == expected_name:
+                        token = value
+                        break
+
+        if not isinstance(token, str) or not token:
+            return None
+        segments = token.split(".")
+        if len(segments) != 3 or not segments[1]:
+            return None
+        padding = "=" * (-len(segments[1]) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode(segments[1] + padding).decode("utf-8")
+        )
+        if not isinstance(payload, dict):
+            return None
+        raw_exp = payload.get("exp")
+        if isinstance(raw_exp, bool):
+            return None
+        exp = Decimal(str(raw_exp))
+        if not exp.is_finite():
+            return None
+        expires_at = datetime.fromtimestamp(float(exp), tz=timezone.utc)
+        observed_at = now or datetime.now(timezone.utc)
+        if observed_at.tzinfo is None:
+            return None
+        observed_at = observed_at.astimezone(timezone.utc)
+        return SessionExpiry(
+            expires_at=expires_at,
+            remaining=expires_at - observed_at,
+        )
+    except Exception:  # noqa: BLE001 所有畸形凭证都只降级，不得阻断调用方
+        return None
 
 
 def _safe_json(resp: Any) -> Any:

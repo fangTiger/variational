@@ -665,7 +665,6 @@ def test_guard_records_cross_liquidation_without_using_it_to_exit(
 def test_panel_xau_xaut_shows_structure_without_xaus_schedule(tmp_path: Path) -> None:
     """24/7 结构的面板显示全部腿，但不显示 XAUS 休市行。"""
     from panel.providers import swap_carry
-    from tools import hedge_swap_carry as carry
 
     heartbeat = tmp_path / "heartbeat.json"
     state = tmp_path / "state.json"
@@ -682,7 +681,6 @@ def test_panel_xau_xaut_shows_structure_without_xaus_schedule(tmp_path: Path) ->
 
     status = swap_carry.collect(
         client=client,
-        structure=carry.XAU_XAUT,
         heartbeat_path=heartbeat,
         state_path=state,
         now=NOW,

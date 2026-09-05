@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
 
+from adapters.base import Position
 from panel.types import Metric, PanelAlert, SystemStatus
 from tools import hedge_swap_carry as carry
 from tools import run_swap_carry_guard as guard
 
 
 NAME = "Swap Carry（XAUS/XAU）"
+UNKNOWN_STRUCTURE = "结构未知（守护心跳不可用）"
+IGNORED_EXTERNAL_POSITIONS = frozenset({"BTC"})
 
 
 def _leg_value(
@@ -81,6 +86,160 @@ def _read_heartbeat(
             level="critical",
             title=f"Swap carry 守护进程已 {age_minutes:.1f} 分钟未运行",
             action="立即检查并重启守护进程；重启前人工核对两腿仓位与强平风险",
+        ),
+    )
+
+
+def _heartbeat_structure(path: Path) -> carry.CarryStructure | None:
+    """只接受守护心跳声明的合法结构，缺失或非法时保持未知。"""
+    heartbeat = carry._read_guard_json(path)
+    raw_structure = heartbeat.get("structure") if heartbeat is not None else None
+    if not isinstance(raw_structure, str) or not raw_structure.strip():
+        return None
+    try:
+        return carry.resolve_structure(raw_structure)
+    except ValueError:
+        return None
+
+
+def _position_items(payload: object) -> Sequence[object]:
+    """兼容 `/positions` 的列表响应与带 positions 键的对象响应。"""
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        return payload
+    if isinstance(payload, Mapping):
+        items = payload.get("positions")
+        if isinstance(items, Sequence) and not isinstance(items, (str, bytes)):
+            return items
+    raise ValueError("/positions 响应缺少持仓列表")
+
+
+def _actual_positions(payload: object) -> list[Position]:
+    """按 `/positions` 原始顺序提取全部标的和有符号数量。"""
+    positions: list[Position] = []
+    for raw_position in _position_items(payload):
+        if not isinstance(raw_position, Mapping):
+            raise ValueError("/positions 持仓记录不是对象")
+        raw_info = raw_position.get("position_info", raw_position)
+        if not isinstance(raw_info, Mapping):
+            raise ValueError("/positions.position_info 不是对象")
+        raw_instrument = raw_info.get("instrument")
+        instrument = raw_instrument if isinstance(raw_instrument, Mapping) else {}
+        underlying_value = instrument.get("underlying") or raw_info.get("underlying")
+        underlying = str(underlying_value or "").strip().upper()
+        if not underlying:
+            raise ValueError("/positions 持仓缺少 instrument.underlying")
+        qty = carry._decimal(
+            raw_info.get("qty", raw_info.get("size")),
+            label=f"{underlying} 持仓数量",
+        )
+        positions.append(Position(underlying, qty, raw=raw_position))
+    return positions
+
+
+def _structure_positions(
+    selected: carry.CarryStructure,
+    actual_positions: Sequence[Position],
+) -> dict[str, Position]:
+    """从全账户快照提取当前结构各腿，缺席腿按空仓处理。"""
+    positions = {
+        leg.underlying: Position(leg.underlying, Decimal("0"))
+        for leg in selected.legs
+    }
+    seen: set[str] = set()
+    for position in actual_positions:
+        if position.market not in positions:
+            continue
+        if position.market in seen:
+            raise ValueError(f"/positions 返回重复的结构腿 {position.market}")
+        seen.add(position.market)
+        positions[position.market] = position
+    return positions
+
+
+def _actual_position_metrics(positions: Sequence[Position]) -> list[Metric]:
+    """把账户快照逐条展示；空列表也明确显示为空仓。"""
+    if not positions:
+        return [Metric("实际持仓", "无持仓")]
+    return [
+        Metric(f"实际持仓 {position.market}", f"{position.signed_size:+.5f}")
+        for position in positions
+    ]
+
+
+def _unknown_structure_status(
+    *,
+    actual_positions: Sequence[Position],
+    alive: bool | None,
+    heartbeat_metric: Metric,
+    session_metric: Metric,
+    alerts: list[PanelAlert],
+) -> SystemStatus:
+    """结构不可确认时只展示事实，不猜测腿方向或裸仓状态。"""
+    alerts.append(
+        PanelAlert(
+            key="swap_carry_structure_unknown",
+            level="warning",
+            title=UNKNOWN_STRUCTURE,
+            action="检查守护进程是否在运行，并确认心跳已写入合法 structure",
+        )
+    )
+    return SystemStatus(
+        name=NAME,
+        alive=alive,
+        summary="结构未知，需人工核对持仓",
+        metrics=[
+            Metric("当前结构", UNKNOWN_STRUCTURE, "warn"),
+            *_actual_position_metrics(actual_positions),
+            session_metric,
+            heartbeat_metric,
+        ],
+        alerts=alerts,
+    )
+
+
+def _session_expiry_metric(path: Path) -> tuple[Metric, PanelAlert | None]:
+    """从守护心跳读取会话剩余时间，不接触 Cookie。"""
+    heartbeat = carry._read_guard_json(path)
+    raw_hours = heartbeat.get("session_hours_left") if heartbeat else None
+    try:
+        if isinstance(raw_hours, bool):
+            raise ValueError
+        hours_left = float(raw_hours)
+        if not math.isfinite(hours_left):
+            raise ValueError
+    except (TypeError, ValueError):
+        return Metric("会话剩余", "无数据"), None
+
+    if hours_left > 48:
+        tone = "good"
+    elif hours_left >= 24:
+        tone = "normal"
+    elif hours_left >= 6:
+        tone = "warn"
+    else:
+        tone = "bad"
+
+    value = (
+        f"{hours_left:.1f} 小时"
+        if hours_left >= 0
+        else f"已过期 {abs(hours_left):.1f} 小时"
+    )
+    metric = Metric("会话剩余", value, tone)
+    if hours_left >= 6:
+        return metric, None
+
+    title = (
+        f"Variational 会话仅剩 {hours_left:.1f} 小时"
+        if hours_left >= 0
+        else f"Variational 会话已过期 {abs(hours_left):.1f} 小时"
+    )
+    return (
+        metric,
+        PanelAlert(
+            key="swap_carry_session_expiry",
+            level="critical",
+            title=title,
+            action="按 docs/guides/导出-Variational-会话Cookie.md 重新导出",
         ),
     )
 
@@ -167,20 +326,37 @@ def _funding_value(
 async def _collect(
     client: Any,
     *,
-    structure: carry.CarryStructure | str,
     heartbeat_path: Path,
     state_path: Path,
     observed_at: datetime,
 ) -> SystemStatus:
     """执行一轮只读采集；账户仓位是卡片成立所需的核心数据。"""
-    selected = carry.resolve_structure(structure)
-    positions = await carry._get_positions(client, selected)
-
     alive, heartbeat_metric, heartbeat_alert = _read_heartbeat(
         heartbeat_path,
         observed_at,
     )
-    alerts = [alert for alert in (heartbeat_alert, _guard_alert(state_path)) if alert]
+    session_metric, session_alert = _session_expiry_metric(heartbeat_path)
+    alerts = [
+        alert
+        for alert in (
+            heartbeat_alert,
+            session_alert,
+            _guard_alert(state_path),
+        )
+        if alert
+    ]
+    actual_positions = _actual_positions(await client.get_positions())
+    selected = _heartbeat_structure(heartbeat_path)
+    if selected is None:
+        return _unknown_structure_status(
+            actual_positions=actual_positions,
+            alive=alive,
+            heartbeat_metric=heartbeat_metric,
+            session_metric=session_metric,
+            alerts=alerts,
+        )
+
+    positions = _structure_positions(selected, actual_positions)
 
     open_legs = [
         leg for leg in selected.legs if not positions[leg.underlying].is_flat
@@ -194,6 +370,25 @@ async def _collect(
                 level="critical",
                 title=f"Swap carry 缺腿裸仓：只剩 {remaining}",
                 action="停止新增仓位并立即人工恢复对冲或安全减掉全部剩余腿",
+            )
+        )
+
+    selected_underlyings = {leg.underlying for leg in selected.legs}
+    residual_positions = [
+        position
+        for position in actual_positions
+        if not position.is_flat
+        and position.market not in selected_underlyings
+        and position.market not in IGNORED_EXTERNAL_POSITIONS
+    ]
+    if residual_positions:
+        residual_names = "、".join(position.market for position in residual_positions)
+        alerts.append(
+            PanelAlert(
+                key="swap_carry_residual_position",
+                level="critical",
+                title=f"Swap carry 发现结构外残留持仓：{residual_names}",
+                action="停止新增仓位并立即人工核对残留腿来源，确认后安全减仓",
             )
         )
 
@@ -305,9 +500,24 @@ async def _collect(
     if selected.has_xaus:
         metrics.append(_schedule_metric(schedule))
     metrics.extend([
+        session_metric,
         heartbeat_metric,
         funding_metric,
     ])
+    metrics.extend(
+        _actual_position_metrics(
+            [
+                position
+                for position in actual_positions
+                if position.market not in selected_underlyings
+            ]
+        )
+        if any(
+            position.market not in selected_underlyings
+            for position in actual_positions
+        )
+        else []
+    )
 
     if missing_legs:
         summary = "缺腿持仓，需立即处理"
@@ -337,7 +547,6 @@ async def _collect(
 def collect(
     *,
     client: Any | None = None,
-    structure: carry.CarryStructure | str = carry.XAUS_XAU,
     heartbeat_path: Path = carry.SWAP_CARRY_GUARD_HEARTBEAT,
     state_path: Path = carry.SWAP_CARRY_GUARD_STATE,
     now: datetime | None = None,
@@ -354,7 +563,6 @@ def collect(
         try:
             return await _collect(
                 client,
-                structure=structure,
                 heartbeat_path=heartbeat_path,
                 state_path=state_path,
                 observed_at=observed_at.astimezone(timezone.utc),
@@ -371,9 +579,12 @@ def collect(
             raise ValueError("now 必须包含时区")
         return asyncio.run(run())
     except Exception as exc:  # noqa: BLE001 单个 provider 不能拖垮整页
+        session_metric, session_alert = _session_expiry_metric(heartbeat_path)
         return SystemStatus(
             name=NAME,
             alive=None,
             summary="采集失败",
+            metrics=[session_metric],
             error=str(exc),
+            alerts=[session_alert] if session_alert is not None else [],
         )

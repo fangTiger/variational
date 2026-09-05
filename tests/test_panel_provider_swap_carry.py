@@ -9,6 +9,8 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from adapters.base import Position
 
 
@@ -43,6 +45,13 @@ def _metadata() -> dict[str, object]:
         "XAU": [
             {
                 "instrument_type": "perpetual_rwa_future",
+                "funding_interval_s": 3600,
+                "price": "4000",
+            }
+        ],
+        "XAUT": [
+            {
+                "instrument_type": "perpetual_future",
                 "funding_interval_s": 3600,
                 "price": "4000",
             }
@@ -85,6 +94,7 @@ class StrictClient:
         liquidations: dict[str, object] | BaseException | None = None,
         xaus_rate: Decimal | BaseException | None = None,
         xau_rate: Decimal | BaseException | None = None,
+        xaut_rate: Decimal | BaseException | None = None,
         transfers: list[dict[str, object]] | BaseException | None = None,
     ) -> None:
         self.positions = positions
@@ -92,6 +102,7 @@ class StrictClient:
         self.liquidations = liquidations
         self.xaus_rate = xaus_rate
         self.xau_rate = xau_rate
+        self.xaut_rate = xaut_rate
         self.transfers = transfers
         self.calls: list[str] = []
 
@@ -111,6 +122,22 @@ class StrictClient:
         if underlying not in positions:
             raise AssertionError(f"未配置仓位：{underlying}")
         return Position(underlying, positions[underlying])
+
+    async def get_positions(self) -> list[dict[str, object]]:
+        """按真实 `/positions` schema 返回账户全部实际持仓。"""
+        self.calls.append("positions")
+        positions = self._configured(self.positions, "get_positions")
+        assert isinstance(positions, dict)
+        return [
+            {
+                "position_info": {
+                    "instrument": {"underlying": underlying},
+                    "qty": str(qty),
+                }
+            }
+            for underlying, qty in positions.items()
+            if qty != 0
+        ]
 
     async def get_supported_assets(self) -> object:
         self.calls.append("supported_assets")
@@ -139,8 +166,15 @@ class StrictClient:
         self, underlying: str, instrument_type: str
     ) -> Decimal:
         self.calls.append("funding_rate")
-        assert (underlying, instrument_type) == ("XAU", "perpetual_rwa_future")
-        rate = self._configured(self.xau_rate, "get_funding_rate")
+        expected_types = {
+            "XAU": "perpetual_rwa_future",
+            "XAUT": "perpetual_future",
+        }
+        assert expected_types[underlying] == instrument_type
+        rate = self._configured(
+            self.xau_rate if underlying == "XAU" else self.xaut_rate,
+            f"get_funding_rate:{underlying}",
+        )
         assert isinstance(rate, Decimal)
         return rate
 
@@ -162,14 +196,17 @@ def _paths(
     *,
     heartbeat_age: timedelta | None = timedelta(minutes=5),
     state: dict[str, object] | None = None,
+    heartbeat_extra: dict[str, object] | None = None,
+    heartbeat_structure: object | None = "XAUS_XAU",
 ) -> tuple[Path, Path]:
     heartbeat_path = tmp_path / "heartbeat.json"
     state_path = tmp_path / "state.json"
     if heartbeat_age is not None:
-        _write_json(
-            heartbeat_path,
-            {"timestamp": (NOW - heartbeat_age).isoformat()},
-        )
+        heartbeat = {"timestamp": (NOW - heartbeat_age).isoformat()}
+        if heartbeat_structure is not None:
+            heartbeat["structure"] = heartbeat_structure
+        heartbeat.update(heartbeat_extra or {})
+        _write_json(heartbeat_path, heartbeat)
     if state is not None:
         _write_json(state_path, state)
     return heartbeat_path, state_path
@@ -185,6 +222,7 @@ def _client(**overrides: object) -> StrictClient:
         },
         "xaus_rate": Decimal("-0.05"),
         "xau_rate": Decimal("0.132"),
+        "xaut_rate": Decimal("0.1095"),
         "transfers": _transfers(),
     }
     values.update(overrides)
@@ -276,11 +314,198 @@ def test_stale_heartbeat_marks_dead_and_emits_critical_alert(tmp_path) -> None:
 
 
 def test_missing_heartbeat_degrades_without_raising(tmp_path) -> None:
-    status = _collect(tmp_path, _client(), heartbeat_age=None)
+    status = _collect(
+        tmp_path,
+        _client(
+            positions={
+                "XAU": Decimal("0.45050"),
+                "XAUT": Decimal("-0.45050"),
+                "BTC": Decimal("0.01"),
+            },
+        ),
+        heartbeat_age=None,
+    )
 
     assert status.alive is None
     assert status.error is None
     assert _metrics(status)["守护进程心跳"].value == "无数据"
+    assert _metrics(status)["当前结构"].value == "结构未知（守护心跳不可用）"
+    assert _metrics(status)["实际持仓 XAU"].value == "+0.45050"
+    assert _metrics(status)["实际持仓 XAUT"].value == "-0.45050"
+    assert _metrics(status)["实际持仓 BTC"].value == "+0.01000"
+    alert = next(
+        alert for alert in status.alerts if alert.key == "swap_carry_structure_unknown"
+    )
+    assert alert.level == "warning"
+    assert "检查守护进程是否在运行" in alert.action
+    assert not any(item.level == "critical" for item in status.alerts)
+
+
+def test_heartbeat_without_structure_degrades_to_unknown(tmp_path) -> None:
+    status = _collect(
+        tmp_path,
+        _client(positions={"XAU": Decimal("0.25")}),
+        heartbeat_structure=None,
+    )
+
+    assert status.error is None
+    assert _metrics(status)["当前结构"].value == "结构未知（守护心跳不可用）"
+    assert _metrics(status)["实际持仓 XAU"].value == "+0.25000"
+    alert = next(
+        alert for alert in status.alerts if alert.key == "swap_carry_structure_unknown"
+    )
+    assert alert.level == "warning"
+
+
+def test_invalid_heartbeat_structure_degrades_to_unknown(tmp_path) -> None:
+    status = _collect(
+        tmp_path,
+        _client(positions={"XAUS": Decimal("0.125"), "BTC": Decimal("-0.01")}),
+        heartbeat_structure="NOT_A_STRUCTURE",
+    )
+
+    assert status.error is None
+    assert _metrics(status)["当前结构"].value == "结构未知（守护心跳不可用）"
+    assert _metrics(status)["实际持仓 XAUS"].value == "+0.12500"
+    assert _metrics(status)["实际持仓 BTC"].value == "-0.01000"
+    alert = next(
+        alert for alert in status.alerts if alert.key == "swap_carry_structure_unknown"
+    )
+    assert alert.level == "warning"
+    assert not any(item.level == "critical" for item in status.alerts)
+
+
+def test_xau_xaut_heartbeat_marks_leg_directions_without_alert(tmp_path) -> None:
+    status = _collect(
+        tmp_path,
+        _client(
+            positions={"XAU": Decimal("0.45050"), "XAUT": Decimal("-0.45050")},
+            liquidations={
+                "XAU": (Decimal("4000"), Decimal("3000")),
+                "XAUT": (Decimal("4000"), Decimal("4500")),
+            },
+            xau_rate=Decimal("0.03"),
+            xaut_rate=Decimal("0.1095"),
+        ),
+        heartbeat_structure="XAU_XAUT",
+    )
+    metrics = _metrics(status)
+
+    assert metrics["当前结构"].value == "XAU_XAUT"
+    assert metrics["XAU 多腿"].value.startswith("权重=1 / +0.45050")
+    assert metrics["XAUT 空腿"].value.startswith("权重=1 / -0.45050")
+    assert status.alerts == []
+
+
+def test_structure_outside_position_emits_critical_residual_alert(tmp_path) -> None:
+    status = _collect(
+        tmp_path,
+        _client(
+            positions={
+                "XAU": Decimal("0.45"),
+                "XAUT": Decimal("-0.45"),
+                "XAUS": Decimal("0.01"),
+            },
+            liquidations={
+                "XAU": (Decimal("4000"), Decimal("3000")),
+                "XAUT": (Decimal("4000"), Decimal("4500")),
+            },
+            xau_rate=Decimal("0.03"),
+            xaut_rate=Decimal("0.1095"),
+        ),
+        heartbeat_structure="XAU_XAUT",
+    )
+
+    alert = next(
+        item for item in status.alerts if item.key == "swap_carry_residual_position"
+    )
+    assert alert.level == "critical"
+    assert "XAUS" in alert.title
+    assert _metrics(status)["实际持仓 XAUS"].value == "+0.01000"
+
+
+def test_btc_position_is_displayed_but_ignored_by_structure_alerts(tmp_path) -> None:
+    status = _collect(
+        tmp_path,
+        _client(
+            positions={
+                "XAUS": Decimal("0.0125"),
+                "XAU": Decimal("-0.0125"),
+                "BTC": Decimal("0.01"),
+            }
+        ),
+    )
+
+    assert _metrics(status)["实际持仓 BTC"].value == "+0.01000"
+    assert "swap_carry_residual_position" not in _alert_keys(status)
+    assert "swap_carry_single_leg" not in _alert_keys(status)
+
+
+def test_xau_xaut_position_does_not_reproduce_xaus_xau_single_leg_false_alert(
+    tmp_path,
+) -> None:
+    """XAU 多头属于心跳声明的 XAU_XAUT，不得按旧默认结构解释。"""
+    status = _collect(
+        tmp_path,
+        _client(
+            positions={"XAU": Decimal("0.45050"), "XAUT": Decimal("-0.45050")},
+            liquidations={
+                "XAU": (Decimal("4000"), Decimal("3000")),
+                "XAUT": (Decimal("4000"), Decimal("4500")),
+            },
+            xau_rate=Decimal("0.03"),
+            xaut_rate=Decimal("0.1095"),
+        ),
+        heartbeat_structure="XAU_XAUT",
+    )
+
+    assert "swap_carry_single_leg" not in _alert_keys(status)
+    assert all("缺腿裸仓" not in alert.title for alert in status.alerts)
+
+
+@pytest.mark.parametrize(
+    ("hours_left", "tone", "critical"),
+    [
+        (72.0, "good", False),
+        (36.0, "normal", False),
+        (12.0, "warn", False),
+        (5.5, "bad", True),
+        (-1.0, "bad", True),
+    ],
+)
+def test_session_remaining_metric_tone_and_critical_alert(
+    tmp_path,
+    hours_left: float,
+    tone: str,
+    critical: bool,
+) -> None:
+    expires_at = NOW + timedelta(hours=hours_left)
+    status = _collect(
+        tmp_path,
+        _client(),
+        heartbeat_extra={
+            "session_expires_at": expires_at.isoformat(),
+            "session_hours_left": hours_left,
+        },
+    )
+
+    metric = _metrics(status)["会话剩余"]
+    assert metric.tone == tone
+    if hours_left >= 0:
+        assert metric.value == f"{hours_left:.1f} 小时"
+    else:
+        assert metric.value == f"已过期 {abs(hours_left):.1f} 小时"
+
+    alerts = [
+        alert for alert in status.alerts if alert.key == "swap_carry_session_expiry"
+    ]
+    assert bool(alerts) is critical
+    if alerts:
+        assert alerts[0].level == "critical"
+        assert (
+            alerts[0].action
+            == "按 docs/guides/导出-Variational-会话Cookie.md 重新导出"
+        )
 
 
 def test_single_leg_emits_critical_alert(tmp_path) -> None:
@@ -337,6 +562,28 @@ def test_core_account_read_failure_returns_error_card(tmp_path) -> None:
     assert status.error is not None and "账户读取失败" in status.error
 
 
+def test_expired_session_remains_visible_when_account_read_fails(tmp_path) -> None:
+    """Cookie 失效导致账户读取失败时，面板仍须显示心跳里的到期告警。"""
+    status = _collect(
+        tmp_path,
+        _client(positions=RuntimeError("会话被拒绝")),
+        heartbeat_extra={
+            "session_expires_at": (NOW - timedelta(hours=1)).isoformat(),
+            "session_hours_left": -1.0,
+        },
+    )
+
+    metric = _metrics(status)["会话剩余"]
+    assert metric.value == "已过期 1.0 小时"
+    assert metric.tone == "bad"
+    alert = next(
+        alert
+        for alert in status.alerts
+        if alert.key == "swap_carry_session_expiry"
+    )
+    assert alert.level == "critical"
+
+
 def test_near_xaus_liquidation_emits_critical_alert(tmp_path) -> None:
     status = _collect(
         tmp_path,
@@ -378,14 +625,12 @@ def test_proxy_environment_is_removed_before_first_network_call(
         monkeypatch.setenv(name, "http://127.0.0.1:1080")
 
     class ProxyCheckingClient(StrictClient):
-        async def get_position(
-            self, underlying: str, *, exact: bool = False
-        ) -> Position:
+        async def get_positions(self) -> list[dict[str, object]]:
             assert not any(
                 name in os.environ
                 for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
             )
-            return await super().get_position(underlying, exact=exact)
+            return await super().get_positions()
 
     defaults = _client()
     client = ProxyCheckingClient(
@@ -394,6 +639,7 @@ def test_proxy_environment_is_removed_before_first_network_call(
         liquidations=defaults.liquidations,
         xaus_rate=defaults.xaus_rate,
         xau_rate=defaults.xau_rate,
+        xaut_rate=defaults.xaut_rate,
         transfers=defaults.transfers,
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import plistlib
 from datetime import datetime, timedelta, timezone
@@ -22,6 +23,22 @@ from adapters.variational_client import (
 
 NOW = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
 _UNCONFIGURED = object()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_variational_cookie_environment(monkeypatch) -> None:
+    """普通守护测试不继承开发机上的真实会话。"""
+    monkeypatch.delenv("VARIATIONAL_COOKIE", raising=False)
+    monkeypatch.delenv("VARIATIONAL_WALLET_ADDRESS", raising=False)
+
+
+def _jwt(expires_at: datetime) -> str:
+    """构造只供到期测试解码的无签名 JWT。"""
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": expires_at.timestamp()}).encode()
+    ).decode().rstrip("=")
+    return f"{header}.{payload}.secret-test-signature"
 
 
 def _metadata(
@@ -936,6 +953,148 @@ def test_heartbeat_and_audit_are_written_even_without_action(tmp_path: Path) -> 
     assert heartbeat["xaus_schedule"]["closure_duration_seconds"] == 3600
     assert heartbeat["consecutive_failures"] == 0
     assert paths["audit_path"].read_text(encoding="utf-8").strip()
+
+
+def test_session_under_24_hours_notifies_once_during_two_hour_cooldown(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    caplog,
+) -> None:
+    """24 小时预警要写心跳，但两小时内不能重复弹窗。"""
+    from tools import run_swap_carry_guard
+
+    token = _jwt(NOW + timedelta(hours=23))
+    monkeypatch.setenv("VARIATIONAL_COOKIE", f"other=value; vr-token={token}")
+    monkeypatch.setenv("VARIATIONAL_WALLET_ADDRESS", "0xabc")
+    notifications: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        run_swap_carry_guard,
+        "notify",
+        lambda title, body: notifications.append((title, body)) or True,
+    )
+    paths = _paths(tmp_path)
+
+    first = asyncio.run(
+        run_swap_carry_guard.run_once(
+            _healthy_client(),
+            now=NOW,
+            **paths,
+        )
+    )
+    second = asyncio.run(
+        run_swap_carry_guard.run_once(
+            _healthy_client(),
+            now=NOW + timedelta(minutes=5),
+            **paths,
+        )
+    )
+
+    assert first == second == 0
+    assert len(notifications) == 1
+    heartbeat_text = paths["heartbeat_path"].read_text(encoding="utf-8")
+    audit_text = paths["audit_path"].read_text(encoding="utf-8")
+    heartbeat = json.loads(heartbeat_text)
+    assert heartbeat["session_expires_at"] == (NOW + timedelta(hours=23)).isoformat()
+    assert heartbeat["session_hours_left"] == pytest.approx(23 - 5 / 60)
+    assert token not in heartbeat_text
+    assert token not in audit_text
+    assert all(token not in " ".join(item) for item in notifications)
+    captured = capsys.readouterr()
+    assert token not in captured.out
+    assert token not in captured.err
+    assert token not in caplog.text
+
+
+def test_session_under_six_hours_notifies_every_round(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """临近失效的 critical 通知不受普通冷却限制。"""
+    from tools import run_swap_carry_guard
+
+    token = _jwt(NOW + timedelta(hours=5))
+    monkeypatch.setenv("VARIATIONAL_COOKIE", f"vr-token={token}")
+    monkeypatch.setenv("VARIATIONAL_WALLET_ADDRESS", "0xabc")
+    notifications: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        run_swap_carry_guard,
+        "notify",
+        lambda title, body: notifications.append((title, body)) or True,
+    )
+    paths = _paths(tmp_path)
+
+    for minutes in (0, 5):
+        result = asyncio.run(
+            run_swap_carry_guard.run_once(
+                _healthy_client(),
+                now=NOW + timedelta(minutes=minutes),
+                **paths,
+            )
+        )
+        assert result == 0
+
+    assert len(notifications) == 2
+    critical_records = [
+        json.loads(line)
+        for line in paths["audit_path"].read_text(encoding="utf-8").splitlines()
+        if '"event": "session_expiry_warning"' in line
+    ]
+    assert len(critical_records) == 2
+    assert all(record["level"] == "critical" for record in critical_records)
+
+
+def test_expired_session_blocks_open_and_switch_without_flattening(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    caplog,
+) -> None:
+    """过期前置门禁不得把结构切换误执行成先平旧仓。"""
+    from tools import run_swap_carry_guard
+
+    token = _jwt(NOW - timedelta(hours=1))
+    monkeypatch.setenv("VARIATIONAL_COOKIE", f"vr-token={token}")
+    monkeypatch.setenv("VARIATIONAL_WALLET_ADDRESS", "0xabc")
+    notifications: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        run_swap_carry_guard,
+        "notify",
+        lambda title, body: notifications.append((title, body)) or True,
+    )
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[],
+    )
+    paths = _paths(tmp_path)
+
+    result = asyncio.run(
+        run_swap_carry_guard.run_once(
+            client,
+            now=NOW,
+            auto_switch=True,
+            **paths,
+        )
+    )
+
+    assert result != 0
+    assert client.all_positions_calls == 0
+    assert client.quote_calls == []
+    assert client.accept_calls == []
+    heartbeat_text = paths["heartbeat_path"].read_text(encoding="utf-8")
+    state_text = paths["state_path"].read_text(encoding="utf-8")
+    audit_text = paths["audit_path"].read_text(encoding="utf-8")
+    assert "会话已过期，需人工刷新 Cookie" in heartbeat_text
+    assert "会话已过期，需人工刷新 Cookie" in state_text
+    assert '"level": "critical"' in audit_text
+    assert token not in heartbeat_text
+    assert token not in state_text
+    assert token not in audit_text
+    assert all(token not in " ".join(item) for item in notifications)
+    captured = capsys.readouterr()
+    assert token not in captured.out
+    assert token not in captured.err
+    assert token not in caplog.text
 
 
 def test_dry_run_performs_decision_but_never_accepts(tmp_path: Path) -> None:
