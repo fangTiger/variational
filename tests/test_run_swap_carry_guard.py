@@ -397,6 +397,7 @@ def _paths(tmp_path: Path) -> dict[str, Path]:
         "heartbeat_path": tmp_path / "heartbeat.json",
         "state_path": tmp_path / "state.json",
         "audit_path": tmp_path / "audit.jsonl",
+        "switch_history_path": tmp_path / "switch_history.jsonl",
     }
 
 
@@ -1937,6 +1938,16 @@ def test_switch_open_failure_stays_fully_flat(
     ]
     assert all(size == 0 for size in client.sizes.values())
 
+    switch_record = json.loads(
+        _paths(tmp_path)["switch_history_path"].read_text(encoding="utf-8")
+    )
+    assert switch_record["status"] == "failed"
+    assert switch_record["failure"]["stage"] == "open"
+    assert switch_record["failure"]["residual_state"] == "空仓"
+    assert switch_record["failure"]["has_residual_position"] is False
+    assert switch_record["self_check"]["status"] == "开仓失败，账户为空仓"
+    assert "completed_at" not in switch_record
+
     client.accept_script = [{}, {}]
     retry = _run(client, tmp_path, auto_switch=True)
 
@@ -2117,3 +2128,272 @@ def test_auto_switch_cli_and_default_notional_configuration() -> None:
     assert disabled.auto_switch is False
     assert defaults.auto_open_notional == Decimal("2000")
     assert run_swap_carry_guard.SWITCH_LEAD_TIME == timedelta(minutes=60)
+
+
+def test_successful_switch_writes_complete_ledger_and_passes_self_check(
+    tmp_path: Path,
+) -> None:
+    """正常切换必须追加单条完整台账，并在新结构上通过立即自检。"""
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[{}, {}, {}, {}],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result == 0
+    records = [
+        json.loads(line)
+        for line in _paths(tmp_path)["switch_history_path"].read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert {
+        "schema_version",
+        "started_at",
+        "completed_at",
+        "status",
+        "direction",
+        "trigger",
+        "before",
+        "close_phase",
+        "flat_confirmation",
+        "open_phase",
+        "after",
+        "measured_wear_usd",
+        "total_duration_ms",
+        "self_check",
+        "failure",
+    } <= set(record)
+    assert record["status"] == "completed"
+    assert record["direction"] == {
+        "from": "XAU_XAUT",
+        "to": "XAUS_XAU",
+    }
+    assert record["trigger"]["types"] == ["时段边界", "目标结构变化"]
+    assert record["before"]["legs"]["XAU"]["quantity"] == "0.01"
+    assert record["before"]["legs"]["XAUT"]["notional_usd"] == "40.00"
+    assert record["before"]["net_delta"] == "0.00"
+    assert record["before"]["equity"] == "1000"
+    assert record["flat_confirmation"]["all_flat"] is True
+    assert record["flat_confirmation"]["poll_count"] >= 1
+    assert record["flat_confirmation"]["confirmed_at"]
+    assert record["after"]["legs"]["XAUS"]["quantity"] == "0.5"
+    assert record["after"]["legs"]["XAU"]["quantity"] == "-0.5"
+    assert record["after"]["net_delta"] == "0.0"
+    assert record["after"]["equity"] == "1000"
+    assert record["measured_wear_usd"] == "0"
+    assert record["self_check"]["performed"] is True
+    assert record["self_check"]["passed"] is True
+    assert all(
+        check["passed"] for check in record["self_check"]["checks"].values()
+    )
+    assert record["failure"] is None
+    for phase_name in ("close_phase", "open_phase"):
+        phase = record[phase_name]
+        assert phase["status"] == "completed"
+        assert phase["duration_ms"] >= 0
+        assert len(phase["legs"]) == 2
+        for leg in phase["legs"]:
+            assert {
+                "market",
+                "side",
+                "execution_price",
+                "quote_mid",
+                "rfq_id",
+                "filled_quantity",
+                "duration_ms",
+                "slippage_bp",
+            } <= set(leg)
+            assert leg["rfq_id"].startswith("rfq-")
+
+
+def test_switch_close_failure_records_stage_without_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """平仓失败必须形成失败台账，且绝不能出现切换完成时间。"""
+    from tools import run_swap_carry_guard
+
+    monkeypatch.setattr(run_swap_carry_guard, "RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(run_swap_carry_guard, "notify", lambda *_args: True)
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[
+            RuntimeError("平仓拒绝 1"),
+            RuntimeError("平仓拒绝 2"),
+            RuntimeError("平仓拒绝 3"),
+        ],
+    )
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result != 0
+    record = json.loads(
+        _paths(tmp_path)["switch_history_path"].read_text(encoding="utf-8")
+    )
+    assert record["status"] == "failed"
+    assert record["failure"]["stage"] == "close"
+    assert record["failure"]["error_type"] == "CloseActionError"
+    assert "平仓连续失败" in record["failure"]["message"]
+    assert record["failure"]["has_residual_position"] is True
+    assert record["failure"]["residual_state"] == "残仓"
+    assert "completed_at" not in record
+
+
+def test_post_switch_delta_failure_sets_incident_and_emits_critical(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """开仓后净 delta 超容差必须升级事故并持久化锁死标记。"""
+    from tools import run_swap_carry_guard
+
+    notifications: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        run_swap_carry_guard,
+        "notify",
+        lambda title, message: notifications.append((title, message)) or True,
+    )
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[{}, {}, {}, {}],
+    )
+    original_accept = client.accept_quote
+
+    async def accept_with_delta_drift(**kwargs: object) -> dict[str, str]:
+        response = await original_accept(**kwargs)
+        quote_id = str(kwargs["quote_id"])
+        underlying, _side, _qty = client._quotes[quote_id]
+        if underlying == "XAU" and kwargs["is_reduce_only"] is False:
+            client.sizes["XAU"] -= Decimal("0.001")
+        return response
+
+    monkeypatch.setattr(client, "accept_quote", accept_with_delta_drift)
+
+    result = _run(client, tmp_path, auto_switch=True)
+
+    assert result != 0
+    state = json.loads(_paths(tmp_path)["state_path"].read_text(encoding="utf-8"))
+    heartbeat = json.loads(
+        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
+    )
+    record = json.loads(
+        _paths(tmp_path)["switch_history_path"].read_text(encoding="utf-8")
+    )
+    assert state["switch_incident"] is True
+    assert heartbeat["switch_incident"] is True
+    assert record["status"] == "failed"
+    assert record["failure"]["stage"] == "self_check"
+    assert record["self_check"]["passed"] is False
+    assert record["self_check"]["checks"]["net_delta_within_tolerance"][
+        "passed"
+    ] is False
+    audit = [
+        json.loads(line)
+        for line in _paths(tmp_path)["audit_path"].read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    critical = next(
+        item for item in audit if item["event"] == "auto_switch_self_check_failed"
+    )
+    assert critical["level"] == "critical"
+    assert notifications and "自检失败" in notifications[-1][0]
+
+
+def test_self_check_rejects_position_outside_target_structure() -> None:
+    """目标结构以外的任意非豁免持仓必须令切换自检失败。"""
+    from tools import hedge_swap_carry, run_swap_carry_guard
+
+    payload = [
+        _position_payload("XAUS", Decimal("0.5"), mark_price=Decimal("4000")),
+        _position_payload("XAU", Decimal("-0.5"), mark_price=Decimal("4000")),
+        {
+            "position_info": {
+                "instrument": {
+                    "underlying": "ETH",
+                    "instrument_type": "perpetual_future",
+                    "funding_interval_s": 3600,
+                    "settlement_asset": "USDC",
+                },
+                "qty": "0.25",
+                "avg_entry_price": "2500",
+            },
+            "price_info": {"underlying_price": "2500"},
+            "upnl": "0",
+        },
+    ]
+
+    result = run_swap_carry_guard._switch_self_check(
+        hedge_swap_carry.XAUS_XAU,
+        account_positions_payload=payload,
+        old_structure_was_flat=True,
+    )
+
+    assert result["passed"] is False
+    residual = result["checks"]["no_external_residual_legs"]
+    assert residual["passed"] is False
+    assert residual["residual_legs"] == ["ETH"]
+
+
+def test_switch_incident_blocks_later_auto_open_and_switch(tmp_path: Path) -> None:
+    """人工清除前，事故标记必须同时阻止后续自动开仓和结构切换。"""
+    from tools import run_swap_carry_guard
+
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(
+        json.dumps(
+            {
+                "open_attempt_date": NOW.date().isoformat(),
+                "daily_open_attempts": 0,
+                "switch_incident": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    switching = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=None,
+    )
+
+    switch_result = asyncio.run(
+        run_swap_carry_guard.run_once(
+            switching,
+            now=NOW,
+            auto_switch=True,
+            **paths,
+        )
+    )
+
+    assert switch_result == 0
+    assert switching.accept_calls == []
+    assert "switch_incident" in json.loads(
+        paths["heartbeat_path"].read_text(encoding="utf-8")
+    )["auto_switch_conclusion"]
+
+    flat_dir = tmp_path / "flat"
+    flat_dir.mkdir()
+    flat_paths = _paths(flat_dir)
+    flat_paths["state_path"].write_text(
+        json.dumps(
+            {
+                "open_attempt_date": NOW.date().isoformat(),
+                "daily_open_attempts": 0,
+                "switch_incident": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    flat = _flat_open_client(accept_script=None)
+
+    open_result = asyncio.run(
+        run_swap_carry_guard.run_once(flat, now=NOW, **flat_paths)
+    )
+
+    assert open_result == 0
+    assert flat.accept_calls == []
+    assert "switch_incident" in json.loads(
+        flat_paths["heartbeat_path"].read_text(encoding="utf-8")
+    )["auto_open_conclusion"]

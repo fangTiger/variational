@@ -15,6 +15,7 @@ from adapters.base import Position
 from panel.types import Metric, PanelAlert, SystemStatus
 from tools import hedge_swap_carry as carry
 from tools import run_swap_carry_guard as guard
+from tools.show_switch_history import load_switch_history
 
 
 NAME = "Swap Carry（XAUS/XAU）"
@@ -172,6 +173,8 @@ def _unknown_structure_status(
     alive: bool | None,
     heartbeat_metric: Metric,
     session_metric: Metric,
+    last_switch_metric: Metric,
+    next_switch_metric: Metric,
     alerts: list[PanelAlert],
 ) -> SystemStatus:
     """结构不可确认时只展示事实，不猜测腿方向或裸仓状态。"""
@@ -192,6 +195,8 @@ def _unknown_structure_status(
             *_actual_position_metrics(actual_positions),
             session_metric,
             heartbeat_metric,
+            last_switch_metric,
+            next_switch_metric,
         ],
         alerts=alerts,
     )
@@ -257,6 +262,90 @@ def _guard_alert(path: Path) -> PanelAlert | None:
         level="critical",
         title=f"Swap carry 守护进程受阻：{message}",
         action="立即切换到放行网络或更新登录会话，并人工确认两腿仍然对冲",
+    )
+
+
+def _switch_incident_alert(
+    heartbeat_path: Path,
+    state_path: Path,
+) -> PanelAlert | None:
+    """任一持久化来源出现切换事故时升级为最高级告警。"""
+    heartbeat = carry._read_guard_json(heartbeat_path)
+    state = carry._read_guard_json(state_path)
+    if not any(
+        payload is not None and payload.get("switch_incident") is True
+        for payload in (heartbeat, state)
+    ):
+        return None
+    return PanelAlert(
+        key="swap_carry_switch_incident",
+        level="critical",
+        title="Swap carry 切换后自检失败，自动开仓与切换已锁定",
+        action=(
+            "立即人工核对台账与全部账户持仓；确认风险解除后，"
+            "再人工清除 switch_incident 标记"
+        ),
+    )
+
+
+def _last_switch_metric(path: Path) -> Metric:
+    """读取最近一条切换台账；缺失与损坏采用不同降级文案。"""
+    records, error = load_switch_history(path)
+    if error is not None:
+        return Metric("上次切换", "台账不可用（文件损坏）", "warn")
+    if not records:
+        return Metric("上次切换", "尚无切换")
+
+    record = records[-1]
+    started_at = record.get("started_at")
+    timestamp = "时间未知"
+    if isinstance(started_at, str):
+        try:
+            parsed = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+        else:
+            if parsed.tzinfo is not None:
+                timestamp = parsed.astimezone(timezone.utc).strftime(
+                    "%m-%d %H:%M UTC"
+                )
+
+    direction = record.get("direction")
+    if isinstance(direction, Mapping):
+        source = str(direction.get("from") or "?")
+        target = str(direction.get("to") or "?")
+        direction_text = f"{source}→{target}"
+    else:
+        direction_text = "方向未知"
+    wear = record.get("measured_wear_usd")
+    wear_text = str(wear) if wear is not None else "无数据"
+    return Metric(
+        "上次切换",
+        f"{timestamp} / {direction_text} / 实测磨损 {wear_text} USDC",
+    )
+
+
+def _next_switch_metric(schedule: Any | None) -> Metric:
+    """按权威 XAUS 会话边界推算下一次长休市结构切换。"""
+    if (
+        schedule is None
+        or not schedule.metadata_is_fresh
+        or schedule.closure_duration is None
+        or schedule.closure_duration <= guard.LONG_CLOSURE_THRESHOLD
+    ):
+        return Metric("下次切换预计", "暂无可推算的长休市切换")
+
+    if schedule.is_tradable and schedule.next_close_at is not None:
+        switch_at = schedule.next_close_at - guard.SWITCH_LEAD_TIME
+        direction = "XAUS_XAU→XAU_XAUT"
+    elif not schedule.is_tradable and schedule.next_open_at is not None:
+        switch_at = schedule.next_open_at
+        direction = "XAU_XAUT→XAUS_XAU"
+    else:
+        return Metric("下次切换预计", "暂无可推算的长休市切换")
+    return Metric(
+        "下次切换预计",
+        f"{_format_datetime(switch_at)} / {direction}",
     )
 
 
@@ -328,6 +417,7 @@ async def _collect(
     *,
     heartbeat_path: Path,
     state_path: Path,
+    switch_history_path: Path,
     observed_at: datetime,
 ) -> SystemStatus:
     """执行一轮只读采集；账户仓位是卡片成立所需的核心数据。"""
@@ -342,10 +432,22 @@ async def _collect(
             heartbeat_alert,
             session_alert,
             _guard_alert(state_path),
+            _switch_incident_alert(heartbeat_path, state_path),
         )
         if alert
     ]
+    last_switch_metric = _last_switch_metric(switch_history_path)
     actual_positions = _actual_positions(await client.get_positions())
+    metadata: object | None = None
+    schedule = None
+    try:
+        metadata, _record, schedule = await carry._load_schedule(
+            client,
+            now=observed_at,
+        )
+    except Exception:  # noqa: BLE001 时段、名义和预计切换独立降级
+        pass
+    next_switch_metric = _next_switch_metric(schedule)
     selected = _heartbeat_structure(heartbeat_path)
     if selected is None:
         return _unknown_structure_status(
@@ -353,6 +455,8 @@ async def _collect(
             alive=alive,
             heartbeat_metric=heartbeat_metric,
             session_metric=session_metric,
+            last_switch_metric=last_switch_metric,
+            next_switch_metric=next_switch_metric,
             alerts=alerts,
         )
 
@@ -391,17 +495,6 @@ async def _collect(
                 action="停止新增仓位并立即人工核对残留腿来源，确认后安全减仓",
             )
         )
-
-    metadata: object | None = None
-    schedule = None
-    if selected.has_xaus:
-        try:
-            metadata, _record, schedule = await carry._load_schedule(
-                client,
-                now=observed_at,
-            )
-        except Exception:  # noqa: BLE001 时段和名义独立降级
-            pass
 
     notionals: dict[str, Decimal | None] = {}
     for leg in selected.legs:
@@ -503,6 +596,8 @@ async def _collect(
         session_metric,
         heartbeat_metric,
         funding_metric,
+        last_switch_metric,
+        next_switch_metric,
     ])
     metrics.extend(
         _actual_position_metrics(
@@ -549,6 +644,7 @@ def collect(
     client: Any | None = None,
     heartbeat_path: Path = carry.SWAP_CARRY_GUARD_HEARTBEAT,
     state_path: Path = carry.SWAP_CARRY_GUARD_STATE,
+    switch_history_path: Path = guard.DEFAULT_SWITCH_HISTORY,
     now: datetime | None = None,
 ) -> SystemStatus:
     """同步 provider 入口；任何整轮失败都返回 error 卡片。"""
@@ -565,6 +661,7 @@ def collect(
                 client,
                 heartbeat_path=heartbeat_path,
                 state_path=state_path,
+                switch_history_path=switch_history_path,
                 observed_at=observed_at.astimezone(timezone.utc),
             )
         finally:
@@ -580,11 +677,24 @@ def collect(
         return asyncio.run(run())
     except Exception as exc:  # noqa: BLE001 单个 provider 不能拖垮整页
         session_metric, session_alert = _session_expiry_metric(heartbeat_path)
+        alerts = [
+            alert
+            for alert in (
+                session_alert,
+                _guard_alert(state_path),
+                _switch_incident_alert(heartbeat_path, state_path),
+            )
+            if alert is not None
+        ]
         return SystemStatus(
             name=NAME,
             alive=None,
             summary="采集失败",
-            metrics=[session_metric],
+            metrics=[
+                session_metric,
+                _last_switch_metric(switch_history_path),
+                _next_switch_metric(None),
+            ],
             error=str(exc),
-            alerts=[session_alert] if session_alert is not None else [],
+            alerts=alerts,
         )

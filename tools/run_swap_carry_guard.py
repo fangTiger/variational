@@ -15,6 +15,7 @@ import argparse  # noqa: E402
 import asyncio  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
+import time  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
@@ -42,6 +43,7 @@ DEFAULT_KILL_SWITCH = execution.SWAP_CARRY_KILL_SWITCH
 DEFAULT_HEARTBEAT = execution.SWAP_CARRY_GUARD_HEARTBEAT
 DEFAULT_STATE = execution.SWAP_CARRY_GUARD_STATE
 DEFAULT_AUDIT_LOG = PROJECT_ROOT / "data" / "swap_carry_guard_audit.jsonl"
+DEFAULT_SWITCH_HISTORY = PROJECT_ROOT / "data" / "swap_carry_switch_history.jsonl"
 
 IMBALANCE_RATIO = Decimal("0.05")
 LIQUIDATION_ALERT_RATIO = Decimal("0.015")
@@ -60,6 +62,8 @@ EXIT_CARRY_CONSECUTIVE_ROUNDS = 3
 SESSION_WARNING_THRESHOLD = timedelta(hours=24)
 SESSION_CRITICAL_THRESHOLD = timedelta(hours=6)
 SESSION_WARNING_COOLDOWN = timedelta(hours=2)
+SWITCH_NET_DELTA_TOLERANCE = execution.XAUS_QTY_STEP
+IGNORED_EXTERNAL_POSITIONS = frozenset({"BTC"})
 
 
 @dataclass(frozen=True)
@@ -142,6 +146,173 @@ class _SessionExpiredPreflight(RuntimeError):
     """会话已过期，必须在任何账户或交易调用前结束本轮。"""
 
 
+class _SwitchTradeRecorder:
+    """透明代理交易客户端，并记录切换期间真正接受的 RFQ。"""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self.phase = "close"
+        self.records: dict[str, list[dict[str, object]]] = {
+            "close": [],
+            "open": [],
+        }
+        self._quotes: dict[str, dict[str, object]] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        """未拦截的能力全部委托给真实客户端。"""
+        return getattr(self._client, name)
+
+    async def request_quote(
+        self,
+        underlying: str,
+        side: str,
+        qty: Decimal,
+        **kwargs: object,
+    ) -> object:
+        """记录报价耗时，并保存 accept 所需的成交上下文。"""
+        started = time.perf_counter()
+        try:
+            payload = await self._client.request_quote(
+                underlying,
+                side,
+                qty,
+                **kwargs,
+            )
+        except Exception as exc:
+            self.records[self.phase].append(
+                {
+                    "status": "failed",
+                    "market": underlying,
+                    "side": side,
+                    "execution_price": None,
+                    "quote_mid": None,
+                    "rfq_id": None,
+                    "filled_quantity": "0",
+                    "duration_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        3,
+                    ),
+                    "slippage_bp": None,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
+            raise
+        if not isinstance(payload, Mapping):
+            return payload
+        quote_id = payload.get("quote_id")
+        if isinstance(quote_id, str) and quote_id:
+            self._quotes[quote_id] = {
+                "market": underlying,
+                "side": side,
+                "quantity": qty,
+                "payload": payload,
+                "quote_duration_ms": (time.perf_counter() - started) * 1000,
+            }
+        return payload
+
+    async def accept_quote(
+        self,
+        *,
+        quote_id: str,
+        side: str,
+        max_slippage: float,
+        is_reduce_only: bool,
+    ) -> object:
+        """记录成交价、rfq_id、数量、耗时和相对报价中点滑点。"""
+        context = self._quotes.get(quote_id, {})
+        payload = context.get("payload")
+        quote_payload = payload if isinstance(payload, Mapping) else {}
+        market = str(context.get("market") or "未知")
+        quantity = context.get("quantity")
+        execution_price: Decimal | None = None
+        quote_mid: Decimal | None = None
+        slippage_bp: Decimal | None = None
+        try:
+            side_value = Side.BUY if side.lower() == "buy" else Side.SELL
+            execution_price = execution._quote_price(quote_payload, side_value)
+            bid = execution._decimal(
+                quote_payload.get("bid"),
+                label=f"{market} bid",
+                positive=True,
+            )
+            ask = execution._decimal(
+                quote_payload.get("ask"),
+                label=f"{market} ask",
+                positive=True,
+            )
+            quote_mid = (bid + ask) / Decimal("2")
+            direction = Decimal("1") if side_value is Side.BUY else Decimal("-1")
+            slippage_bp = (
+                direction
+                * (execution_price - quote_mid)
+                / quote_mid
+                * Decimal("10000")
+            )
+        except (TypeError, ValueError):
+            # 交易安全不依赖观测字段；缺失时在台账中保留 null。
+            pass
+
+        started = time.perf_counter()
+        try:
+            result = await self._client.accept_quote(
+                quote_id=quote_id,
+                side=side,
+                max_slippage=max_slippage,
+                is_reduce_only=is_reduce_only,
+            )
+        except Exception as exc:
+            accept_duration_ms = (time.perf_counter() - started) * 1000
+            self.records[self.phase].append(
+                {
+                    "status": "failed",
+                    "market": market,
+                    "side": side,
+                    "reduce_only": is_reduce_only,
+                    "execution_price": execution_price,
+                    "quote_mid": quote_mid,
+                    "rfq_id": None,
+                    "filled_quantity": "0",
+                    "duration_ms": round(
+                        float(context.get("quote_duration_ms", 0))
+                        + accept_duration_ms,
+                        3,
+                    ),
+                    "slippage_bp": slippage_bp,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
+            raise
+
+        accept_duration_ms = (time.perf_counter() - started) * 1000
+        rfq_id = (
+            result.get("rfq_id")
+            if isinstance(result, Mapping)
+            else getattr(result, "rfq_id", None)
+        )
+        self.records[self.phase].append(
+            {
+                "status": "succeeded",
+                "market": market,
+                "side": side,
+                "reduce_only": is_reduce_only,
+                "execution_price": execution_price,
+                "quote_mid": quote_mid,
+                "rfq_id": str(rfq_id) if rfq_id not in (None, "") else None,
+                # Variational RFQ accept 返回成交编号即表示报价数量全量成交。
+                "filled_quantity": str(quantity),
+                "duration_ms": round(
+                    float(context.get("quote_duration_ms", 0))
+                    + accept_duration_ms,
+                    3,
+                ),
+                "slippage_bp": slippage_bp,
+            }
+        )
+        return result
+
+
 def _json_default(value: object) -> str:
     """把审计载荷中的时间和十进制数稳定转换为字符串。"""
     if isinstance(value, datetime):
@@ -171,6 +342,206 @@ def _append_audit(path: Path, payload: Mapping[str, object]) -> None:
         )
 
 
+def _account_quantities(payload: object) -> dict[str, Decimal]:
+    """从真实 `/positions` schema 提取全部非重复标的数量。"""
+    quantities: dict[str, Decimal] = {}
+    for raw_position in _position_items(payload):
+        if not isinstance(raw_position, Mapping):
+            raise ValueError("/positions 持仓记录不是对象")
+        raw_info = raw_position.get("position_info", raw_position)
+        if not isinstance(raw_info, Mapping):
+            raise ValueError("/positions.position_info 不是对象")
+        raw_instrument = raw_info.get("instrument")
+        instrument = raw_instrument if isinstance(raw_instrument, Mapping) else {}
+        underlying = str(
+            instrument.get("underlying") or raw_info.get("underlying") or ""
+        ).strip().upper()
+        if not underlying:
+            raise ValueError("/positions 持仓缺少 instrument.underlying")
+        if underlying in quantities:
+            raise ValueError(f"/positions 返回重复标的 {underlying}")
+        quantities[underlying] = execution._decimal(
+            raw_info.get("qty", raw_info.get("size")),
+            label=f"{underlying} 持仓数量",
+        )
+    return quantities
+
+
+def _managed_legs() -> tuple[execution.CarryLeg, ...]:
+    """返回切换自检与台账覆盖的三个受管标的。"""
+    return (
+        execution.XAUS_LEG,
+        execution.XAU_LONG_LEG,
+        execution.XAUT_LEG,
+    )
+
+
+async def _switch_snapshot(
+    var: Any,
+    *,
+    positions_payload: object,
+    metadata: object | None,
+) -> dict[str, object]:
+    """读取一份权益净值和全受管腿仓位快照。"""
+    quantities = _account_quantities(positions_payload)
+    balance = await var.get_balance()
+    equity_value = (
+        balance.get("equity")
+        if isinstance(balance, Mapping)
+        else getattr(balance, "equity", None)
+    )
+    equity = execution._decimal(equity_value, label="账户权益")
+    legs: dict[str, dict[str, object]] = {}
+    for leg in _managed_legs():
+        quantity = quantities.get(leg.underlying, Decimal("0"))
+        price = (
+            execution._metadata_price(metadata, leg)
+            if metadata is not None
+            else None
+        )
+        notional = abs(quantity) * price if price is not None else None
+        legs[leg.underlying] = {
+            "quantity": str(quantity),
+            "notional_usd": _format_money(notional),
+        }
+    net_delta = sum(
+        (quantities.get(leg.underlying, Decimal("0")) for leg in _managed_legs()),
+        Decimal("0"),
+    )
+    external = {
+        underlying: str(quantity)
+        for underlying, quantity in quantities.items()
+        if underlying not in legs and quantity != 0
+    }
+    return {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "legs": legs,
+        "external_legs": external,
+        "net_delta": str(net_delta),
+        # get_balance 已包含 balance + upnl，因此这里是结算资金费后的账户净值。
+        "equity": str(equity),
+    }
+
+
+async def _await_managed_flat(
+    var: Any,
+) -> tuple[dict[str, Position], object, int]:
+    """轮询确认三个受管标的全部归零，并返回真实轮询次数。"""
+    payload: object = []
+    positions = {
+        leg.underlying: Position(leg.underlying, Decimal("0"))
+        for leg in _managed_legs()
+    }
+    for attempt in range(1, execution._FLAT_TRIES + 1):
+        payload = await var.get_positions()
+        positions = _carry_positions_from_payload(payload)
+        if all(position.is_flat for position in positions.values()):
+            return positions, payload, attempt
+        if attempt < execution._FLAT_TRIES:
+            await asyncio.sleep(execution._POLL_DELAY_S)
+    return positions, payload, execution._FLAT_TRIES
+
+
+def _switch_self_check(
+    target: execution.CarryStructure | str,
+    *,
+    account_positions_payload: object,
+    old_structure_was_flat: bool,
+    tolerance: Decimal = SWITCH_NET_DELTA_TOLERANCE,
+) -> dict[str, object]:
+    """在切换后校验旧仓、目标方向权重、净 delta 和结构外残仓。"""
+    selected = execution.resolve_structure(target)
+    quantities = _account_quantities(account_positions_payload)
+    target_positions = {
+        leg.underlying: Position(
+            leg.underlying,
+            quantities.get(leg.underlying, Decimal("0")),
+        )
+        for leg in selected.legs
+    }
+    imbalance = _imbalance_reason(selected, target_positions)
+    target_open = all(not position.is_flat for position in target_positions.values())
+    directions_and_weights_ok = target_open and imbalance is None
+    net_delta = sum(
+        (position.signed_size for position in target_positions.values()),
+        Decimal("0"),
+    )
+    residual_legs = sorted(
+        underlying
+        for underlying, quantity in quantities.items()
+        if quantity != 0
+        and underlying not in target_positions
+        and underlying not in IGNORED_EXTERNAL_POSITIONS
+    )
+    checks: dict[str, dict[str, object]] = {
+        "old_structure_flat": {
+            "passed": old_structure_was_flat,
+            "message": "开新结构前已确认三个受管标的全平",
+        },
+        "new_structure_directions_and_weights": {
+            "passed": directions_and_weights_ok,
+            "message": (
+                "目标结构方向与权重比例正确"
+                if directions_and_weights_ok
+                else imbalance or "目标结构未完整开出"
+            ),
+        },
+        "net_delta_within_tolerance": {
+            "passed": abs(net_delta) <= tolerance,
+            "net_delta": str(net_delta),
+            "tolerance": str(tolerance),
+        },
+        "no_external_residual_legs": {
+            "passed": not residual_legs,
+            "residual_legs": residual_legs,
+        },
+    }
+    passed = all(bool(check["passed"]) for check in checks.values())
+    return {
+        "performed": True,
+        "passed": passed,
+        "status": "通过" if passed else "失败",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checks": checks,
+    }
+
+
+def _residual_state(payload: object) -> tuple[str, bool]:
+    """把切换失败后的真实账户快照归类为空仓或残仓。"""
+    quantities = _account_quantities(payload)
+    has_residual = any(
+        quantity != 0
+        for underlying, quantity in quantities.items()
+        if underlying not in IGNORED_EXTERNAL_POSITIONS
+    )
+    return ("残仓" if has_residual else "空仓"), has_residual
+
+
+def _phase_payload(
+    recorder: _SwitchTradeRecorder,
+    phase: str,
+    *,
+    started: float,
+    status: str,
+) -> dict[str, object]:
+    """构造带总耗时的平仓或开仓阶段载荷。"""
+    records = recorder.records[phase]
+    successful = [record for record in records if record.get("status") == "succeeded"]
+    rollbacks = [record for record in successful if record.get("reduce_only") is True]
+    legs = [record for record in successful if record.get("reduce_only") is (phase == "close")]
+    payload: dict[str, object] = {
+        "status": status,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+        "legs": legs,
+        "failed_attempts": [
+            record for record in records if record.get("status") == "failed"
+        ],
+    }
+    if phase == "open":
+        payload["rollback_legs"] = rollbacks
+    return payload
+
+
 def _read_failure_count(path: Path) -> int:
     """读取上一轮连续失败数；损坏状态不冒充健康。"""
     try:
@@ -194,6 +565,15 @@ def _read_auto_open_state(path: Path, observed_at: datetime) -> tuple[int, bool]
         return attempts, incident
     except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
         return 0, False
+
+
+def _read_switch_incident(path: Path) -> bool:
+    """读取需人工清除的切换事故标记；损坏状态不伪造事故。"""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+    return isinstance(payload, Mapping) and payload.get("switch_incident") is True
 
 
 def _read_exit_carry_rounds(path: Path) -> int:
@@ -278,6 +658,7 @@ def _state_payload(
     open_attempt_date: str | None = None,
     daily_open_attempts: int = 0,
     auto_open_incident: bool = False,
+    switch_incident: bool = False,
     exit_carry_consecutive_rounds: int = 0,
     last_session_expiry_alert_at: datetime | None = None,
 ) -> dict[str, object]:
@@ -290,6 +671,7 @@ def _state_payload(
         "open_attempt_date": open_attempt_date or observed_at.date().isoformat(),
         "daily_open_attempts": daily_open_attempts,
         "auto_open_incident": auto_open_incident,
+        "switch_incident": switch_incident,
         "exit_carry_consecutive_rounds": exit_carry_consecutive_rounds,
         "last_session_expiry_alert_at": (
             last_session_expiry_alert_at.isoformat()
@@ -953,7 +1335,10 @@ async def _switch_readiness(
     if not auto_open:
         return False, "自动开仓已关闭，不能执行结构切换"
     if incident:
-        return False, "既有自动开仓 INCIDENT 未解除，不能执行结构切换"
+        return False, (
+            "既有 INCIDENT（auto_open_incident / switch_incident）未解除，"
+            "不能执行结构切换"
+        )
     if daily_attempts >= MAX_DAILY_OPEN_ATTEMPTS:
         return False, f"当日切换开仓尝试已达上限 {MAX_DAILY_OPEN_ATTEMPTS} 次"
     try:
@@ -1048,7 +1433,8 @@ async def _try_auto_open(
         return skip("自动开仓已由 --no-auto-open 关闭")
     if incident:
         return skip(
-            "自动开仓已因既有 INCIDENT 停止，需人工解除后才能恢复",
+            "自动开仓已因既有 INCIDENT（auto_open_incident / switch_incident）停止，"
+            "需人工解除后才能恢复",
             status="incident",
             result_code=1,
             incident_state=True,
@@ -1376,6 +1762,7 @@ async def run_once(
     heartbeat_path: Path = DEFAULT_HEARTBEAT,
     state_path: Path = DEFAULT_STATE,
     audit_path: Path = DEFAULT_AUDIT_LOG,
+    switch_history_path: Path = DEFAULT_SWITCH_HISTORY,
 ) -> int:
     """先执行全部平仓风控，再按长休市边界原子切换结构。"""
     configured_structure = execution.resolve_structure(structure)
@@ -1403,6 +1790,7 @@ async def run_once(
     daily_open_attempts, auto_open_incident = _read_auto_open_state(
         state_path, observed_at
     )
+    switch_incident = _read_switch_incident(state_path)
     exit_carry_rounds = _read_exit_carry_rounds(state_path)
     last_session_expiry_alert_at = _warn_session_expiry(
         session_expiry,
@@ -1447,10 +1835,18 @@ async def run_once(
         tuple[str, str, int, str | None, str],
         Mapping[str, Any],
     ] = {}
+    switch_record: dict[str, object] | None = None
+    switch_recorder: _SwitchTradeRecorder | None = None
+    switch_stage = "before_snapshot"
+    switch_started = 0.0
+    switch_phase_started = 0.0
+    switch_record_written = False
 
     def persist_state(status: str, message: str, failures: int) -> None:
         """写状态时始终保留每日计数和不可自动清除的 INCIDENT。"""
-        effective_status = "incident" if auto_open_incident else status
+        effective_status = (
+            "incident" if auto_open_incident or switch_incident else status
+        )
         _write_json(
             state_path,
             _state_payload(
@@ -1461,10 +1857,101 @@ async def run_once(
                 open_attempt_date=observed_at.date().isoformat(),
                 daily_open_attempts=daily_open_attempts,
                 auto_open_incident=auto_open_incident,
+                switch_incident=switch_incident,
                 exit_carry_consecutive_rounds=exit_carry_rounds,
                 last_session_expiry_alert_at=last_session_expiry_alert_at,
             ),
         )
+
+    async def finalize_switch_failure(error: BaseException) -> None:
+        """用当前可读事实补齐失败台账；记录失败不得遮蔽原始异常。"""
+        nonlocal switch_record_written
+        if switch_record is None or switch_record_written:
+            return
+        recorder = switch_recorder
+        if recorder is not None:
+            if switch_stage == "close":
+                switch_record["close_phase"] = _phase_payload(
+                    recorder,
+                    "close",
+                    started=switch_phase_started,
+                    status="failed",
+                )
+            elif switch_stage in {"open", "self_check"}:
+                if not isinstance(switch_record.get("open_phase"), Mapping) or (
+                    switch_record["open_phase"].get("status") == "pending"  # type: ignore[union-attr]
+                ):
+                    switch_record["open_phase"] = _phase_payload(
+                        recorder,
+                        "open",
+                        started=switch_phase_started,
+                        status="failed",
+                    )
+
+        residual_state = "未知"
+        has_residual: bool | None = None
+        try:
+            final_payload = await var.get_positions()
+            residual_state, has_residual = _residual_state(final_payload)
+            switch_record["after"] = await _switch_snapshot(
+                var,
+                positions_payload=final_payload,
+                metadata=metadata,
+            )
+        except Exception as snapshot_error:  # noqa: BLE001 原错误优先
+            switch_record["after_capture_error"] = (
+                f"{type(snapshot_error).__name__}: {snapshot_error}"
+            )
+            known_positions = positions.values()
+            if known_positions:
+                has_residual = any(not position.is_flat for position in known_positions)
+                residual_state = "残仓" if has_residual else "空仓"
+
+        before = switch_record.get("before")
+        after = switch_record.get("after")
+        if isinstance(before, Mapping) and isinstance(after, Mapping):
+            try:
+                switch_record["measured_wear_usd"] = str(
+                    execution._decimal(after.get("equity"), label="切换后权益")
+                    - execution._decimal(before.get("equity"), label="切换前权益")
+                )
+            except ValueError:
+                switch_record["measured_wear_usd"] = None
+
+        if switch_stage == "open" and has_residual is False:
+            switch_record["self_check"] = {
+                "performed": True,
+                "passed": None,
+                "status": "开仓失败，账户为空仓",
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "checks": {},
+            }
+        switch_record["status"] = "failed"
+        switch_record["failure"] = {
+            "stage": switch_stage,
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "residual_state": residual_state,
+            "has_residual_position": has_residual,
+        }
+        switch_record["total_duration_ms"] = round(
+            (time.perf_counter() - switch_started) * 1000,
+            3,
+        )
+        try:
+            _append_audit(switch_history_path, switch_record)
+        except Exception as ledger_error:  # noqa: BLE001 原始交易错误优先
+            _append_audit(
+                audit_path,
+                {
+                    "timestamp": observed_at,
+                    "event": "switch_ledger_write_failed",
+                    "level": "critical",
+                    "message": f"{type(ledger_error).__name__}: {ledger_error}",
+                },
+            )
+        else:
+            switch_record_written = True
 
     _append_audit(
         audit_path,
@@ -1480,6 +1967,7 @@ async def run_once(
             "auto_open_notional": auto_open_notional,
             "daily_open_attempts": daily_open_attempts,
             "auto_open_incident": auto_open_incident,
+            "switch_incident": switch_incident,
             "exit_carry_consecutive_rounds": exit_carry_rounds,
             "session_expires_at": session_expires_at,
             "session_hours_left": session_hours_left,
@@ -1797,7 +2285,7 @@ async def run_once(
                 auto_open=auto_open,
                 auto_open_notional=auto_open_notional,
                 daily_attempts=daily_open_attempts,
-                incident=auto_open_incident,
+                incident=auto_open_incident or switch_incident,
             )
             _append_audit(
                 audit_path,
@@ -1821,6 +2309,50 @@ async def run_once(
             assert current_structure is not None
             assert target_structure is not None
             auto_switch_attempted = True
+            switch_started = time.perf_counter()
+            switch_phase_started = switch_started
+            switch_record = {
+                "schema_version": 1,
+                "started_at": observed_at.isoformat(),
+                "status": "in_progress",
+                "direction": {
+                    "from": current_structure.name,
+                    "to": target_structure.name,
+                },
+                "trigger": {
+                    "types": ["时段边界", "目标结构变化"],
+                    "detail": target_structure_reason,
+                },
+                "before": None,
+                "close_phase": {
+                    "status": "pending",
+                    "duration_ms": 0,
+                    "legs": [],
+                    "failed_attempts": [],
+                },
+                "flat_confirmation": {
+                    "all_flat": False,
+                    "confirmed_at": None,
+                    "poll_count": 0,
+                },
+                "open_phase": {
+                    "status": "pending",
+                    "duration_ms": 0,
+                    "legs": [],
+                    "rollback_legs": [],
+                    "failed_attempts": [],
+                },
+                "after": None,
+                "measured_wear_usd": None,
+                "total_duration_ms": 0,
+                "self_check": {
+                    "performed": False,
+                    "passed": None,
+                    "status": "未执行",
+                    "checks": {},
+                },
+                "failure": None,
+            }
             _append_audit(
                 audit_path,
                 {
@@ -1831,14 +2363,33 @@ async def run_once(
                     "dry_run": dry_run,
                 },
             )
-            flatten_result = await _flatten(
+            before_payload = (
+                account_positions_payload
+                if account_positions_payload is not None
+                else await var.get_positions()
+            )
+            switch_record["before"] = await _switch_snapshot(
                 var,
+                positions_payload=before_payload,
+                metadata=metadata,
+            )
+            switch_recorder = _SwitchTradeRecorder(var)
+            switch_stage = "close"
+            switch_phase_started = time.perf_counter()
+            flatten_result = await _flatten(
+                switch_recorder,
                 structure=current_structure,
                 positions=positions,
                 xaus_known_closed=False,
                 dry_run=dry_run,
                 audit_path=audit_path,
                 observed_at=observed_at,
+            )
+            switch_record["close_phase"] = _phase_payload(
+                switch_recorder,
+                "close",
+                started=switch_phase_started,
+                status="completed" if flatten_result.complete else "failed",
             )
             if not flatten_result.complete:
                 raise CloseActionError(
@@ -1855,38 +2406,32 @@ async def run_once(
                 persist_state("dry_run", conclusion, 0)
                 result_code = 0
             else:
-                flat_result = await execution._await_flat(var, current_structure)
-                old_sizes = flat_result[:-1]
-                old_net_delta = flat_result[-1]
-                if any(size != 0 for size in old_sizes):
+                flat_positions, flat_payload, flat_poll_count = (
+                    await _await_managed_flat(switch_recorder)
+                )
+                old_net_delta = sum(
+                    (
+                        position.signed_size
+                        for position in flat_positions.values()
+                    ),
+                    Decimal("0"),
+                )
+                if any(
+                    not position.is_flat for position in flat_positions.values()
+                ):
                     detail = " ".join(
-                        f"{leg.underlying}={size}"
-                        for leg, size in zip(
-                            current_structure.legs,
-                            old_sizes,
-                            strict=True,
-                        )
+                        f"{underlying}={position.signed_size}"
+                        for underlying, position in flat_positions.items()
                     )
                     raise CloseActionError(
                         "切换平仓 accept 已返回，但旧结构仍未归零："
                         f"{detail} 净 delta={old_net_delta}"
                     )
-
-                target_positions = await execution._get_positions(
-                    var,
-                    target_structure,
-                )
-                if any(
-                    not position.is_flat
-                    for position in target_positions.values()
-                ):
-                    detail = " ".join(
-                        f"{underlying}={position.signed_size}"
-                        for underlying, position in target_positions.items()
-                    )
-                    raise CloseActionError(
-                        f"旧结构全平后目标结构仍有持仓，拒绝开仓：{detail}"
-                    )
+                switch_record["flat_confirmation"] = {
+                    "all_flat": True,
+                    "confirmed_at": datetime.now(timezone.utc).isoformat(),
+                    "poll_count": flat_poll_count,
+                }
                 _append_audit(
                     audit_path,
                     {
@@ -1894,18 +2439,25 @@ async def run_once(
                         "event": "auto_switch_flat_confirmed",
                         "current_structure": current_structure.name,
                         "target_structure": target_structure.name,
+                        "poll_count": flat_poll_count,
                     },
                 )
 
                 selected = target_structure
-                positions = target_positions
+                positions = {
+                    leg.underlying: flat_positions[leg.underlying]
+                    for leg in selected.legs
+                }
                 prices = {
                     leg.underlying: execution._metadata_price(metadata, leg)
                     for leg in selected.legs
                 }
                 funding_availability = target_funding_availability
+                switch_stage = "open"
+                switch_recorder.phase = "open"
+                switch_phase_started = time.perf_counter()
                 open_result = await _try_auto_open(
-                    var,
+                    switch_recorder,
                     structure=selected,
                     target_structure=target_structure,
                     positions=positions,
@@ -1917,12 +2469,18 @@ async def run_once(
                     auto_open=auto_open,
                     auto_open_notional=auto_open_notional,
                     daily_attempts=daily_open_attempts,
-                    incident=auto_open_incident,
+                    incident=auto_open_incident or switch_incident,
                     dry_run=False,
                     audit_path=audit_path,
                     observed_at=observed_at,
                     funding_rate_overrides=target_funding_overrides,
                     enforce_min_carry=False,
+                )
+                switch_record["open_phase"] = _phase_payload(
+                    switch_recorder,
+                    "open",
+                    started=switch_phase_started,
+                    status="completed" if open_result.result_code == 0 else "failed",
                 )
                 auto_open_attempted = open_result.attempted
                 auto_open_conclusion = open_result.conclusion
@@ -1933,21 +2491,97 @@ async def run_once(
                     previous_failures + 1 if result_code != 0 else 0
                 )
                 if result_code == 0:
-                    auto_switch_conclusion = (
-                        f"已从 {current_structure.name} 切换为 "
-                        f"{target_structure.name}"
+                    switch_stage = "self_check"
+                    account_positions_payload = await var.get_positions()
+                    latest_positions = _carry_positions_from_payload(
+                        account_positions_payload
                     )
-                    conclusion = auto_switch_conclusion
-                    _append_audit(
-                        audit_path,
-                        {
-                            "timestamp": observed_at,
-                            "event": "auto_switch_succeeded",
-                            "current_structure": current_structure.name,
-                            "target_structure": target_structure.name,
-                            "daily_open_attempts": daily_open_attempts,
-                        },
+                    positions = {
+                        leg.underlying: latest_positions[leg.underlying]
+                        for leg in selected.legs
+                    }
+                    switch_record["after"] = await _switch_snapshot(
+                        var,
+                        positions_payload=account_positions_payload,
+                        metadata=metadata,
                     )
+                    before_snapshot = switch_record["before"]
+                    after_snapshot = switch_record["after"]
+                    assert isinstance(before_snapshot, Mapping)
+                    assert isinstance(after_snapshot, Mapping)
+                    switch_record["measured_wear_usd"] = str(
+                        execution._decimal(
+                            after_snapshot.get("equity"),
+                            label="切换后权益",
+                        )
+                        - execution._decimal(
+                            before_snapshot.get("equity"),
+                            label="切换前权益",
+                        )
+                    )
+                    self_check = _switch_self_check(
+                        target_structure,
+                        account_positions_payload=account_positions_payload,
+                        old_structure_was_flat=True,
+                    )
+                    switch_record["self_check"] = self_check
+                    if self_check["passed"] is True:
+                        auto_switch_conclusion = (
+                            f"已从 {current_structure.name} 切换为 "
+                            f"{target_structure.name}，切换后自检通过"
+                        )
+                        conclusion = auto_switch_conclusion
+                        switch_record["status"] = "completed"
+                        switch_record["completed_at"] = datetime.now(
+                            timezone.utc
+                        ).isoformat()
+                        _append_audit(
+                            audit_path,
+                            {
+                                "timestamp": observed_at,
+                                "event": "auto_switch_succeeded",
+                                "current_structure": current_structure.name,
+                                "target_structure": target_structure.name,
+                                "daily_open_attempts": daily_open_attempts,
+                                "self_check": self_check,
+                            },
+                        )
+                    else:
+                        switch_incident = True
+                        result_code = 1
+                        consecutive_failures = previous_failures + 1
+                        auto_switch_conclusion = (
+                            f"{current_structure.name}→{target_structure.name} "
+                            "切换后自检失败，已设置 switch_incident"
+                        )
+                        conclusion = auto_switch_conclusion
+                        residual_state, has_residual = _residual_state(
+                            account_positions_payload
+                        )
+                        switch_record["status"] = "failed"
+                        switch_record["failure"] = {
+                            "stage": "self_check",
+                            "error_type": "SwitchSelfCheckError",
+                            "message": auto_switch_conclusion,
+                            "residual_state": residual_state,
+                            "has_residual_position": has_residual,
+                        }
+                        _append_audit(
+                            audit_path,
+                            {
+                                "timestamp": observed_at,
+                                "event": "auto_switch_self_check_failed",
+                                "level": "critical",
+                                "current_structure": current_structure.name,
+                                "target_structure": target_structure.name,
+                                "message": auto_switch_conclusion,
+                                "self_check": self_check,
+                            },
+                        )
+                        notify(
+                            "Swap carry 切换后自检失败",
+                            f"{auto_switch_conclusion}；请立即人工核对切换台账",
+                        )
                 else:
                     auto_switch_conclusion = (
                         f"{current_structure.name} 已全平，但 "
@@ -1966,15 +2600,33 @@ async def run_once(
                             "daily_open_attempts": daily_open_attempts,
                         },
                     )
+                    await finalize_switch_failure(
+                        RuntimeError(open_result.conclusion)
+                    )
                 exit_carry_rounds = 0
+                if not switch_record_written:
+                    switch_record["total_duration_ms"] = round(
+                        (time.perf_counter() - switch_started) * 1000,
+                        3,
+                    )
+                    _append_audit(switch_history_path, switch_record)
+                    switch_record_written = True
                 persist_state(
-                    open_result.status,
+                    "incident" if switch_incident else open_result.status,
                     conclusion,
                     consecutive_failures,
                 )
         elif reason is None and all_flat:
             exit_carry_rounds = 0
-            if auto_switch and target_structure is None:
+            if switch_incident and not auto_open_incident:
+                open_result = AutoOpenResult(
+                    False,
+                    "自动开仓已因既有 switch_incident 停止，"
+                    "需人工核对并清除标记后才能恢复",
+                    daily_open_attempts,
+                    status="incident",
+                )
+            elif auto_switch and target_structure is None:
                 open_result = AutoOpenResult(
                     False,
                     auto_switch_conclusion,
@@ -1994,7 +2646,7 @@ async def run_once(
                     auto_open=auto_open,
                     auto_open_notional=auto_open_notional,
                     daily_attempts=daily_open_attempts,
-                    incident=auto_open_incident,
+                    incident=auto_open_incident or switch_incident,
                     dry_run=dry_run,
                     audit_path=audit_path,
                     observed_at=observed_at,
@@ -2103,6 +2755,7 @@ async def run_once(
         persist_state("session_expired", conclusion, consecutive_failures)
         result_code = 1
     except (VariationalJurisdictionError, VariationalAuthError) as exc:
+        await finalize_switch_failure(exc)
         consecutive_failures = previous_failures + 1
         category = (
             "地区封锁"
@@ -2115,6 +2768,7 @@ async def run_once(
         print(f"🚨 {conclusion}")
         result_code = 1
     except Exception as exc:  # noqa: BLE001 任意未知错误都不得静默
+        await finalize_switch_failure(exc)
         consecutive_failures = previous_failures + 1
         conclusion = f"守护轮次失败，无法确认已安全平仓：{type(exc).__name__}: {exc}"
         persist_state("action_failed", conclusion, consecutive_failures)
@@ -2215,6 +2869,7 @@ async def run_once(
             "auto_open_conclusion": auto_open_conclusion,
             "daily_open_attempts": daily_open_attempts,
             "auto_open_incident": auto_open_incident,
+            "switch_incident": switch_incident,
             "auto_switch": auto_switch,
             "auto_switch_attempted": auto_switch_attempted,
             "auto_switch_conclusion": auto_switch_conclusion,

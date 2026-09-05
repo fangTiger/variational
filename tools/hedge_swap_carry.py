@@ -582,7 +582,15 @@ async def _prepare_open_quotes(
         step * first_leg.weight / leg.weight
         for leg, (_minimum, step) in zip(selected.legs, constraints, strict=True)
     )
-    reference_price = _quote_price(probes[0], first_leg.open_side)
+    try:
+        # 目标名义按报价标记价换算数量；最终成交价名义仍会在下方严格校验。
+        reference_price = _decimal(
+            probes[0].get("mark_price"),
+            label=f"{first_leg.underlying} 标记价",
+            positive=True,
+        )
+    except ValueError:
+        reference_price = _quote_price(probes[0], first_leg.open_side)
     first_qty = _round_qty(target_notional / reference_price, first_step)
     if first_qty < first_minimum:
         raise SystemExit(

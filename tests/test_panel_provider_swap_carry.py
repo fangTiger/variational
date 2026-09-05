@@ -232,11 +232,19 @@ def _client(**overrides: object) -> StrictClient:
 def _collect(tmp_path: Path, client: StrictClient, **path_overrides: object):
     from panel.providers.swap_carry import collect
 
+    switch_history_content = path_overrides.pop("switch_history_content", None)
     heartbeat_path, state_path = _paths(tmp_path, **path_overrides)
+    switch_history_path = tmp_path / "switch_history.jsonl"
+    if switch_history_content is not None:
+        switch_history_path.write_text(
+            str(switch_history_content),
+            encoding="utf-8",
+        )
     return collect(
         client=client,
         heartbeat_path=heartbeat_path,
         state_path=state_path,
+        switch_history_path=switch_history_path,
         now=NOW,
     )
 
@@ -297,6 +305,69 @@ def test_flat_position_displays_normally_without_liquidation_calls(tmp_path) -> 
     assert _metrics(status)["XAUS 强平"].value == "无持仓"
     assert _metrics(status)["XAU 强平"].value == "无持仓"
     assert not any(call.startswith("liquidation:") for call in client.calls)
+    assert _metrics(status)["上次切换"].value == "尚无切换"
+
+
+def test_panel_displays_last_and_next_switch(tmp_path) -> None:
+    """面板必须从本地台账展示最近切换，并按 XAUS 时段推算下一次。"""
+    record = {
+        "schema_version": 1,
+        "started_at": "2026-09-06T22:00:00+00:00",
+        "completed_at": "2026-09-06T22:00:04+00:00",
+        "status": "completed",
+        "direction": {"from": "XAU_XAUT", "to": "XAUS_XAU"},
+        "measured_wear_usd": "-0.42",
+        "total_duration_ms": 4000,
+        "self_check": {"performed": True, "passed": True},
+    }
+
+    status = _collect(
+        tmp_path,
+        _client(),
+        switch_history_content=json.dumps(record, ensure_ascii=False) + "\n",
+    )
+    metrics = _metrics(status)
+
+    assert metrics["上次切换"].value == (
+        "09-06 22:00 UTC / XAU_XAUT→XAUS_XAU / 实测磨损 -0.42 USDC"
+    )
+    assert metrics["下次切换预计"].value == "暂无可推算的长休市切换"
+
+
+def test_panel_corrupt_switch_ledger_degrades_without_raising(tmp_path) -> None:
+    """切换台账损坏只能令该指标降级，不能拖垮整张卡片。"""
+    status = _collect(
+        tmp_path,
+        _client(),
+        switch_history_content="{损坏\n",
+    )
+
+    assert status.error is None
+    metric = _metrics(status)["上次切换"]
+    assert metric.value == "台账不可用（文件损坏）"
+    assert metric.tone == "warn"
+
+
+def test_panel_switch_incident_is_critical(tmp_path) -> None:
+    """切换事故必须在面板升级 critical，并给出人工清除指引。"""
+    status = _collect(
+        tmp_path,
+        _client(),
+        state={
+            "status": "incident",
+            "message": "切换后净 delta 超容差",
+            "consecutive_failures": 1,
+            "switch_incident": True,
+        },
+        heartbeat_extra={"switch_incident": True},
+    )
+
+    alert = next(
+        item for item in status.alerts if item.key == "swap_carry_switch_incident"
+    )
+    assert alert.level == "critical"
+    assert "人工核对台账" in alert.action
+    assert "清除 switch_incident 标记" in alert.action
 
 
 def test_stale_heartbeat_marks_dead_and_emits_critical_alert(tmp_path) -> None:
