@@ -14,11 +14,36 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from datetime import datetime, timezone
 
-from adapters.variational_client import Session, VariationalAuthError, VariationalClient
+from adapters.variational_client import (
+    Session,
+    VariationalAuthError,
+    VariationalClient,
+    get_session_expiry,
+)
 
 
-async def _run(session: Session) -> int:
+async def _run(session: Session, *, now: datetime | None = None) -> int:
+    observed_at = now or datetime.now(timezone.utc)
+    expiry = get_session_expiry(
+        session.cookies,
+        wallet_address=session.wallet_address,
+        now=observed_at,
+    )
+    if expiry is None:
+        print("会话到期：无法从 vr-token 解析 exp")
+    elif expiry.remaining.total_seconds() <= 0:
+        print(
+            f"会话到期：{expiry.expires_at.isoformat()}；"
+            f"已过期 {abs(expiry.hours_left):.1f} 小时"
+        )
+    else:
+        print(
+            f"会话到期：{expiry.expires_at.isoformat()}；"
+            f"剩余 {expiry.hours_left:.1f} 小时"
+        )
+
     client = VariationalClient(session)
     try:
         print("→ 调用 /positions …")

@@ -6,13 +6,14 @@ import math
 from collections.abc import Callable
 
 from panel.actions import to_panel_alert
-from panel.providers import attribution, grid, hedge
+from panel.providers import attribution, grid, hedge, swap_carry
 from panel.types import PanelAlert, SystemStatus
 
 #: (显示名, 采集函数)。加系统改这里，其他文件都不用动。
 PROVIDERS: list[tuple[str, Callable[[], SystemStatus]]] = [
     (grid.NAME, grid.collect),
     (hedge.NAME, hedge.collect),
+    (swap_carry.NAME, swap_carry.collect),
     (attribution.NAME, attribution.collect),
 ]
 
@@ -66,12 +67,14 @@ def total_pnl_summary(systems: list[SystemStatus]) -> tuple[float, list[str]]:
     return total, missing
 
 
-def collect_panel_alerts() -> list[PanelAlert]:
+def collect_panel_alerts(
+    systems: list[SystemStatus] | None = None,
+) -> list[PanelAlert]:
     """取全局告警并翻译成带动作指引的形式。"""
     try:
         raw = _collect_alerts()
     except Exception as exc:  # noqa: BLE001
-        return [
+        alerts = [
             PanelAlert(
                 key="panel_alert_failure",
                 level="critical",
@@ -79,4 +82,9 @@ def collect_panel_alerts() -> list[PanelAlert]:
                 action=f"面板无法判断是否有异常，不要依赖本页。告诉 Claude 排查：{exc}",
             )
         ]
-    return [to_panel_alert(a) for a in raw]
+    else:
+        alerts = [to_panel_alert(a) for a in raw]
+    if systems is not None:
+        for system in systems:
+            alerts.extend(system.alerts)
+    return alerts

@@ -211,16 +211,55 @@ def _position_client() -> VariationalClient:
 
 
 def test_get_position_exact_disambiguates_xau_and_xaut() -> None:
-    """精确匹配时 XAU 不能误命中 XAUT，同时默认旧子串行为保持不变。"""
+    """精确匹配时 XAU 不能误命中 XAUT，同时保留显式旧子串行为。"""
     client = _position_client()
 
-    legacy = asyncio.run(client.get_position("XAU"))
+    legacy = asyncio.run(client.get_position("XAU", exact=False))
     xau = asyncio.run(client.get_position("XAU", exact=True))
     xaut = asyncio.run(client.get_position("XAUT", exact=True))
 
     assert legacy.signed_size == Decimal("-0.25")
     assert xau.signed_size == Decimal("0.25")
     assert xaut.signed_size == Decimal("-0.25")
+
+
+def test_get_position_defaults_to_exact_for_xau_perpetual_and_xaus_swap() -> None:
+    """默认查询必须按真实 instrument.underlying 区分 XAU 与 XAUS。"""
+    client = object.__new__(VariationalClient)
+
+    async def fake_get_positions():
+        return {
+            "positions": [
+                {
+                    "position_info": {
+                        "instrument": {
+                            "underlying": "XAUS",
+                            "instrument_type": "swap",
+                        },
+                        "qty": "-1.75",
+                    }
+                },
+                {
+                    "position_info": {
+                        "instrument": {
+                            "underlying": "XAU",
+                            "instrument_type": "perpetual_rwa_future",
+                        },
+                        "qty": "0.25",
+                    }
+                },
+            ]
+        }
+
+    client.get_positions = fake_get_positions
+
+    xau = asyncio.run(client.get_position("XAU"))
+    xaus = asyncio.run(client.get_position("XAUS"))
+
+    assert xau.signed_size == Decimal("0.25")
+    assert xau.raw["position_info"]["instrument"]["underlying"] == "XAU"
+    assert xaus.signed_size == Decimal("-1.75")
+    assert xaus.raw["position_info"]["instrument"]["underlying"] == "XAUS"
 
 
 def test_gold_net_delta_uses_exact_positions() -> None:

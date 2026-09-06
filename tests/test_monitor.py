@@ -1,27 +1,40 @@
-"""资金费归一化与方向选择测试。"""
+"""资金费归一化、方向选择与方向状态持久化测试。"""
 
 from __future__ import annotations
 
 from decimal import Decimal
 
 from grid.grid_state import GridState, save_state
+from tracking import monitor
 from tracking.monitor import compute_funding_view
 from tools import grid_monitor, run_grid
 
 
 def test_funding_normalization_and_direction() -> None:
-    """Variational 0.062%/8h vs Extended 0.000013(小数)/1h。"""
-    v = compute_funding_view(Decimal("0.062"), Decimal("0.000013"))
-    # Variational 已是 %/8h
-    assert v.var_pct_8h == Decimal("0.062")
-    # Extended: 0.000013 * 100 * 8 = 0.0104 %/8h
+    """Variational 预测值按年化小数换算后，再与 Extended 的 8h 口径比较。"""
+    # 0.066721 是 /funding/v2 的真实量级：正确含义为年化 6.6721%。
+    v = compute_funding_view(Decimal("0.066721"), Decimal("0.000013"))
+    assert v.var_pct_8h * Decimal("1095") == Decimal("6.672100")
+    # Extended 算法暂时保持原样：0.000013 * 100 * 8 = 0.0104 %/8h。
     assert abs(v.ext_pct_8h - Decimal("0.0104")) < Decimal("1e-9")
-    # var > ext → 推荐 Variational 做空
-    assert "做空" in v.recommended and "Variational" in v.recommended
-    # 净 carry = 0.062 - 0.0104 = 0.0516 %/8h
-    assert abs(v.carry_short_var_pct_8h - Decimal("0.0516")) < Decimal("1e-9")
-    # 年化 = 0.0516 * 1095 ≈ 56.5%
-    assert Decimal("55") < v.annualized_pct < Decimal("58")
+    # 新口径下 Extended 费率更高，方向应翻转为做多 Variational。
+    assert "做多" in v.recommended and "Variational" in v.recommended
+    assert v.carry_short_var_pct_8h < 0
+    assert v.annualized_pct == Decimal("4.715900")
+    assert "折算 %/8h" in v.pretty()
+
+
+def test_rejects_old_variational_percent_per_period_interpretation() -> None:
+    """拒绝把 0.066721 误读成 0.066721%/8h 的旧口径。"""
+    predicted = Decimal("0.066721")
+    view = compute_funding_view(predicted, Decimal("0"))
+
+    # 旧算法会得到 73.059495% 年化，远离历史已结算约 2.5%~11% 的区间。
+    old_annualized_pct = predicted * Decimal("1095")
+    assert old_annualized_pct == Decimal("73.059495")
+    assert view.var_pct_8h != predicted
+    # 新算法把原值直接视为年化小数，即年化 6.6721%。
+    assert view.var_pct_8h * Decimal("1095") == Decimal("6.672100")
 
 
 def test_direction_flips_when_extended_higher() -> None:
@@ -31,6 +44,127 @@ def test_direction_flips_when_extended_higher() -> None:
     assert v.carry_short_var_pct_8h < 0
     assert "做多" in v.recommended and "Variational" in v.recommended
     assert v.annualized_pct > 0  # 推荐方向年化应为正
+
+
+def test_extended_funding_rate_is_visibly_uncalibrated() -> None:
+    """任何资金费视图都必须明确标出 Extended 单位尚未经结算校准。"""
+    view = compute_funding_view(Decimal("0.066721"), Decimal("0.000013"))
+
+    assert view.extended_calibrated is False
+    assert "Extended" in view.pretty()
+    assert "未经校准" in view.pretty()
+
+
+def test_compute_funding_view_is_pure_and_returns_direction() -> None:
+    """相同显式输入必须得到相同结果，且模块不得保留方向状态。"""
+    first = compute_funding_view(
+        Decimal("0"),
+        Decimal("0.00001"),
+        previous_direction="short_variational",
+    )
+    second = compute_funding_view(
+        Decimal("0"),
+        Decimal("0.00001"),
+        previous_direction="short_variational",
+    )
+
+    assert first == second
+    assert first.direction == "long_variational"
+    assert any("方向翻转" in warning for warning in first.warnings)
+    assert not hasattr(monitor, "_last_recommended_direction")
+
+
+def test_close_funding_rates_produce_unstable_direction_warning() -> None:
+    """两腿折算费率相同或接近时必须提示方向不稳健。"""
+    view = compute_funding_view(Decimal("0.00876"), Decimal("0.000001"))
+
+    assert any("不稳健" in warning for warning in view.warnings)
+
+
+def test_direction_flip_is_detected_across_independent_calls(tmp_path) -> None:
+    """每次重新读取同一状态文件，模拟两个一次性 CLI 进程。"""
+    state_path = tmp_path / "funding_direction.json"
+
+    first = monitor.compute_funding_view_with_state(
+        Decimal("0.10"),
+        Decimal("0"),
+        venue="variational",
+        market="BTC",
+        state_path=state_path,
+    )
+    second = monitor.compute_funding_view_with_state(
+        Decimal("0"),
+        Decimal("0.00001"),
+        venue="variational",
+        market="BTC",
+        state_path=state_path,
+    )
+
+    assert first.direction == "short_variational"
+    assert not any("方向翻转" in warning for warning in first.warnings)
+    assert second.direction == "long_variational"
+    assert any("与上次运行相比方向翻转" in warning for warning in second.warnings)
+
+
+def test_direction_state_is_isolated_by_venue_and_market(tmp_path) -> None:
+    """一个标的的方向不得污染另一个标的或交易场所。"""
+    state_path = tmp_path / "funding_direction.json"
+    monitor.compute_funding_view_with_state(
+        Decimal("0.10"),
+        Decimal("0"),
+        venue="variational",
+        market="BTC",
+        state_path=state_path,
+    )
+
+    other_market = monitor.compute_funding_view_with_state(
+        Decimal("0"),
+        Decimal("0.00001"),
+        venue="variational",
+        market="XAU",
+        state_path=state_path,
+    )
+    other_venue = monitor.compute_funding_view_with_state(
+        Decimal("0"),
+        Decimal("0.00001"),
+        venue="extended",
+        market="BTC",
+        state_path=state_path,
+    )
+
+    assert not any("方向翻转" in warning for warning in other_market.warnings)
+    assert not any("方向翻转" in warning for warning in other_venue.warnings)
+
+
+def test_direction_state_corruption_and_write_failure_do_not_crash(
+    tmp_path, caplog
+) -> None:
+    """状态损坏或父路径不可写时降级成无历史方向并记录日志。"""
+    corrupt_path = tmp_path / "corrupt.json"
+    corrupt_path.write_text("{broken", encoding="utf-8")
+
+    corrupt_view = monitor.compute_funding_view_with_state(
+        Decimal("0.10"),
+        Decimal("0"),
+        venue="variational",
+        market="BTC",
+        state_path=corrupt_path,
+    )
+
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("占位", encoding="utf-8")
+    blocked_view = monitor.compute_funding_view_with_state(
+        Decimal("0.10"),
+        Decimal("0"),
+        venue="variational",
+        market="BTC",
+        state_path=blocked_parent / "state.json",
+    )
+
+    assert corrupt_view.direction == "short_variational"
+    assert blocked_view.direction == "short_variational"
+    assert "读取资金方向状态失败" in caplog.text
+    assert "写入资金方向状态失败" in caplog.text
 
 
 def test_run_grid_trend_aware_cli_defaults_and_overrides() -> None:

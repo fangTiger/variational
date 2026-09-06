@@ -35,11 +35,18 @@ async def _main(once: bool, interval: float) -> None:
     ext = ExtendedClient.from_env()
     await ext.connect()
     tracker = MetricsTracker()
+    previous_direction = None
 
     try:
         while True:
             try:
-                await run_once(var, ext, tracker)
+                snapshot = await run_once(
+                    var,
+                    ext,
+                    tracker,
+                    previous_direction=previous_direction,
+                )
+                previous_direction = snapshot.funding.direction
             except Exception as exc:  # noqa: BLE001 单轮异常不退出
                 print(f"⚠️ 本轮采集异常：{type(exc).__name__}: {exc}")
             if once:

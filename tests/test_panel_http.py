@@ -29,3 +29,22 @@ def test_build_unified_page_survives_total_failure(monkeypatch):
     html = build_unified_page()
     assert "<!doctype html>" in html
     assert "全炸了" in html
+
+
+def test_build_unified_page_passes_systems_to_alert_collection(monkeypatch):
+    """页面告警采集必须能看到本轮 provider 产出的系统快照。"""
+    import panel.registry as registry
+    from panel.types import SystemStatus
+
+    systems = [SystemStatus(name="A", alive=True, summary="")]
+    seen: list[list[SystemStatus]] = []
+    monkeypatch.setattr(registry, "collect_all", lambda: systems)
+    monkeypatch.setattr(
+        registry,
+        "collect_panel_alerts",
+        lambda got: seen.append(got) or [],
+    )
+
+    build_unified_page()
+
+    assert seen == [systems]
