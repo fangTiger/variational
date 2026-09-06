@@ -8,6 +8,8 @@ __pycache__/
 venv/
 env/
 .env
+.env.*
+!.env.example
 
 # 日志（log/ 是历史笔误，实际目录是 logs/，两个都留着防回潮）
 log/
