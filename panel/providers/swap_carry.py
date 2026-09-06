@@ -27,14 +27,30 @@ def _leg_value(
     size: Decimal,
     notional: Decimal | None,
     weight: Decimal,
+    unrealized_pnl: Decimal | None,
 ) -> str:
-    """格式化单腿权重、数量与绝对名义。"""
+    """格式化单腿权重、数量、绝对名义与未实现盈亏。"""
     value = f"权重={weight} / {size:+.5f}"
     if notional is not None:
         value += f" / ${notional:,.2f}"
     else:
         value += " / 无数据"
+    if unrealized_pnl is not None:
+        value += f" / 未实现盈亏={unrealized_pnl:+.2f} USDC"
+    else:
+        value += " / 未实现盈亏=无数据"
     return value
+
+
+def _position_upnl(position: Position) -> Decimal | None:
+    """从已读取的原始持仓中提取未实现盈亏，不额外请求接口。"""
+    raw = position.raw
+    if not isinstance(raw, Mapping) or raw.get("upnl") in (None, ""):
+        return None
+    try:
+        return carry._decimal(raw["upnl"], label=f"{position.market} 未实现盈亏")
+    except ValueError:
+        return None
 
 
 def _carry_tone(value: Decimal | None) -> str:
@@ -74,7 +90,7 @@ def _read_heartbeat(
     stale = age > carry.SWAP_CARRY_GUARD_STALE_AFTER
     metric = Metric(
         "守护进程心跳",
-        f"上次运行于 {age_minutes:.1f} 分钟前",
+        f"{_format_datetime(timestamp)}（{age_minutes:.1f} 分钟前）",
         "bad" if stale else "good",
     )
     if not stale:
@@ -581,6 +597,7 @@ async def _collect(
                 positions[leg.underlying].signed_size,
                 notionals[leg.underlying],
                 leg.weight,
+                _position_upnl(positions[leg.underlying]),
             ),
         )
         for leg in selected.legs

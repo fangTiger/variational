@@ -90,6 +90,7 @@ class StrictClient:
         self,
         *,
         positions: dict[str, Decimal] | BaseException | None = None,
+        upnls: dict[str, Decimal] | None = None,
         metadata: object | BaseException | None = None,
         liquidations: dict[str, object] | BaseException | None = None,
         xaus_rate: Decimal | BaseException | None = None,
@@ -98,6 +99,7 @@ class StrictClient:
         transfers: list[dict[str, object]] | BaseException | None = None,
     ) -> None:
         self.positions = positions
+        self.upnls = upnls or {}
         self.metadata = metadata
         self.liquidations = liquidations
         self.xaus_rate = xaus_rate
@@ -133,7 +135,10 @@ class StrictClient:
                 "position_info": {
                     "instrument": {"underlying": underlying},
                     "qty": str(qty),
-                }
+                },
+                "upnl": str(self.upnls[underlying])
+                if underlying in self.upnls
+                else None,
             }
             for underlying, qty in positions.items()
             if qty != 0
@@ -215,6 +220,7 @@ def _paths(
 def _client(**overrides: object) -> StrictClient:
     values: dict[str, object] = {
         "positions": {"XAUS": Decimal("0.0125"), "XAU": Decimal("-0.0125")},
+        "upnls": {"XAUS": Decimal("1.25"), "XAU": Decimal("-0.75")},
         "metadata": _metadata(),
         "liquidations": {
             "XAUS": (Decimal("4000"), Decimal("3000")),
@@ -267,10 +273,12 @@ def test_normal_position_reports_all_metrics_and_weekly_actual_funding(tmp_path)
     assert status.error is None
     assert status.summary == "持仓中，净 carry +8.2%/年"
     assert (metrics["XAUS 多腿"].value, metrics["XAUS 多腿"].tone) == (
-        "权重=1 / +0.01250 / $50.00",
+        "权重=1 / +0.01250 / $50.00 / 未实现盈亏=+1.25 USDC",
         "normal",
     )
-    assert metrics["XAU 空腿"].value == "权重=1 / -0.01250 / $50.00"
+    assert metrics["XAU 空腿"].value == (
+        "权重=1 / -0.01250 / $50.00 / 未实现盈亏=-0.75 USDC"
+    )
     assert (metrics["净 delta"].value, metrics["净 delta"].tone) == (
         "+0.00000",
         "good",
@@ -285,7 +293,7 @@ def test_normal_position_reports_all_metrics_and_weekly_actual_funding(tmp_path)
     assert "可交易" in metrics["XAUS 时段"].value
     assert "距下次休市=6小时30分钟" in metrics["XAUS 时段"].value
     assert "下次开市=09-08 22:00 UTC" in metrics["XAUS 时段"].value
-    assert metrics["守护进程心跳"].value == "上次运行于 5.0 分钟前"
+    assert metrics["守护进程心跳"].value == "09-08 11:55 UTC（5.0 分钟前）"
     assert metrics["本周已结算资金费"].value == (
         "XAUS -1.25 / XAU +1.75 / 合计 +0.50 USDC"
     )

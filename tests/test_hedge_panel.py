@@ -267,19 +267,54 @@ def test_build_page_does_not_collect_swap_carry(monkeypatch) -> None:
     assert 'class="overview"' in html
 
 
-def test_swap_carry_block_renders_summary_and_all_metric_tones() -> None:
-    """正常快照要完整展示摘要与指标，并复用页面既有配色 class。"""
-    status = SystemStatus(
+def _swap_carry_status(
+    *,
+    alive: bool = True,
+    net_delta: str = "+0.00000",
+    net_tone: str = "good",
+    xaus_liquidation: str = "强平价=3000，距离=25.00%（mark=4000）",
+) -> SystemStatus:
+    """生成包含卡片所需字段的 swap carry 快照。"""
+    heartbeat_value = (
+        "09-08 11:55 UTC（5.0 分钟前）"
+        if alive
+        else "09-08 11:44 UTC（16.0 分钟前）"
+    )
+    return SystemStatus(
         name="Swap Carry（测试）",
-        alive=True,
-        summary="持仓中，净 carry +12.5%/年",
+        alive=alive,
+        summary="持仓中，净 carry +8.2%/年",
         metrics=[
-            Metric("当前结构", "XAUS_XAU", "normal"),
-            Metric("守护进程心跳", "30 秒前", "good"),
+            Metric("当前结构", "XAUS_XAU"),
+            Metric(
+                "XAUS 多腿",
+                "权重=1 / +0.01250 / $50.00 / 未实现盈亏=+1.25 USDC",
+            ),
+            Metric(
+                "XAU 空腿",
+                "权重=1 / -0.01250 / $50.00 / 未实现盈亏=-0.75 USDC",
+            ),
+            Metric("净 delta", net_delta, net_tone),
+            Metric("净 carry 年化", "+8.2%", "good"),
+            Metric("XAUS 强平", xaus_liquidation),
+            Metric("XAU 强平", "强平价=4500，距离=12.50%（mark=4000）"),
             Metric("会话剩余", "18.0 小时", "warn"),
-            Metric("净 delta", "+0.02000", "bad"),
+            Metric(
+                "守护进程心跳",
+                heartbeat_value,
+                "good" if alive else "bad",
+            ),
+            Metric(
+                "下次切换预计",
+                "09-11 17:30 UTC / XAUS_XAU→XAU_XAUT",
+            ),
         ],
     )
+
+
+def test_swap_carry_renders_instance_card_with_facts_legs_and_liquidation() -> None:
+    """正常快照复用实例卡片骨架，完整展示核心事实与两腿风险。"""
+    status = _swap_carry_status()
     margin = {"legs": [], "spot": None, "error": None}
 
     html = hedge_panel.build_page(
@@ -289,21 +324,75 @@ def test_swap_carry_block_renders_summary_and_all_metric_tones() -> None:
         swap_carry_status=status,
     )
 
-    assert "Swap Carry（测试）" in html
-    assert "持仓中，净 carry +12.5%/年" in html
+    assert '<section class="cards" aria-label="swap carry">' in html
+    assert '<article class="instance-card" data-instance="swap-carry">' in html
+    assert '<p class="eyebrow">同所 carry 对冲</p>' in html
+    assert "<h2>XAUS × XAU</h2>" in html
+    assert '<section class="net-status">' in html
+    assert (
+        '<strong class="net-value mono exposure-good">+0.00000</strong>' in html
+    )
     for label, value in (
         ("当前结构", "XAUS_XAU"),
-        ("守护进程心跳", "30 秒前"),
+        ("净 carry 年化", "+8.2%"),
         ("会话剩余", "18.0 小时"),
-        ("净 delta", "+0.02000"),
+        ("距下次切换", "09-11 17:30 UTC / XAUS_XAU→XAU_XAUT"),
     ):
         assert label in html and value in html
-    for css_class in ("pnl-flat", "exposure-good", "exposure-warn", "exposure-bad"):
-        assert f'class="mono {css_class}"' in html
-    assert "● 存活" in html
+    assert '<section class="legs" aria-label="swap carry 两腿持仓">' in html
+    assert '<strong class="mono leg-long">多 0.01250</strong>' in html
+    assert '<strong class="mono leg-short">空 -0.01250</strong>' in html
+    assert html.count('<em class="leg-usd">≈ $50.00</em>') == 2
+    assert '<em class="leg-pnl mono pnl-positive">+$1.25</em>' in html
+    assert '<em class="leg-pnl mono pnl-negative">-$0.75</em>' in html
+    assert 'aria-label="swap carry 强平距离"' in html
+    assert "强平价=3000" in html and "25.00%" in html
+    assert "数据时间：<span class=\"mono\">09-08 11:55 UTC（5.0 分钟前）" in html
+    assert "运行中" in html
     assert html.index('aria-label="保证金与强平距离"') < html.index(
         'aria-label="swap carry"'
     ) < html.index('class="overview"')
+
+
+def test_swap_carry_net_delta_outside_tolerance_uses_danger_emphasis() -> None:
+    """provider 判为超容差的净 delta 必须用红底大字危险态。"""
+    html = hedge_panel.build_page(
+        instances=(),
+        now=NOW,
+        swap_carry_status=_swap_carry_status(
+            net_delta="+0.02000",
+            net_tone="bad",
+        ),
+    )
+
+    assert '<section class="net-status net-status-danger">' in html
+    assert '<strong class="net-value mono exposure-bad">+0.02000</strong>' in html
+
+
+def test_swap_carry_liquidation_below_danger_threshold_is_red() -> None:
+    """强平距离低于统一危险阈值时必须使用 margin-danger。"""
+    html = hedge_panel.build_page(
+        instances=(),
+        now=NOW,
+        swap_carry_status=_swap_carry_status(
+            xaus_liquidation="强平价=3700，距离=7.50%（mark=4000）",
+        ),
+    )
+
+    assert '<em class="leg-pnl mono margin-danger">7.50%</em>' in html
+    assert '<td class="mono margin-danger">7.50%</td>' in html
+
+
+def test_swap_carry_stale_heartbeat_uses_red_badge() -> None:
+    """超过十五分钟的心跳显示红色“心跳陈旧”徽章。"""
+    html = hedge_panel.build_page(
+        instances=(),
+        now=NOW,
+        swap_carry_status=_swap_carry_status(alive=False),
+    )
+
+    assert '<div class="data-time stale">' in html
+    assert '<span class="status exposure-bad">心跳陈旧</span>' in html
 
 
 def test_missing_swap_carry_status_keeps_rest_of_page() -> None:
@@ -334,8 +423,8 @@ def test_render_html_catches_swap_carry_collect_exception(monkeypatch) -> None:
     assert "模拟采集失败" not in html
 
 
-def test_swap_carry_alerts_distinguish_critical_from_warning() -> None:
-    """严重与警告告警都展示动作指引，严重项必须有更强的视觉强调。"""
+def test_swap_carry_alerts_reuse_existing_warnings_block() -> None:
+    """结构化告警沿用实例卡片的 warnings 区块并保留严重度标识。"""
     status = SystemStatus(
         name="Swap Carry（测试）",
         alive=False,
@@ -354,9 +443,10 @@ def test_swap_carry_alerts_distinguish_critical_from_warning() -> None:
 
     assert "会话即将过期" in html and "重新导出会话" in html
     assert "守护心跳陈旧" in html and "检查守护进程" in html
-    assert 'class="swap-carry-alert critical interlock-alert"' in html
-    assert 'class="swap-carry-alert warning warnings"' in html
-    assert "● 未存活" in html
+    assert '<section class="warnings"><h3>告警</h3><ul>' in html
+    assert "🔴 会话即将过期" in html
+    assert "⚠ 守护心跳陈旧" in html
+    assert '<span class="status exposure-bad">心跳陈旧</span>' in html
 
 
 def test_portfolio_cumulative_pnl_sums_each_account_delta_with_sources(tmp_path) -> None:

@@ -1302,73 +1302,236 @@ _SWAP_CARRY_TONE_CLASS = {
 def _swap_carry_alive(status: SystemStatus | None) -> tuple[str, str]:
     """把 provider 的三态存活值映射到页面现有状态样式。"""
     if status is None or status.alive is None:
-        return "read-status", "● 未知"
+        return "read-status", "数据不可用"
     if status.alive:
-        return "status running", "● 存活"
-    return "status stopped", "● 未存活"
+        return "status running", "运行中"
+    return "status exposure-bad", "心跳陈旧"
+
+
+def _swap_carry_metric(status: SystemStatus, label: str):
+    """按标签读取 carry 指标；缺项时由卡片局部显示破折号。"""
+    return next((metric for metric in status.metrics if metric.label == label), None)
+
+
+def _swap_carry_structure_title(value: object, fallback: str) -> str:
+    """把结构标识转换为与实例标题一致的双腿写法。"""
+    text = str(value).strip() if value not in (None, "") else ""
+    if text and "_" in text and "未知" not in text:
+        return text.replace("_", " × ")
+    return text or fallback
+
+
+def _swap_carry_leg_parts(value: object) -> tuple[str, str, object]:
+    """解析 provider 的稳定单腿摘要，异常字段仅降级自身。"""
+    parts = [part.strip() for part in str(value or "").split("/")]
+    quantity = parts[1] if len(parts) > 1 else ""
+    notional = parts[2] if len(parts) > 2 else ""
+    unrealized_pnl: object = None
+    for part in parts[3:]:
+        if part.startswith("未实现盈亏="):
+            raw_pnl = part.removeprefix("未实现盈亏=").removesuffix(" USDC")
+            unrealized_pnl = raw_pnl if raw_pnl != "无数据" else None
+            break
+    return quantity, notional, unrealized_pnl
+
+
+def _swap_carry_liquidation_parts(value: object) -> tuple[str, str, object]:
+    """提取强平价和百分比距离，保留无法解析时的安全降级。"""
+    text = str(value or "").strip()
+    if not text or text in {"无数据", "无持仓"}:
+        return text or "—", "—", None
+    price = text
+    distance_text = "—"
+    distance: object = None
+    if "，距离=" in text:
+        price, raw_distance = text.split("，距离=", 1)
+        distance_text = raw_distance.split("（", 1)[0].strip()
+        distance = distance_text.removesuffix("%")
+    return price, distance_text, distance
+
+
+def _render_swap_carry_leg(leg_metric: object, liquidation_metric: object) -> str:
+    """用实例卡片的 leg 结构渲染一条 carry 腿。"""
+    label = str(getattr(leg_metric, "label", ""))
+    symbol = label.rsplit(" ", 1)[0] if label else "—"
+    is_long = label.endswith("多腿")
+    side = "多" if is_long else "空"
+    side_class = "leg-long" if is_long else "leg-short"
+    quantity, notional, unrealized_pnl = _swap_carry_leg_parts(
+        getattr(leg_metric, "value", None)
+    )
+    parsed_quantity = _to_decimal(quantity)
+    if parsed_quantity is None:
+        position_text = "—"
+        side_class = "leg-flat"
+    elif parsed_quantity == 0:
+        position_text = "空仓"
+        side_class = "leg-flat"
+    elif is_long:
+        position_text = f"多 {_decimal_text(abs(parsed_quantity))}"
+    else:
+        position_text = f"空 {_decimal_text(parsed_quantity)}"
+    usd_text = f"≈ {notional}" if notional and notional != "无数据" else ""
+    _price, distance_text, distance = _swap_carry_liquidation_parts(
+        getattr(liquidation_metric, "value", None)
+    )
+    return (
+        '    <div class="leg">\n'
+        f"      <span>{side}头 · {_text(symbol)}</span>\n"
+        f'      <strong class="mono {side_class}">{_text(position_text)}</strong>\n'
+        f'      <em class="leg-usd">{_text(usd_text)}</em>\n'
+        '      <div class="leg-pnl-row"><span>未实现盈亏</span>'
+        f'<em class="leg-pnl mono {_pnl_class(unrealized_pnl)}">'
+        f"{_text(_money_text(unrealized_pnl))}</em></div>\n"
+        '      <div class="leg-pnl-row"><span>强平距离</span>'
+        f'<em class="leg-pnl mono {_distance_class(distance)}">'
+        f"{_text(distance_text)}</em></div>\n"
+        "    </div>"
+    )
+
+
+def _render_swap_carry_liquidation(status: SystemStatus, leg_metrics: list) -> str:
+    """复用保证金表格样式集中展示两腿强平价与距离。"""
+    rows = []
+    for leg_metric in leg_metrics:
+        symbol = leg_metric.label.rsplit(" ", 1)[0]
+        liquidation = _swap_carry_metric(status, f"{symbol} 强平")
+        price, distance_text, distance = _swap_carry_liquidation_parts(
+            getattr(liquidation, "value", None)
+        )
+        rows.append(
+            "      <tr>"
+            f"<td>{_text(symbol)}</td>"
+            f'<td class="mono">{_text(price)}</td>'
+            f'<td class="mono {_distance_class(distance)}">'
+            f"{_text(distance_text)}</td></tr>\n"
+        )
+    if not rows:
+        return ""
+    return (
+        '  <section class="margin-block" aria-label="swap carry 强平距离">\n'
+        "    <h3>强平距离</h3>\n"
+        '    <table class="margin-table">\n'
+        "      <tr><th>标的</th><th>强平价</th><th>强平距离</th></tr>\n"
+        f"{''.join(rows)}"
+        "    </table>\n"
+        "    <small>强平距离绝对值低于 12% 转警示、低于 8% 转危险。</small>\n"
+        "  </section>\n"
+    )
+
+
+def _render_swap_carry_fact(status: SystemStatus, label: str, source: str) -> str:
+    """用 facts 网格的既有结构渲染一项 carry 事实。"""
+    metric = _swap_carry_metric(status, source)
+    value = getattr(metric, "value", None)
+    tone = getattr(metric, "tone", "normal")
+    tone_class = _SWAP_CARRY_TONE_CLASS.get(tone, "pnl-flat")
+    return (
+        f"    <div><span>{_text(label)}</span>"
+        f'<strong class="mono {tone_class}">{_text(value)}</strong></div>\n'
+    )
 
 
 def _render_swap_carry(status: SystemStatus | None) -> str:
-    """渲染调用方注入的 swap carry 快照；缺失时局部降级。"""
+    """把调用方注入的 swap carry 快照渲染为实例同款卡片。"""
     status_class, status_text = _swap_carry_alive(status)
     if status is None:
         return (
-            '  <section class="margin-block swap-carry-block" '
-            'aria-label="swap carry">\n'
-            '    <div class="swap-carry-head">\n'
-            f"      <h3>{_text(swap_carry.NAME)}</h3>\n"
-            f'      <span class="{status_class}">{status_text}</span>\n'
-            "    </div>\n"
-            '    <p class="margin-error">swap carry 数据不可用</p>\n'
+            '  <section class="cards" aria-label="swap carry">\n'
+            '    <article class="instance-card read-failed" data-instance="swap-carry">\n'
+            '      <div class="card-top">\n'
+            '        <div class="data-time">数据时间：<span class="mono">—</span>（暂无数据）</div>\n'
+            f'        <span class="{status_class}">{status_text}</span>\n'
+            "      </div>\n"
+            '      <div class="title-row"><div><p class="eyebrow">同所 carry 对冲</p>'
+            f"<h2>{_text(swap_carry.NAME)}</h2></div></div>\n"
+            '      <p class="margin-error">swap carry 数据不可用</p>\n'
+            "    </article>\n"
             "  </section>\n"
         )
 
-    metric_rows = "".join(
-        "      <tr>"
-        f"<td>{_text(metric.label)}</td>"
-        f'<td class="mono {_SWAP_CARRY_TONE_CLASS.get(metric.tone, "pnl-flat")}">'
-        f"{_text(metric.value)}</td></tr>\n"
-        for metric in status.metrics
+    structure_metric = _swap_carry_metric(status, "当前结构")
+    structure = getattr(structure_metric, "value", None)
+    title = _swap_carry_structure_title(structure, status.name)
+    heartbeat = _swap_carry_metric(status, "守护进程心跳")
+    heartbeat_value = getattr(heartbeat, "value", None)
+    freshness_class = "data-time stale" if status.alive is False else "data-time"
+    stale_warning = (
+        " <strong>⚠ 数据可能已过期</strong>" if status.alive is False else ""
     )
-    metrics = (
-        '    <table class="margin-table swap-carry-metrics">\n'
-        f"{metric_rows}"
-        "    </table>\n"
-        if metric_rows
+    net_delta = _swap_carry_metric(status, "净 delta")
+    net_value = getattr(net_delta, "value", None)
+    net_tone = getattr(net_delta, "tone", "normal")
+    net_class = _SWAP_CARRY_TONE_CLASS.get(net_tone, "exposure-missing")
+    net_status_class = (
+        "net-status net-status-danger" if net_tone == "bad" else "net-status"
+    )
+    facts = "".join(
+        (
+            _render_swap_carry_fact(status, "当前结构", "当前结构"),
+            _render_swap_carry_fact(status, "净 carry 年化", "净 carry 年化"),
+            _render_swap_carry_fact(status, "会话剩余", "会话剩余"),
+            _render_swap_carry_fact(status, "距下次切换", "下次切换预计"),
+        )
+    )
+    leg_metrics = [
+        metric
+        for metric in status.metrics
+        if metric.label.endswith((" 多腿", " 空腿"))
+    ]
+    legs = "".join(
+        _render_swap_carry_leg(
+            metric,
+            _swap_carry_metric(status, f"{metric.label.rsplit(' ', 1)[0]} 强平"),
+        )
+        for metric in leg_metrics
+    )
+    legs_block = (
+        '  <section class="legs" aria-label="swap carry 两腿持仓">\n'
+        f"{legs}\n"
+        "  </section>\n"
+        if legs
         else ""
     )
     error = (
-        f'    <p class="margin-error">采集异常：{_text(status.error)}</p>\n'
+        f'  <p class="margin-error">采集异常：{_text(status.error)}</p>\n'
         if status.error
         else ""
     )
-    alert_items = "".join(
-        (
-            f'      <li class="swap-carry-alert {alert.level} '
-            f'{"interlock-alert" if alert.level == "critical" else "warnings"}">'
-            f"<strong>{'🔴' if alert.level == 'critical' else '⚠'} "
-            f"{_text(alert.title)}</strong>"
-            f"<span>→ {_text(alert.action)}</span></li>\n"
-        )
-        for alert in status.alerts
+    warnings = _render_warnings(
+        [
+            f"{'🔴' if alert.level == 'critical' else '⚠'} "
+            f"{alert.title} → {alert.action}"
+            for alert in status.alerts
+        ]
     )
-    alerts = (
-        '    <section class="swap-carry-alert-block" aria-label="swap carry 告警">\n'
-        "      <h3>告警</h3>\n"
-        f'      <ul class="swap-carry-alerts">\n{alert_items}      </ul>\n'
-        "    </section>\n"
-        if alert_items
-        else ""
-    )
+    card_class = "instance-card read-failed" if status.error else "instance-card"
     return (
-        '  <section class="margin-block swap-carry-block" '
-        'aria-label="swap carry">\n'
-        '    <div class="swap-carry-head">\n'
-        f"      <h3>{_text(status.name)}</h3>\n"
-        f'      <span class="{status_class}">{status_text}</span>\n'
-        "    </div>\n"
-        f'    <p class="swap-carry-summary">{_text(status.summary)}</p>\n'
-        f"{metrics}{error}{alerts}"
+        '  <section class="cards" aria-label="swap carry">\n'
+        f'    <article class="{card_class}" data-instance="swap-carry">\n'
+        '      <div class="card-top">\n'
+        f'        <div class="{freshness_class}">数据时间：'
+        f'<span class="mono">{_text(heartbeat_value)}</span>{stale_warning}</div>\n'
+        f'        <span class="{status_class}">{status_text}</span>\n'
+        "      </div>\n"
+        '      <div class="title-row">\n'
+        '        <div><p class="eyebrow">同所 carry 对冲</p>'
+        f"<h2>{_text(title)}</h2></div>\n"
+        f'        <div class="round">{_text(status.summary)}</div>\n'
+        "      </div>\n"
+        f'      <section class="{net_status_class}">\n'
+        "        <span>净敞口</span>\n"
+        f'        <strong class="net-value mono {net_class}">'
+        f"{_text(net_value)}</strong>\n"
+        "        <small>绝对值越接近 0 越好</small>\n"
+        "      </section>\n"
+        '      <section class="facts">\n'
+        f"{facts}"
+        "      </section>\n"
+        f"{legs_block}"
+        f"{_render_swap_carry_liquidation(status, leg_metrics)}"
+        f"{error}{warnings}\n"
+        "    </article>\n"
         "  </section>\n"
     )
 
@@ -1493,14 +1656,6 @@ def build_page(
       .margin-empty { color: var(--muted); font-size: 13px; }
       .margin-spot { color: var(--muted); font-size: 12px; margin-top: 8px; }
       .margin-block small { display: block; margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.5; }
-      .swap-carry-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 8px; }
-      .swap-carry-head h3 { margin-bottom: 0; }
-      .swap-carry-summary { margin-bottom: 10px; color: var(--muted); font-size: 13px; }
-      .swap-carry-metrics td:last-child { text-align: right; }
-      .swap-carry-alert-block { margin-top: 12px; }
-      .swap-carry-alerts { margin: 7px 0 0; padding: 0; list-style: none; }
-      .swap-carry-alert { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px 12px; }
-      .swap-carry-alert + .swap-carry-alert { margin-top: 7px; }
       .mono, .net-value {
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         font-variant-numeric: tabular-nums;
