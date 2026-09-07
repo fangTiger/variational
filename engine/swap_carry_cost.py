@@ -433,10 +433,11 @@ def reconciliation_period(rows, since=None):
 
 
 def snapshot_report(rows, path, since=None, *, scope='account', threshold='1',
-                    max_gap_seconds=900):
+                    max_gap_seconds=900, latest_continuous=False):
     """从组合权益和全量台账构造只读证据；未知浮动保留为空，不推算回填。"""
     try:
-        start, end = reconciliation_period(rows, since)
+        if not latest_continuous:
+            start, end = reconciliation_period(rows, since)
         if scope not in {'account', 'swap_carry'}:
             raise ValueError('对账范围无效')
         if number(max_gap_seconds) < 0:
@@ -457,6 +458,20 @@ def snapshot_report(rows, path, since=None, *, scope='account', threshold='1',
                 except (KeyError, ValueError, TypeError):
                     continue
                 snapshots.append((when, equity))
+        if latest_continuous:
+            # 最近有效快照向前回溯，遇到超过十五分钟的断档即停止。
+            snapshots.sort(key=lambda item: item[0])
+            if not snapshots:
+                raise ValueError('权益数据不足以对账：没有有效的 Variational 权益快照')
+            end = snapshots[-1][0]
+            start = end
+            for when, _equity in reversed(snapshots[:-1]):
+                if (start - when).total_seconds() > max_gap_seconds:
+                    break
+                start = when
+            if (end - start).total_seconds() < 3600:
+                raise ValueError(f'权益数据不足以对账：最近连续区间 {start.isoformat()} → '
+                                 f'{end.isoformat()} 不足 1 小时（断档阈值 {max_gap_seconds} 秒）')
         chosen = []
         missing = []
         for label, boundary in [('期初', start), ('期末', end)]:
@@ -496,5 +511,5 @@ def snapshot_report(rows, path, since=None, *, scope='account', threshold='1',
         report['snapshot_offsets_seconds'] = tuple((item[0]-boundary).total_seconds()
                                                    for item, boundary in zip(chosen, (start, end)))
         return report, None
-    except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, AttributeError) as exc:
         return None, f'对账不可用：{exc}'

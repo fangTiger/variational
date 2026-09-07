@@ -712,27 +712,59 @@ async def _collect(
     )
 
 
-def _cost_metrics(path: Path, reconciliation_path: Path):
-    """只读成本区块独立降级，不拖垮仓位卡片。"""
+def _cost_metrics(path: Path, reconciliation_path: Path | None, *, equity_path: Path | None = None):
+    """只读成本区块独立降级；默认按最近连续权益段对账。"""
     rows, error = cost.load(path)
     if error:
-        return [Metric("成本明细", error, "warn"), Metric("未解释残差", "不可用", "warn")], []
+        return [Metric("成本明细", error, "warn"), Metric("未解释残差", "不可用", "warn"),
+                Metric("成本证据完整性", "证据不完整，不能确认闭合", "warn"),
+                Metric("磨损事件", "台账不可用，无法展示逐笔记录", "warn")], []
     totals = cost.summarize(rows)
-    metrics = [Metric("成本明细 " + label, f"{totals[kind]:+.2f} USD")
+    metrics = [Metric("成本明细 " + label, f"{totals[kind]:+.2f} USD", _carry_tone(totals[kind]))
                for kind, label in cost.LABELS.items()]
-    metrics.append(Metric("成本合计", f"{totals['total']:+.2f} USD"))
-    report, error = cost.read_report(rows, reconciliation_path)
+    metrics.extend([Metric("成本合计", f"{totals['total']:+.2f} USD", _carry_tone(totals['total'])),
+                    Metric("成本汇总范围", "全台账累计，仅 XAUS/XAU/XAUT；切换父项不重复计入合计")])
+    events = sorted((r for r in rows if r['event_type'] in cost.LABELS and
+                     r['market'] in cost.MARKETS | {'XAUS/XAU/XAUT'}),
+                    key=lambda r: cost.timestamp(r['ts']), reverse=True)[:10]
+    for index, row in enumerate(events, 1):
+        label = cost.LABELS[row['event_type']]
+        if row['event_type'] == 'switch':
+            label = '切换（不重复计入合计）'
+        amount = cost.number(row['amount_usd'])
+        metrics.append(Metric(f"磨损事件 {index}",
+            f"{row['ts']} / {label} / {row['market']} / {amount:+.2f} USD / {row['source']}",
+            _carry_tone(amount)))
+    if not events:
+        metrics.append(Metric("磨损事件", "暂无磨损记录"))
+    if reconciliation_path is not None:
+        report, error = cost.read_report(rows, reconciliation_path)
+    else:
+        report, error = cost.snapshot_report(rows, equity_path or Path(path).with_name('portfolio_equity.jsonl'),
+                                             latest_continuous=True)
     if error:
         metrics.append(Metric("未解释残差", error, "warn"))
+        metrics.append(Metric("成本证据完整性", "证据不完整，不能确认闭合", "warn"))
         return metrics, []
     metrics.extend([
         Metric("成本口径", report["basis_note"]),
+        Metric("成本对账范围", "账户权益对账" if report['scope'] == 'account' else "策略对账（含账户公共科目）"),
         Metric("成本对账区间", f"{report['start_ts']} → {report['end_ts']}"),
-        Metric("区间成本合计", f"{report['total']:+.2f} USD"),
-        Metric("其它策略（含 BTC）", f"{report['other_strategies']:+.2f} USD"),
-        Metric("平台盈亏滑点抵销", f"{report['spread_embedded_adjustment']:+.2f} USD"),
-        Metric("未解释残差", f"{report['residual']:+.2f} USD", "warn" if report['warning'] else "normal"),
+        Metric("成本证据完整性", "证据完整" if report['evidence_complete'] else
+               "证据不完整，不能确认闭合（未实现浮动变化不可用）",
+               "normal" if report['evidence_complete'] else "warn"),
     ])
+    for label, key in [('期初权益', 'start_equity'), ('期末权益', 'end_equity'),
+                       ('权益变化', 'equity_change'), ('已解释合计', 'explained'),
+                       ('区间成本合计', 'total'), ('其它策略（含 BTC）', 'other_strategies'),
+                       ('平台盈亏滑点抵销', 'spread_embedded_adjustment'), ('未解释残差', 'residual')]:
+        value = report[key]
+        tone = 'bad' if key == 'residual' and report['warning'] else _carry_tone(value)
+        metrics.append(Metric(label, f"{value:+.2f} USD", tone))
+    ratio = report['residual_ratio']
+    metrics.append(Metric("残差占比", f"{ratio:.2f}%" if ratio is not None else "不适用（权益变化为零）",
+                          'bad' if report['warning'] else 'normal'))
+    metrics.append(Metric("成本残差阈值", f"{report['threshold']:.2f} USD"))
     alerts = [PanelAlert(key="swap_carry_cost_residual", level="warning",
                          title=f"Swap carry 未解释残差 {report['residual']:+.2f} USD 超过阈值",
                          action="核对流水覆盖、成交滑点、其它策略及权益快照口径")
@@ -749,12 +781,13 @@ def collect(
     now: datetime | None = None,
     cost_ledger_path: Path = cost.DEFAULT_PATH,
     cost_reconciliation_path: Path | None = None,
+    portfolio_equity_path: Path | None = None,
 ) -> SystemStatus:
     """同步 provider 入口；任何整轮失败都返回 error 卡片。"""
     observed_at = now or datetime.now(timezone.utc)
     owned_client = client is None
     cost_metrics, cost_alerts = _cost_metrics(
-        cost_ledger_path, cost_reconciliation_path or Path(cost_ledger_path).with_name(cost.DEFAULT_RECON_PATH.name))
+        cost_ledger_path, cost_reconciliation_path, equity_path=portfolio_equity_path)
 
     async def run() -> SystemStatus:
         nonlocal client

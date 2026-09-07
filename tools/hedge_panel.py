@@ -1530,12 +1530,17 @@ def _render_swap_carry(status: SystemStatus | None) -> str:
         "      </section>\n"
         f"{legs_block}"
         f"{_render_swap_carry_liquidation(status, leg_metrics)}"
-        '      <section aria-label="成本明细"><h3>成本明细</h3>\n'
+        '      <section aria-label="成本明细"><h3>成本明细</h3><div class="facts">\n'
         + ''.join(_render_swap_carry_fact(status, metric.label, metric.label)
                   for metric in status.metrics
                   if metric.label.startswith("成本") or metric.label in {
-                      "未解释残差", "其它策略（含 BTC）", "平台盈亏滑点抵销", "区间成本合计"})
-        + '      </section>\n'
+                      "未解释残差", "其它策略（含 BTC）", "平台盈亏滑点抵销", "区间成本合计",
+                      "期初权益", "期末权益", "权益变化", "已解释合计", "残差占比"})
+        + '      </div></section>\n'
+        + '<section aria-label="最近磨损事件"><h3>最近磨损事件（最近 10 条）</h3><div class="facts">'
+        + ''.join(_render_swap_carry_fact(status, metric.label, metric.label)
+                  for metric in status.metrics if metric.label.startswith("磨损事件"))
+        + '</div></section>\n'
         f"{error}{warnings}\n"
         "    </article>\n"
         "  </section>\n"
