@@ -283,7 +283,9 @@ def test_reverse_existing_leg_uses_standalone_margin_not_negative_delta(tmp_path
     run(client, tmp_path)
     report = rehearsals(tmp_path)[0]
     assert report["conclusion"] == "ready"
-    assert Decimal(report["margin"]["required_usd"]) == Decimal("200")
+    # 两腿各按 5% 初始保证金率计算独立保证金。
+    expected_margin = guard.AUTO_OPEN_NOTIONAL_USD * Decimal("0.05") * 2
+    assert Decimal(report["margin"]["required_usd"]) == expected_margin
     xau = next(leg for leg in report["open_legs"] if leg["market"] == "XAU")
     assert Decimal(xau["required_margin_usd"]) > 0
     assert xau["quoted_margin_delta_usd"] == "-100"

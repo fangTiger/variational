@@ -58,7 +58,7 @@ DEFAULT_AUDIT_LOG = data_dir() / "swap_carry_guard_audit.jsonl"
 DEFAULT_SWITCH_HISTORY = data_dir() / "swap_carry_switch_history.jsonl"
 
 TARGET_LIQUIDATION_DISTANCE = Decimal("0.08")
-MAX_ALLOCATION_USD = Decimal("600")
+MAX_ALLOCATION_USD = Decimal("800")
 MAX_DAILY_ALLOCATION_ATTEMPTS = 30
 MAX_DAILY_ALLOCATION_ERRORS = 5
 MIN_ALLOCATION_INTERVAL_SECONDS = 900
@@ -70,16 +70,17 @@ PRE_CLOSE_MINUTES = 30
 LONG_CLOSURE_THRESHOLD = timedelta(hours=4)
 CLOSE_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
-AUTO_OPEN_NOTIONAL_USD = Decimal("2000")
-MIN_ENTRY_CARRY_ANNUAL = Decimal("0.05")
+AUTO_OPEN_NOTIONAL_USD = Decimal("4000")
+MIN_ENTRY_CARRY_ANNUAL = Decimal("0.02")
 MIN_TIME_TO_CLOSE = timedelta(hours=2)
 MAX_DAILY_OPEN_ATTEMPTS = 20
 SWITCH_LEAD_TIME = timedelta(minutes=60)
 REHEARSAL_LEAD = timedelta(minutes=30)
 REHEARSAL_TIMEOUT_SECONDS = 20
 REHEARSAL_SLIPPAGE_WARNING_BP = Decimal("20")
-EXIT_CARRY_ANNUAL = Decimal("0")
-EXIT_CARRY_CONSECUTIVE_ROUNDS = 3
+EXIT_CARRY_ANNUAL = Decimal("-0.10")
+EXIT_CARRY_DURATION = timedelta(hours=24)
+REOPEN_COOLDOWN = timedelta(hours=2)
 SESSION_WARNING_THRESHOLD = timedelta(hours=24)
 SESSION_CRITICAL_THRESHOLD = timedelta(hours=6)
 SESSION_WARNING_COOLDOWN = timedelta(hours=2)
@@ -195,6 +196,7 @@ class AutoOpenResult:
     status: str = "healthy"
     result_code: int = 0
     incident: bool = False
+    closed_position: bool = False
 
 
 @dataclass(frozen=True)
@@ -691,14 +693,17 @@ def _read_switch_incident(path: Path) -> bool:
     return isinstance(payload, Mapping) and payload.get("switch_incident") is True
 
 
-def _read_exit_carry_rounds(path: Path) -> int:
-    """读取跨进程保存的连续非正 carry 轮次。"""
+def _read_state_timestamp(path: Path, key: str) -> datetime | None:
+    """读取持久化 UTC 时间；旧轮次状态不推算持续时间。"""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        value = int(payload.get("exit_carry_consecutive_rounds", 0))
-        return max(0, value)
-    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
-        return 0
+        raw = payload.get(key)
+        if not isinstance(raw, str):
+            return None
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
 def _read_session_alert_at(path: Path) -> datetime | None:
@@ -774,7 +779,8 @@ def _state_payload(
     daily_open_attempts: int = 0,
     auto_open_incident: bool = False,
     switch_incident: bool = False,
-    exit_carry_consecutive_rounds: int = 0,
+    exit_carry_since: datetime | None = None,
+    last_closed_at: datetime | None = None,
     last_session_expiry_alert_at: datetime | None = None,
 ) -> dict[str, object]:
     """构造供人工 status 置顶显示的显著状态。"""
@@ -787,7 +793,8 @@ def _state_payload(
         "daily_open_attempts": daily_open_attempts,
         "auto_open_incident": auto_open_incident,
         "switch_incident": switch_incident,
-        "exit_carry_consecutive_rounds": exit_carry_consecutive_rounds,
+        "exit_carry_since": exit_carry_since.isoformat() if exit_carry_since else None,
+        "last_closed_at": last_closed_at.isoformat() if last_closed_at else None,
         "last_session_expiry_alert_at": (
             last_session_expiry_alert_at.isoformat()
             if last_session_expiry_alert_at is not None
@@ -1631,6 +1638,7 @@ async def _try_auto_open(
             "dry_run": dry_run,
         },
     )
+    closed_position = False
     try:
         await execution.cmd_open(
             var,
@@ -1641,6 +1649,10 @@ async def _try_auto_open(
             now=observed_at,
         )
     except SystemExit as exc:
+        # 执行器报告成功回滚后仍核对仓位，回滚平仓同样需要冷却。
+        if not dry_run and "已回滚" in str(exc) and not _is_rollback_failure(exc):
+            flat_result = await execution._await_flat(var, selected)
+            closed_position = all(size == 0 for size in flat_result[:-1])
         if _is_skew_rejection(exc):
             conclusion = (
                 f"{selected.legs[0].underlying} 开仓因 OI 偏斜被拒；"
@@ -1656,7 +1668,9 @@ async def _try_auto_open(
                     "daily_open_attempts": attempt_number,
                 },
             )
-            return AutoOpenResult(True, conclusion, attempt_number)
+            return AutoOpenResult(
+                True, conclusion, attempt_number, closed_position=closed_position
+            )
         if _is_rollback_failure(exc):
             conclusion = f"自动开仓回滚失败，进入 INCIDENT：{exc}"
             _append_audit(
@@ -1696,7 +1710,9 @@ async def _try_auto_open(
                     "daily_open_attempts": attempt_number,
                 },
             )
-            return AutoOpenResult(True, conclusion, attempt_number)
+            return AutoOpenResult(
+                True, conclusion, attempt_number, closed_position=closed_position
+            )
         conclusion = f"自动开仓失败：{type(exc).__name__}: {exc}"
     else:
         conclusion = (
@@ -1736,6 +1752,7 @@ async def _try_auto_open(
         attempt_number,
         status="action_failed",
         result_code=1,
+        closed_position=closed_position,
     )
 
 
@@ -2251,7 +2268,8 @@ async def run_once(
             "timestamp": observed_at.isoformat(),
         }
     rehearsal_blocked = bool(last_rehearsal and last_rehearsal.get("conclusion") == "blocked")
-    exit_carry_rounds = _read_exit_carry_rounds(state_path)
+    exit_carry_since = _read_state_timestamp(state_path, "exit_carry_since")
+    last_closed_at = _read_state_timestamp(state_path, "last_closed_at")
     last_session_expiry_alert_at = _warn_session_expiry(
         session_expiry,
         observed_at=observed_at,
@@ -2323,7 +2341,8 @@ async def run_once(
                 daily_open_attempts=daily_open_attempts,
                 auto_open_incident=auto_open_incident,
                 switch_incident=switch_incident,
-                exit_carry_consecutive_rounds=exit_carry_rounds,
+                exit_carry_since=exit_carry_since,
+                last_closed_at=last_closed_at,
                 last_session_expiry_alert_at=last_session_expiry_alert_at,
             ), "last_rehearsal": last_rehearsal,
                 "rehearsal_windows": rehearsal_windows,
@@ -2435,7 +2454,8 @@ async def run_once(
             "daily_open_attempts": daily_open_attempts,
             "auto_open_incident": auto_open_incident,
             "switch_incident": switch_incident,
-            "exit_carry_consecutive_rounds": exit_carry_rounds,
+            "exit_carry_since": exit_carry_since,
+            "last_closed_at": last_closed_at,
             "session_expires_at": session_expires_at,
             "session_hours_left": session_hours_left,
         },
@@ -2691,27 +2711,29 @@ async def run_once(
             try:
                 rates = await execution._load_funding_rates(var, selected)
                 net_carry = execution._weighted_net_carry(selected, rates)
-            except Exception as exc:  # noqa: BLE001 读取失败必须保持原计数
+            except Exception as exc:  # noqa: BLE001 读取失败保留原计时
                 exit_carry_observation = (
-                    "退出 carry 读取失败，本轮不计数也不清零："
+                    "退出 carry 读取失败，保留原计时，本轮不触发熔断："
                     f"{type(exc).__name__}: {exc}"
                 )
             else:
                 if net_carry <= EXIT_CARRY_ANNUAL:
-                    exit_carry_rounds += 1
+                    if exit_carry_since is None or exit_carry_since > observed_at:
+                        exit_carry_since = observed_at
+                    elapsed = observed_at - exit_carry_since
                     exit_carry_observation = (
                         f"净 carry {net_carry:.4%} 不高于退出阈值 "
-                        f"{EXIT_CARRY_ANNUAL:.4%}，连续第 "
-                        f"{exit_carry_rounds}/{EXIT_CARRY_CONSECUTIVE_ROUNDS} 轮"
+                        f"{EXIT_CARRY_ANNUAL:.4%}，已持续 "
+                        f"{elapsed}，熔断要求 {EXIT_CARRY_DURATION}"
                     )
-                    if exit_carry_rounds >= EXIT_CARRY_CONSECUTIVE_ROUNDS:
+                    if elapsed >= EXIT_CARRY_DURATION:
                         reason = exit_carry_observation
                         state_status = "exit_carry_triggered"
                 else:
-                    exit_carry_rounds = 0
+                    exit_carry_since = None
                     exit_carry_observation = (
                         f"净 carry {net_carry:.4%} 高于退出阈值 "
-                        f"{EXIT_CARRY_ANNUAL:.4%}，连续计数已清零"
+                        f"{EXIT_CARRY_ANNUAL:.4%}，持续计时已清零"
                     )
             _append_audit(
                 audit_path,
@@ -2721,8 +2743,8 @@ async def run_once(
                     "message": exit_carry_observation,
                     "net_carry_annual": net_carry,
                     "threshold_annual": EXIT_CARRY_ANNUAL,
-                    "consecutive_rounds": exit_carry_rounds,
-                    "required_rounds": EXIT_CARRY_CONSECUTIVE_ROUNDS,
+                    "exit_carry_since": exit_carry_since,
+                    "required_duration_seconds": EXIT_CARRY_DURATION.total_seconds(),
                 },
             )
 
@@ -3190,7 +3212,7 @@ async def run_once(
                     await finalize_switch_failure(
                         RuntimeError(open_result.conclusion)
                     )
-                exit_carry_rounds = 0
+                exit_carry_since = None
                 if not switch_record_written:
                     switch_record["total_duration_ms"] = round(
                         (time.perf_counter() - switch_started) * 1000,
@@ -3204,7 +3226,7 @@ async def run_once(
                     consecutive_failures,
                 )
         elif reason is None and all_flat:
-            exit_carry_rounds = 0
+            exit_carry_since = None
             if rehearsal_blocked:
                 open_result = AutoOpenResult(
                     False, "本窗口预演 blocked，禁止平仓后绕过阻断重新开仓",
@@ -3217,6 +3239,13 @@ async def run_once(
                     "需人工核对并清除标记后才能恢复",
                     daily_open_attempts,
                     status="incident",
+                )
+            elif last_closed_at is not None and observed_at - last_closed_at < REOPEN_COOLDOWN:
+                open_result = AutoOpenResult(
+                    False,
+                    f"平仓后重开冷却中，最早可重开时间 {(last_closed_at + REOPEN_COOLDOWN).isoformat()}",
+                    daily_open_attempts,
+                    status="reopen_cooldown",
                 )
             elif auto_switch and target_structure is None:
                 open_result = AutoOpenResult(
@@ -3244,6 +3273,8 @@ async def run_once(
                     observed_at=observed_at,
                     funding_rate_overrides=target_funding_overrides,
                 )
+            if open_result.closed_position:
+                last_closed_at = observed_at
             auto_open_attempted = open_result.attempted
             auto_open_conclusion = open_result.conclusion
             daily_open_attempts = open_result.daily_attempts
@@ -3325,7 +3356,10 @@ async def run_once(
                             "net_delta": net_delta,
                         },
                     )
-                    exit_carry_rounds = 0
+                    exit_carry_since = None
+                    # 仅真实持仓平仓确认后开始冷却，空仓风控轮次不延长。
+                    if not all_flat:
+                        last_closed_at = observed_at
                 consecutive_failures = 0
                 completed_status = (
                     "dry_run"
@@ -3496,8 +3530,10 @@ async def run_once(
                 str(net_carry) if net_carry is not None else None
             ),
             "exit_carry_annual": str(EXIT_CARRY_ANNUAL),
-            "exit_carry_consecutive_rounds": exit_carry_rounds,
-            "exit_carry_required_rounds": EXIT_CARRY_CONSECUTIVE_ROUNDS,
+            "exit_carry_since": exit_carry_since,
+            "last_closed_at": last_closed_at,
+            "exit_carry_duration_seconds": EXIT_CARRY_DURATION.total_seconds(),
+            "reopen_cooldown_seconds": REOPEN_COOLDOWN.total_seconds(),
             "exit_carry_observation": exit_carry_observation,
             "consecutive_failures": consecutive_failures,
             "dry_run": dry_run,

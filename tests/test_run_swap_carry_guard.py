@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tools import run_swap_carry_guard
+
 from adapters.base import Position
 from adapters.variational_client import (
     VariationalAuthError,
@@ -419,7 +421,7 @@ def _run(client: StrictGuardClient, tmp_path: Path, **kwargs: object) -> int:
     return asyncio.run(
         run_swap_carry_guard.run_once(
             client,
-            now=NOW,
+            now=kwargs.pop("now", NOW),
             **_paths(tmp_path),
             **kwargs,
         )
@@ -1129,6 +1131,7 @@ def test_dry_run_performs_decision_but_never_accepts(tmp_path: Path) -> None:
     assert client.accept_calls == []
     state = json.loads(paths["state_path"].read_text(encoding="utf-8"))
     assert state["status"] == "dry_run"
+    assert state["last_closed_at"] is None
 
 
 def test_launchd_plist_runs_guard_once_every_minute() -> None:
@@ -1142,10 +1145,10 @@ def test_launchd_plist_runs_guard_once_every_minute() -> None:
 
 
 def test_auto_open_skips_when_net_carry_is_below_threshold(tmp_path: Path) -> None:
-    """净 carry 低于 5% 时不得询价或开仓。"""
+    """净 carry 低于 2% 时不得询价或开仓。"""
     client = _flat_open_client(
         swap_rate=Decimal("-0.04"),
-        perp_rate=Decimal("0.0899"),
+        perp_rate=Decimal("0.0599"),
     )
 
     result = _run(client, tmp_path)
@@ -1211,99 +1214,75 @@ def test_auto_open_never_runs_while_either_leg_exists(tmp_path: Path) -> None:
     assert client.accept_calls == []
 
 
-def test_exit_carry_closes_after_three_consecutive_nonpositive_rounds(
-    tmp_path: Path,
-) -> None:
-    """净 carry 连续三轮不高于零时，第三轮必须平掉全部腿。"""
-    for expected_count in (1, 2):
-        client = _healthy_client(
-            swap_rate=Decimal("-0.10"),
-            perp_rate=Decimal("0.05"),
-        )
+@pytest.mark.parametrize("carry,hours,closes", [
+    ("-0.03", 2, False), ("-0.12", 23, False),
+    ("-0.12", 24, True), ("-0.10", 24, True),
+])
+def test_exit_carry_duration_survives_restart(tmp_path, monkeypatch, carry, hours, closes):
+    """每轮重建客户端并重读磁盘，按经过时间而非轮数决定平仓。"""
+    start = NOW
+    for elapsed in (0, hours / 2, hours):
+        current = start + timedelta(hours=elapsed)
+        monkeypatch.setattr(__import__(__name__, fromlist=["NOW"]), "NOW", current)
+        client = _healthy_client(swap_rate=Decimal(carry), perp_rate=Decimal("0"),
+                                 accept_script=[{}, {}])
+        assert _run(client, tmp_path, auto_switch=False) == 0
+        assert bool(client.accept_calls) is (closes and elapsed == hours)
+        state = json.loads(_paths(tmp_path)["state_path"].read_text())
+        expected = start.isoformat() if Decimal(carry) <= Decimal("-0.10") else None
+        assert state["exit_carry_since"] == (None if closes and elapsed == hours else expected)
+        if closes and elapsed == hours:
+            assert all(reduce_only for _, _, reduce_only in client.accept_calls)
+            assert state["last_closed_at"] == current.isoformat()
 
-        result = _run(client, tmp_path)
 
-        assert result == 0
+@pytest.mark.parametrize("recovered", ["0.03", "-0.03"])
+def test_recovery_resets_exit_timer(tmp_path, monkeypatch, recovered):
+    """回到阈值以上即清零，下一次恶化从当前时间重新开始。"""
+    start = NOW
+    for hours, carry in [(0, "-0.12"), (23, recovered), (24, "-0.12"), (47, "-0.12")]:
+        monkeypatch.setattr(__import__(__name__, fromlist=["NOW"]), "NOW", start + timedelta(hours=hours))
+        client = _healthy_client(swap_rate=Decimal(carry), perp_rate=Decimal("0"))
+        assert _run(client, tmp_path, auto_switch=False) == 0
         assert client.accept_calls == []
-        state = json.loads(
-            _paths(tmp_path)["state_path"].read_text(encoding="utf-8")
-        )
-        assert state["exit_carry_consecutive_rounds"] == expected_count
-
-    closing_client = _healthy_client(
-        swap_rate=Decimal("-0.10"),
-        perp_rate=Decimal("0.05"),
-        accept_script=[{}, {}],
-    )
-
-    result = _run(closing_client, tmp_path)
-
-    assert result == 0
-    assert _accepted_markets(closing_client) == [
-        ("XAUS", "sell", True),
-        ("XAU", "buy", True),
-    ]
-    heartbeat = json.loads(
-        _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
-    )
-    assert "carry" in heartbeat["conclusion"]
+        state = json.loads(_paths(tmp_path)["state_path"].read_text())
+        assert state["exit_carry_since"] == (None if hours == 23 else
+            (start + timedelta(hours=24 if hours >= 24 else 0)).isoformat())
 
 
-def test_positive_carry_resets_exit_counter_before_next_bad_round(
-    tmp_path: Path,
-) -> None:
-    """第二轮转正应清零，下一次非正 carry 只能重新计为第一轮。"""
-    negative = dict(swap_rate=Decimal("-0.10"), perp_rate=Decimal("0.05"))
-    positive = dict(swap_rate=Decimal("-0.04"), perp_rate=Decimal("0.10"))
-
-    assert _run(_healthy_client(**negative), tmp_path) == 0
-    assert _run(_healthy_client(**positive), tmp_path) == 0
-    assert _run(_healthy_client(**negative), tmp_path) == 0
-
-    state = json.loads(_paths(tmp_path)["state_path"].read_text(encoding="utf-8"))
-    assert state["exit_carry_consecutive_rounds"] == 1
+def test_unreadable_carry_preserves_timer_without_closing(tmp_path):
+    """读取失败保留起点，但不能仅凭旧值触发平仓。"""
+    since = (NOW - timedelta(hours=25)).isoformat()
+    _paths(tmp_path)["state_path"].write_text(json.dumps({"exit_carry_since": since}))
+    client = _healthy_client(swap_rate=RuntimeError("费率不可读"))
+    assert _run(client, tmp_path, auto_switch=False) == 0
+    assert client.accept_calls == []
+    assert json.loads(_paths(tmp_path)["state_path"].read_text())["exit_carry_since"] == since
 
 
-def test_unreadable_carry_neither_increments_nor_resets_exit_counter(
-    tmp_path: Path,
-) -> None:
-    """读取失败不能被解释成坏 carry，也不能伪装成恢复正常。"""
-    assert _run(
-        _healthy_client(
-            swap_rate=Decimal("-0.10"),
-            perp_rate=Decimal("0.05"),
-        ),
-        tmp_path,
-    ) == 0
-
-    assert _run(
-        _healthy_client(
-            swap_rate=RuntimeError("费率接口暂不可用"),
-            perp_rate=Decimal("0.05"),
-        ),
-        tmp_path,
-    ) == 0
-
-    state = json.loads(_paths(tmp_path)["state_path"].read_text(encoding="utf-8"))
-    assert state["exit_carry_consecutive_rounds"] == 1
+def test_three_percent_carry_opens_flat_position(tmp_path):
+    """3% 已满足新的 2% 入场阈值。"""
+    client = _flat_open_client(swap_rate=Decimal("-0.04"), perp_rate=Decimal("0.07"), accept_script=[{}, {}])
+    assert _run(client, tmp_path) == 0
+    assert len(client.accept_calls) == 2
+    assert all(not reduce_only for _, _, reduce_only in client.accept_calls)
 
 
-def test_exit_carry_counter_survives_new_client_process_round(tmp_path: Path) -> None:
-    """新进程式重建客户端后，退出连续轮次必须从状态文件继续累计。"""
-    first_process = _healthy_client(
-        swap_rate=Decimal("-0.10"),
-        perp_rate=Decimal("0.05"),
-    )
-    second_process = _healthy_client(
-        swap_rate=Decimal("-0.10"),
-        perp_rate=Decimal("0.05"),
-    )
-
-    assert _run(first_process, tmp_path) == 0
-    assert _run(second_process, tmp_path) == 0
-
-    state = json.loads(_paths(tmp_path)["state_path"].read_text(encoding="utf-8"))
-    assert state["exit_carry_consecutive_rounds"] == 2
+def test_close_cooldown_survives_rounds_and_does_not_slide(tmp_path, monkeypatch):
+    """确认平仓后一小时禁止重开，两小时半允许，空仓轮次不延长冷却。"""
+    start = NOW
+    paths = _paths(tmp_path)
+    paths["kill_switch_path"].touch()
+    closing = _healthy_client(accept_script=[{}, {}])
+    assert _run(closing, tmp_path) == 0
+    assert len(closing.accept_calls) == 2
+    paths["kill_switch_path"].unlink()
+    for hours, opens in [(1, False), (2.5, True)]:
+        monkeypatch.setattr(__import__(__name__, fromlist=["NOW"]), "NOW", start + timedelta(hours=hours))
+        client = _flat_open_client(accept_script=[{}, {}])
+        assert _run(client, tmp_path) == 0
+        assert bool(client.accept_calls) is opens
+        assert json.loads(paths["state_path"].read_text())["last_closed_at"] == start.isoformat()
 
 
 def test_auto_open_skips_when_available_margin_is_insufficient(
@@ -1486,6 +1465,10 @@ def test_second_leg_failure_rolls_back_first_leg(
     assert client.sizes == {"XAUS": Decimal("0"), "XAU": Decimal("0")}
     state = json.loads(_paths(tmp_path)["state_path"].read_text(encoding="utf-8"))
     assert state["auto_open_incident"] is False
+    assert state["last_closed_at"] == NOW.isoformat()
+    reopened = _flat_open_client(accept_script=[{}, {}])
+    assert _run(reopened, tmp_path, now=NOW + timedelta(hours=1)) == 0
+    assert reopened.accept_calls == []
 
 
 def test_rollback_failure_enters_incident_and_blocks_later_auto_open(
@@ -1591,14 +1574,15 @@ def test_auto_open_cli_and_environment_configuration(
     """自动开仓可独立关闭，名义可由环境变量或命令行覆盖。"""
     from tools import run_swap_carry_guard
 
-    monkeypatch.setenv("AUTO_OPEN_NOTIONAL_USD", "2000")
+    env_notional = run_swap_carry_guard.AUTO_OPEN_NOTIONAL_USD / Decimal("2")
+    monkeypatch.setenv("AUTO_OPEN_NOTIONAL_USD", str(env_notional))
     parser = run_swap_carry_guard.build_parser()
 
     env_args = parser.parse_args(["--once", "--no-auto-open"])
     cli_args = parser.parse_args(["--once", "--auto-open-notional", "750"])
 
     assert env_args.auto_open is False
-    assert env_args.auto_open_notional == Decimal("2000")
+    assert env_args.auto_open_notional == env_notional
     assert cli_args.auto_open is True
     assert cli_args.auto_open_notional == Decimal("750")
 
@@ -1742,13 +1726,13 @@ def test_weekend_rate_api_failure_is_not_treated_as_zero(tmp_path: Path) -> None
     assert "读取失败" in heartbeat["auto_open_conclusion"]
 
 
-def test_weekend_positive_xau_xaut_carry_resets_exit_counter(
+def test_weekend_positive_xau_xaut_carry_resets_exit_timer(
     tmp_path: Path,
 ) -> None:
-    """周末目标结构的正 carry 应按正常值评估并清零退出计数。"""
+    """周末目标结构的正 carry 应按正常值评估并清零退出计时。"""
     paths = _paths(tmp_path)
     paths["state_path"].write_text(
-        json.dumps({"exit_carry_consecutive_rounds": 2}),
+        json.dumps({"exit_carry_since": (NOW - timedelta(hours=24)).isoformat()}),
         encoding="utf-8",
     )
     client = _switch_client(
@@ -1780,7 +1764,7 @@ def test_weekend_positive_xau_xaut_carry_resets_exit_counter(
         ("XAUT", "perpetual_future"),
     ]
     state = json.loads(paths["state_path"].read_text(encoding="utf-8"))
-    assert state["exit_carry_consecutive_rounds"] == 0
+    assert state["exit_carry_since"] is None
     heartbeat = json.loads(paths["heartbeat_path"].read_text(encoding="utf-8"))
     assert heartbeat["net_carry_annual"] == "0.1095"
 
@@ -1814,6 +1798,7 @@ def test_45_minutes_before_long_close_switches_to_xau_xaut(
     tmp_path: Path,
 ) -> None:
     """距长休市 45 分钟时应在 XAUS 关市前完成周末结构切换。"""
+    _paths(tmp_path)["state_path"].write_text(json.dumps({"last_closed_at": NOW.isoformat()}))
     client = _switch_client(
         positions={"XAUS": Decimal("0.01"), "XAU": Decimal("-0.01")},
         metadata=_metadata(
@@ -2127,7 +2112,7 @@ def test_switch_respects_daily_open_attempt_limit(tmp_path: Path) -> None:
 
 
 def test_auto_switch_cli_and_default_notional_configuration() -> None:
-    """切换默认开启且可关闭，自动开仓默认名义调整为 2000 美元。"""
+    """切换默认开启且可关闭，自动开仓默认名义跟随配置常量。"""
     from tools import run_swap_carry_guard
 
     parser = run_swap_carry_guard.build_parser()
@@ -2137,7 +2122,7 @@ def test_auto_switch_cli_and_default_notional_configuration() -> None:
 
     assert defaults.auto_switch is True
     assert disabled.auto_switch is False
-    assert defaults.auto_open_notional == Decimal("2000")
+    assert defaults.auto_open_notional == run_swap_carry_guard.AUTO_OPEN_NOTIONAL_USD
     assert run_swap_carry_guard.SWITCH_LEAD_TIME == timedelta(minutes=60)
 
 
@@ -2193,9 +2178,14 @@ def test_successful_switch_writes_complete_ledger_and_passes_self_check(
     assert record["flat_confirmation"]["all_flat"] is True
     assert record["flat_confirmation"]["poll_count"] >= 1
     assert record["flat_confirmation"]["confirmed_at"]
-    assert record["after"]["legs"]["XAUS"]["quantity"] == "0.5"
-    assert record["after"]["legs"]["XAU"]["quantity"] == "-0.5"
-    assert record["after"]["net_delta"] == "0.0"
+    # 目标数量由默认名义和客户端价格推导，保留台账字符串的精确比较。
+    expected_quantity = (
+        run_swap_carry_guard.AUTO_OPEN_NOTIONAL_USD
+        / Decimal(client.metadata["XAUS"][0]["price"])
+    )
+    assert record["after"]["legs"]["XAUS"]["quantity"] == str(expected_quantity)
+    assert record["after"]["legs"]["XAU"]["quantity"] == str(-expected_quantity)
+    assert record["after"]["net_delta"] == str(expected_quantity - expected_quantity)
     assert record["after"]["equity"] == "1000"
     assert record["measured_wear_usd"] == "0"
     assert record["self_check"]["performed"] is True
@@ -2414,9 +2404,9 @@ def test_switch_incident_blocks_later_auto_open_and_switch(tmp_path: Path) -> No
 
 @pytest.mark.parametrize("unreadable", [False, True])
 def test_non_target_holding_exit_uses_readability_only(tmp_path, unreadable):
-    """复现开市后负 carry 旧结构：只有读取失败才能暂停计数。"""
+    """复现开市后负 carry 旧结构：读取失败保留计时，不能伪造恢复。"""
     paths = _paths(tmp_path)
-    paths["state_path"].write_text(json.dumps({"exit_carry_consecutive_rounds": 1}))
+    paths["state_path"].write_text(json.dumps({"exit_carry_since": (NOW - timedelta(hours=1)).isoformat()}))
     client = _switch_client(
         positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
         perp_rate={"XAU": RuntimeError("读取失败") if unreadable else Decimal("0.1120"),
@@ -2425,10 +2415,10 @@ def test_non_target_holding_exit_uses_readability_only(tmp_path, unreadable):
     )
     assert _run(client, tmp_path, auto_switch=True) == 0
     state = json.loads(paths["state_path"].read_text())
-    assert state["exit_carry_consecutive_rounds"] == (1 if unreadable else 2)
+    assert state["exit_carry_since"] == (NOW - timedelta(hours=1)).isoformat()
     records = [json.loads(line) for line in paths["audit_path"].read_text().splitlines()]
     observed = next(row for row in records if row["event"] == "exit_carry_observed")
-    assert ("不计数也不清零" in observed["message"]) is unreadable
+    assert ("保留原计时" in observed["message"]) is unreadable
     if unreadable:
         assert "读取失败" in observed["message"]
     else:
@@ -2461,27 +2451,16 @@ def test_switch_accepts_latest_applied_fallback(tmp_path):
         ("XAUS", "buy", False), ("XAU", "sell", False)]
 
 
-def test_non_target_negative_carry_closes_before_switch_on_third_round(tmp_path):
-    """旧结构退出计数达阈值时必须只减仓，不能被切换抢先或重新开仓。"""
-    for expected in (1, 2, 3):
-        client = _switch_client(
-            positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
-            perp_rate={"XAU": Decimal("0.1120"), "XAUT": Decimal("0.0036")},
-            swap_rate=RuntimeError("目标费率不可用"),
-            accept_script=[{}, {}] if expected == 3 else None,
-        )
-        assert _run(client, tmp_path, auto_switch=True) == 0
-        state = json.loads(_paths(tmp_path)["state_path"].read_text())
-        assert state["exit_carry_consecutive_rounds"] == (expected if expected < 3 else 0)
-        records = [json.loads(line) for line in _paths(tmp_path)["audit_path"].read_text().splitlines()]
-        observations = [row for row in records if row["event"] == "exit_carry_observed"]
-        assert observations[-1]["consecutive_rounds"] == expected
-        if expected < 3:
-            assert client.accept_calls == []
-        else:
-            assert _accepted_markets(client) == [
-                ("XAU", "sell", True), ("XAUT", "buy", True)]
-            assert all(size == 0 for size in client.sizes.values())
+def test_non_target_negative_carry_closes_after_duration(tmp_path):
+    """非目标结构持续恶化满一天，也必须先熔断且不重开。"""
+    _paths(tmp_path)["state_path"].write_text(json.dumps({
+        "exit_carry_since": (NOW - timedelta(hours=24)).isoformat()}))
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        perp_rate={"XAU": Decimal("0.1120"), "XAUT": Decimal("0.0036")},
+        swap_rate=RuntimeError("目标费率不可用"), accept_script=[{}, {}])
+    assert _run(client, tmp_path, auto_switch=True) == 0
+    assert _accepted_markets(client) == [("XAU", "sell", True), ("XAUT", "buy", True)]
 
 
 @pytest.mark.parametrize('trigger', ['liquidation', 'kill', 'carry', 'none'])
@@ -2508,7 +2487,7 @@ def test_allocation_runs_only_after_all_close_checks(tmp_path, monkeypatch, trig
     elif trigger == 'carry':
         client.swap_rate = Decimal('-1')
         client.perp_rate = Decimal('0')
-        _paths(tmp_path)['state_path'].write_text(json.dumps({'exit_carry_consecutive_rounds':2}))
+        _paths(tmp_path)['state_path'].write_text(json.dumps({'exit_carry_since': (NOW - timedelta(hours=24)).isoformat()}))
     assert _run(client,tmp_path,auto_switch=False,auto_open=False) == 0
     if trigger != 'none':
         client.get_isolated_allocation.assert_not_awaited()
@@ -2552,3 +2531,57 @@ def test_funding_recon_runs_in_guard_dry_run(tmp_path, monkeypatch):
     assert records[0]['conclusion'] == '日常计提正常'
     assert reads.count('/transfers?limit=100&offset=0') == 2
     assert client.accept_calls == []
+
+
+@pytest.mark.parametrize("trigger", ["kill", "single_leg", "liquidation", "account_margin"])
+def test_risk_closes_immediately_during_carry_timer_and_cooldown(tmp_path, trigger):
+    """最高优先级风控不等待 carry 满一天，也不受重开冷却约束。"""
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(json.dumps({
+        "exit_carry_since": (NOW - timedelta(minutes=5)).isoformat(),
+        "last_closed_at": (NOW - timedelta(minutes=30)).isoformat(),
+    }))
+    client = _healthy_client(swap_rate=Decimal("-0.12"), perp_rate=Decimal("0"),
+                             accept_script=[{}, {}])
+    if trigger == "kill":
+        paths["kill_switch_path"].touch()
+    elif trigger == "single_leg":
+        client.sizes["XAU"] = Decimal("0")
+    elif trigger == "liquidation":
+        client.liquidation_info = (Decimal("4000"), Decimal("3960"))
+    else:
+        client.equity = Decimal("5")
+    assert _run(client, tmp_path) == 0
+    assert len(client.accept_calls) == (1 if trigger == "single_leg" else 2)
+    assert all(reduce_only for _, _, reduce_only in client.accept_calls)
+    assert client.funding_calls == []
+    assert json.loads(paths["state_path"].read_text())["last_closed_at"] == NOW.isoformat()
+
+
+def test_reopen_cooldown_exact_boundary(tmp_path):
+    """冷却满两小时即允许开仓。"""
+    _paths(tmp_path)["state_path"].write_text(json.dumps({
+        "last_closed_at": (NOW - timedelta(hours=2)).isoformat()}))
+    client = _flat_open_client(accept_script=[{}, {}])
+    assert _run(client, tmp_path) == 0
+    assert len(client.accept_calls) == 2
+
+
+def test_legacy_round_counter_does_not_trigger_duration_exit(tmp_path):
+    """旧版高轮数没有时间语义，升级后从首次低 carry 观察重新计时。"""
+    _paths(tmp_path)["state_path"].write_text(json.dumps({"exit_carry_consecutive_rounds": 999}))
+    client = _healthy_client(swap_rate=Decimal("-0.12"), perp_rate=Decimal("0"))
+    assert _run(client, tmp_path) == 0
+    assert client.accept_calls == []
+    assert json.loads(_paths(tmp_path)["state_path"].read_text())["exit_carry_since"] == NOW.isoformat()
+
+
+def test_second_leg_skew_rollback_also_starts_cooldown(tmp_path):
+    """首腿成交后第二腿偏斜拒单已产生回滚成本，不能下一轮立即重试。"""
+    client = _flat_open_client(accept_script=[{}, VariationalRequestError(422, "skew"), {}])
+    assert _run(client, tmp_path) == 0
+    assert len(client.accept_calls) == 3
+    assert json.loads(_paths(tmp_path)["state_path"].read_text())["last_closed_at"] == NOW.isoformat()
+    retry = _flat_open_client(accept_script=[{}, {}])
+    assert _run(retry, tmp_path, now=NOW + timedelta(hours=1)) == 0
+    assert retry.accept_calls == []

@@ -601,7 +601,7 @@ def test_guard_xau_xaut_open_position_has_no_weekend_close_logic(
 
     paths = _guard_paths(tmp_path)
     paths["state_path"].write_text(
-        json.dumps({"exit_carry_consecutive_rounds": 2}),
+        json.dumps({"exit_carry_since": NOW.isoformat()}),
         encoding="utf-8",
     )
     client = StrictMultiClient(
@@ -630,14 +630,14 @@ def test_guard_xau_xaut_open_position_has_no_weekend_close_logic(
     assert client.funding_calls == (["XAU", "XAUT"] if readable else ["XAU"])
     assert client.accept_calls == []
     state = json.loads(paths["state_path"].read_text(encoding="utf-8"))
-    assert state["exit_carry_consecutive_rounds"] == (0 if readable else 2)
+    assert state["exit_carry_since"] == (None if readable else NOW.isoformat())
     records = [json.loads(line) for line in paths["audit_path"].read_text().splitlines()]
     observation = next(row for row in records if row["event"] == "exit_carry_observed")
     if readable:
         assert Decimal(observation["net_carry_annual"]) == Decimal("0.10")
-        assert "连续计数已清零" in observation["message"]
+        assert "持续计时已清零" in observation["message"]
     else:
-        assert "读取失败，本轮不计数也不清零" in observation["message"]
+        assert "读取失败，保留原计时" in observation["message"]
 
 
 def test_guard_records_cross_liquidation_without_using_it_to_exit(
