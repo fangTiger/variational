@@ -16,6 +16,8 @@ from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequen
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+
+from infra.data_paths import data_dir
 from typing import Any, TypeVar
 
 from adapters.variational_client import (
@@ -32,7 +34,7 @@ from tools.verify_funding_units import remove_proxy_environment
 logger = logging.getLogger("sample_swap_carry")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "swap_carry_samples.jsonl"
+DEFAULT_OUTPUT = data_dir() / "swap_carry_samples.jsonl"
 DEFAULT_QTY = Decimal("0.224")
 DEFAULT_INTERVAL_SECONDS = 3600
 DEFAULT_COST_BPS = Decimal("6")

@@ -185,13 +185,14 @@ def test_nonpositive_hard_stop_requires_explicit_waiver(
 
 
 def test_ready_dependencies_enter_existing_loop_and_log_summary(
+    tmp_path,
     monkeypatch,
     caplog,
 ) -> None:
     """依赖齐备时仍按原顺序连接并执行交易循环。"""
     engine = GridEngine(
         _ReadyAdapter(),
-        _protected_config(poll_interval=0),
+        _protected_config(poll_interval=0, state_path=str(tmp_path / "grid_state.json")),
         candle_source=_ReadyCandleSource(),
     )
     calls: list[str] = []
@@ -210,6 +211,7 @@ def test_ready_dependencies_enter_existing_loop_and_log_summary(
     with caplog.at_level(logging.INFO, logger="grid_engine"):
         asyncio.run(engine.run_forever())
 
+    assert (tmp_path / "grid_live.json").is_file()
     assert calls == ["connect", "run_once"]
     assert "风控状态摘要" in caplog.text
     assert "净值回撤熔断=启用" in caplog.text

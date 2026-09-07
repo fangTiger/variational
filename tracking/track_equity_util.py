@@ -10,6 +10,8 @@ import json
 import time
 from decimal import Decimal
 from pathlib import Path
+
+from infra.data_paths import data_dir
 from typing import Any
 
 from tracking.direction_state import FundingDirectionStateStore
@@ -17,7 +19,7 @@ from tracking.monitor import compute_funding_view
 
 UNDERLYING = "BTC"
 EXT_MARKET = "BTC-USD"
-EQUITY_FILE = Path(__file__).resolve().parent.parent / "data" / "equity_track.jsonl"
+EQUITY_FILE = data_dir() / "equity_track.jsonl"
 
 
 async def build_snapshot(

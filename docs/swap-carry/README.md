@@ -246,3 +246,37 @@ touch data/swap_carry.kill
 - `docs/plans/2026-09-05-swap-carry-首仓执行计划.md` —— 首仓参数与执行步骤
 - `docs/guides/导出-Variational-会话Cookie.md` —— Cookie 导出与刷新
 - `openspec/changes/variational-swap-carry/` —— 提案、设计决策与需求规范
+
+## 结构切换事前预演
+
+守护进程在计划切换前 30 分钟执行一次 indicative 预演。计划切换时间仍由真实
+XAUS 会话边界和 `SWITCH_LEAD_TIME` 推算，不使用固定星期或固定收市时间。
+`REHEARSAL_LEAD` 环境变量或 `--rehearsal-lead-minutes` 可覆盖提前分钟数；
+错过提前时间的启动会在实际切换前补预演。`--no-auto-switch` 禁用自动预演；
+守护进程 `--dry-run` 仍保持原有禁止全部 POST 的约定，不发送 indicative。
+
+预演检查旧仓数量、名义和净 delta，逐腿平仓报价及滑点，新仓数量、名义、保证金，
+交易状态与剩余交易时间、各腿年化费率和新结构净 carry。所需保证金按旧结构全平后
+的新仓估算：已有同标的仓位时采用报价 `margin_params.params.asset_params` 内的
+`futures_initial_margin`，保留原始方向保证金增量供审计，避免把反向抵消旧仓的负增量
+误认为新仓不需保证金。可用保证金为 `/portfolio.balance + upnl` 减全部持仓顶层
+`initial_margin`，不预支尚未释放的资金。字段不足时阻断。预计耗时仅取历史真实完成
+切换的 `total_duration_ms` 中位数；无有效历史明确记录“无估计”。
+
+- `ready`：检查通过，info 记录，不阻止切换。
+- `warning`：例如滑点超过 20 bp、净 carry 低于入场阈值，warning 记录，继续允许切换。
+- `blocked`：保证金不足、不可交易、报价或检查异常（含 20 秒超时），critical 记录并
+  尝试 macOS 通知，本窗口禁止真实切换。同一窗口即使重启或条件恢复也不重复预演。
+  直到新窗口重新预演通过才解除；风控平仓后也不能通过自动开仓绕过阻断。
+
+平仓风控优先于预演；blocked 不禁止 reduce-only 风控平仓。注意：按“预演时任何腿
+不可交易即 blocked”的规则，开市前预演遇到尚未开市的 XAUS 也会阻断本次开市窗口，
+不能仅因随后开市自动解除。
+
+完整证据追加到 `data/swap_carry_switch_history.jsonl`，使用 `kind: "rehearsal"`。
+真实切换记录保留关联的预演结论。状态文件保存窗口去重记录；心跳包含 `last_rehearsal`
+与 `rehearsal_blocked`，面板显示“上次预演”，阻断显示 critical 告警。查询工具仅读文件：
+
+```bash
+.venv/bin/python tools/show_rehearsal.py --last 5
+```

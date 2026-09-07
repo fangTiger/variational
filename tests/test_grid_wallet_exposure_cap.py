@@ -330,12 +330,14 @@ def test_august_19_short_inventory_rejects_sell_but_allows_buy() -> None:
 
 
 def test_run_forever_logs_current_effective_cap_from_shared_cache(
+    tmp_path,
     monkeypatch,
     caplog,
 ) -> None:
     """启动摘要使用首次共享权益缓存，显示当前生效值及来源。"""
     adapter = _BalanceAdapter(730)
     engine = _engine(adapter)
+    engine.config.state_path = str(tmp_path / "grid_state.json")
     engine.config.poll_interval = 0
     calls: list[str] = []
 
@@ -356,6 +358,7 @@ def test_run_forever_logs_current_effective_cap_from_shared_cache(
         asyncio.run(engine.run_forever())
 
     assert calls == ["connect", "run_once"]
+    assert (tmp_path / "grid_live.json").is_file()
     assert adapter.balance_calls == 1
     assert "库存上限状态" in caplog.text
     assert "当前生效值=$2190.00" in caplog.text
@@ -394,12 +397,14 @@ def test_startup_cache_is_still_processed_by_first_drawdown_check(
 
 
 def test_unconfigured_ratio_does_not_prefetch_balance_at_startup(
+    tmp_path,
     monkeypatch,
 ) -> None:
     """无比例的 legacy 启动不得比变更前多发一次权益请求。"""
     adapter = _BalanceAdapter(RuntimeError("不应调用"))
     engine = _engine(adapter, ratio=None)
     engine.config.max_drawdown_pct = 0.12
+    engine.config.state_path = str(tmp_path / "grid_state.json")
     engine.config.poll_interval = 0
 
     monkeypatch.setattr(engine, "validate_risk_controls", lambda: {})
@@ -416,6 +421,7 @@ def test_unconfigured_ratio_does_not_prefetch_balance_at_startup(
 
     asyncio.run(engine.run_forever())
 
+    assert (tmp_path / "grid_live.json").is_file()
     assert adapter.balance_calls == 0
 
 

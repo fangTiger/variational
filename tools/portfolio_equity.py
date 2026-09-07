@@ -17,12 +17,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+from infra.data_paths import data_dir
 from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "portfolio_equity.jsonl"
-DEFAULT_VOLUME_OUTPUT = PROJECT_ROOT / "data" / "portfolio_volume.jsonl"
+DEFAULT_OUTPUT = data_dir() / "portfolio_equity.jsonl"
+DEFAULT_VOLUME_OUTPUT = data_dir() / "portfolio_volume.jsonl"
 DEFAULT_INTERVAL_SECONDS = 900.0
 PORTFOLIO_SCHEMA = 6
 ACCOUNT_SOURCES = {
@@ -59,7 +61,7 @@ class VolumeInstanceConfig:
 DEFAULT_VOLUME_INSTANCES = (
     VolumeInstanceConfig(
         key="entropy_xyz_sndk",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_sndk_xyz.jsonl",
+        heartbeat_path=data_dir() / "timed_volume_sndk_xyz.jsonl",
         symbol="io:SNDK",
         primary_source="hyperliquid_var",
         hedge_source="hyperliquid_var",
@@ -67,7 +69,7 @@ DEFAULT_VOLUME_INSTANCES = (
     ),
     VolumeInstanceConfig(
         key="lighter_variational_btc",
-        heartbeat_path=PROJECT_ROOT / "data" / "timed_volume_btc.jsonl",
+        heartbeat_path=data_dir() / "timed_volume_btc.jsonl",
         symbol="BTC",
         primary_source="lighter",
         hedge_source="variational",

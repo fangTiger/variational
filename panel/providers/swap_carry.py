@@ -305,9 +305,33 @@ def _switch_incident_alert(
     )
 
 
+def _rehearsal_metric(path: Path) -> tuple[Metric, PanelAlert | None]:
+    """无论持仓采集是否成功，都从心跳展示预演及阻断告警。"""
+    try:
+        heartbeat = json.loads(path.read_text(encoding="utf-8"))
+        report = heartbeat.get("last_rehearsal")
+        if not isinstance(report, Mapping):
+            return Metric("上次预演", "尚无预演"), None
+        conclusion = report.get("conclusion", "未知")
+        blocked = conclusion == "blocked" or heartbeat.get("rehearsal_blocked") is True
+        reasons = "；".join(report.get("blocking_reasons", []))
+        value = f"{report.get('timestamp', '时间未知')} / {conclusion}"
+        if reasons:
+            value += f" / {reasons}"
+        alert = PanelAlert(
+            key="swap_carry_rehearsal_blocked", level="critical",
+            title=f"结构切换预演 blocked：{reasons}",
+            action="本窗口禁止切换；平仓风控仍生效，请检查预演台账",
+        ) if blocked else None
+        return Metric("上次预演", value, "bad" if blocked else "warn" if conclusion == "warning" else "good"), alert
+    except (OSError, ValueError, TypeError, AttributeError):
+        return Metric("上次预演", "无数据", "warn"), None
+
+
 def _last_switch_metric(path: Path) -> Metric:
     """读取最近一条切换台账；缺失与损坏采用不同降级文案。"""
     records, error = load_switch_history(path)
+    records = [record for record in records if record.get("kind") != "rehearsal"]
     if error is not None:
         return Metric("上次切换", "台账不可用（文件损坏）", "warn")
     if not records:
@@ -719,13 +743,20 @@ def collect(
     try:
         if observed_at.tzinfo is None:
             raise ValueError("now 必须包含时区")
-        return asyncio.run(run())
+        status = asyncio.run(run())
+        metric, alert = _rehearsal_metric(heartbeat_path)
+        status.metrics.append(metric)
+        if alert:
+            status.alerts.append(alert)
+        return status
     except Exception as exc:  # noqa: BLE001 单个 provider 不能拖垮整页
         session_metric, session_alert = _session_expiry_metric(heartbeat_path)
+        rehearsal_metric, rehearsal_alert = _rehearsal_metric(heartbeat_path)
         alerts = [
             alert
             for alert in (
                 session_alert,
+                rehearsal_alert,
                 _guard_alert(state_path),
                 _switch_incident_alert(heartbeat_path, state_path),
             )
@@ -737,6 +768,7 @@ def collect(
             summary="采集失败",
             metrics=[
                 session_metric,
+                rehearsal_metric,
                 _last_switch_metric(switch_history_path),
                 _next_switch_metric(None),
             ],

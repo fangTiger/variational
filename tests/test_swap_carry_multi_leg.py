@@ -321,6 +321,7 @@ def _guard_paths(tmp_path: Path) -> dict[str, Path]:
         "heartbeat_path": tmp_path / "heartbeat.json",
         "state_path": tmp_path / "state.json",
         "audit_path": tmp_path / "audit.jsonl",
+        "switch_history_path": tmp_path / "switch_history.jsonl",
     }
 
 

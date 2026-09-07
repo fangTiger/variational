@@ -19,7 +19,9 @@ import ssl  # noqa: E402
 from collections import deque  # noqa: E402
 from collections.abc import Iterable  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
-from pathlib import Path  # noqa: E402
+from pathlib import Path
+
+from infra.data_paths import data_dir  # noqa: E402
 
 import certifi  # noqa: E402
 import websockets  # noqa: E402
@@ -30,7 +32,7 @@ WS_URL = (
     "wss://api.starknet.extended.exchange/stream.extended.exchange"
     "/v1/publicTrades/BTC-USD"
 )
-OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "trades"
+OUT_DIR = data_dir() / "trades"
 
 # 连接正常但长时间无数据时视为可能静默卡死，写缺口标记。
 #
@@ -135,34 +137,36 @@ class TradeBuffer:
         return None
 
 
-def _out_path(ts_ms: int) -> Path:
+def _out_path(ts_ms: int, out_dir: Path | None = None) -> Path:
     """按交易所时间戳（UTC）切分日文件。"""
     day = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-    return OUT_DIR / f"{day}.jsonl"
+    return (OUT_DIR if out_dir is None else Path(out_dir)) / f"{day}.jsonl"
 
 
-def _append(rows: list[dict]) -> None:
+def _append(rows: list[dict], *, out_dir: Path | None = None) -> None:
     """按天分组落盘。"""
     if not rows:
         return
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = OUT_DIR if out_dir is None else Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     by_day: dict[Path, list[dict]] = {}
     for row in rows:
-        by_day.setdefault(_out_path(row["T"]), []).append(row)
+        by_day.setdefault(_out_path(row["T"], out_dir), []).append(row)
     for path, chunk in by_day.items():
         with path.open("a", encoding="utf-8") as f:
             for row in chunk:
                 f.write(json.dumps(row, separators=(",", ":")) + "\n")
 
 
-def _append_gap(start_ms: int, end_ms: int) -> None:
+def _append_gap(start_ms: int, end_ms: int, *, out_dir: Path | None = None) -> None:
     """写缺口标记。
 
     分析脚本遇到它必须截断该段而非跨越拼接——跨越缺口会凭空制造一次
     巨大的价格跳变，直接污染标度指数。宁可多标不可漏标。
     """
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = _out_path(end_ms)
+    out_dir = OUT_DIR if out_dir is None else Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = _out_path(end_ms, out_dir)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"gap": True, "from": start_ms, "to": end_ms}) + "\n")
     logger.warning("检测到数据缺口 %d → %d（%.1f 秒）",

@@ -22,17 +22,19 @@ import json  # noqa: E402
 import math  # noqa: E402
 import subprocess  # noqa: E402
 import time  # noqa: E402
-from pathlib import Path  # noqa: E402
+from pathlib import Path
+
+from infra.data_paths import data_dir  # noqa: E402
 
 from adapters.extended_client import ExtendedClient  # noqa: E402
 from grid.grid_state import load_state  # noqa: E402
 from grid.regime import adx, decide_mode, donchian_prev  # noqa: E402
 from grid.risk import dist_to_liq_pct  # noqa: E402
 
-_FILE = Path(__file__).resolve().parent.parent / "data" / "grid_monitor.jsonl"
-_BASELINE = Path(__file__).resolve().parent.parent / "data" / "grid_baseline.json"
-_STATE = Path(__file__).resolve().parent.parent / "data" / "grid_state.json"
-_LIVE = Path(__file__).resolve().parent.parent / "data" / "grid_live.json"
+_FILE = data_dir() / "grid_monitor.jsonl"
+_BASELINE = data_dir() / "grid_baseline.json"
+_STATE = data_dir() / "grid_state.json"
+_LIVE = data_dir() / "grid_live.json"
 MARKET = "BTC-USD"
 
 
@@ -99,7 +101,7 @@ def _liquidation_distance_pct(
     return dist_to_liq_pct(float(mark), float(liq), signed_size)
 
 
-async def _snapshot() -> dict:
+async def _snapshot(*, baseline_path: Path | None = None) -> dict:
     try:
         from dotenv import load_dotenv
 
@@ -135,13 +137,14 @@ async def _snapshot() -> dict:
     finally:
         await ext.close()
 
-    # 基线权益（首次记录）
-    if _BASELINE.exists():
-        base = json.loads(_BASELINE.read_text())["equity"]
+    # 基线权益（首次记录），路径可由测试显式注入。
+    baseline_path = _BASELINE if baseline_path is None else Path(baseline_path)
+    if baseline_path.exists():
+        base = json.loads(baseline_path.read_text())["equity"]
     else:
         base = equity
-        _BASELINE.parent.mkdir(exist_ok=True)
-        _BASELINE.write_text(json.dumps({"equity": equity, "ts": time.time()}))
+        baseline_path.parent.mkdir(exist_ok=True)
+        baseline_path.write_text(json.dumps({"equity": equity, "ts": time.time()}))
 
     grid_state = _read_grid_state()
     # mode/封锁状态一律以引擎快照为准；引擎停了或快照过期才回退到本地重算，
@@ -179,9 +182,11 @@ async def _snapshot() -> dict:
     }
 
 
-def _record(snap: dict) -> None:
-    _FILE.parent.mkdir(exist_ok=True)
-    with _FILE.open("a", encoding="utf-8") as f:
+def _record(snap: dict, *, path: Path | None = None) -> None:
+    """追加监控记录，允许独立注入输出路径。"""
+    path = _FILE if path is None else Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(snap, ensure_ascii=False) + "\n")
 
 

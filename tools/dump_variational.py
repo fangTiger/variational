@@ -19,6 +19,8 @@ import asyncio
 import json
 from pathlib import Path
 
+from infra.data_paths import data_dir
+
 from adapters.variational_client import Session, VariationalAuthError, VariationalClient
 
 # 只读端点清单（均为 GET，安全）
@@ -39,10 +41,10 @@ ENDPOINTS = [
     "/v1/profile/account",
 ]
 
-_OUT = Path(__file__).resolve().parent.parent / "data" / "variational_dump.json"
+_OUT = data_dir() / "variational_dump.json"
 
 
-async def _run(session: Session) -> int:
+async def _run(session: Session, *, output: Path | None = None) -> int:
     client = VariationalClient(session)
     results: dict[str, object] = {}
     try:
@@ -63,9 +65,10 @@ async def _run(session: Session) -> int:
     finally:
         await client.close()
 
-    _OUT.parent.mkdir(exist_ok=True)
-    _OUT.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n📄 已保存全部原始响应到 {_OUT}")
+    output = _OUT if output is None else Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n📄 已保存全部原始响应到 {output}")
     print("请把这个文件（或上面的控制台输出）发回。")
     return 0
 
@@ -73,6 +76,7 @@ async def _run(session: Session) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Variational 只读端点批量导出")
     parser.add_argument("--json", help="会话 JSON 文件路径", default=None)
+    parser.add_argument("--output", type=Path, default=_OUT, help="原始响应输出路径")
     args = parser.parse_args()
 
     try:
@@ -83,7 +87,7 @@ def main() -> None:
         pass
 
     session = Session.from_json(args.json) if args.json else Session.from_env()
-    raise SystemExit(asyncio.run(_run(session)))
+    raise SystemExit(asyncio.run(_run(session, output=args.output)))
 
 
 if __name__ == "__main__":

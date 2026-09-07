@@ -28,6 +28,8 @@ _UNCONFIGURED = object()
 @pytest.fixture(autouse=True)
 def _isolate_variational_cookie_environment(monkeypatch) -> None:
     """普通守护测试不继承开发机上的真实会话。"""
+    from tools import run_swap_carry_guard
+    monkeypatch.setattr(run_swap_carry_guard, "notify", lambda *_args: True)
     monkeypatch.delenv("VARIATIONAL_COOKIE", raising=False)
     monkeypatch.delenv("VARIATIONAL_WALLET_ADDRESS", raising=False)
 
@@ -311,6 +313,7 @@ class StrictGuardClient:
                 "params": {
                     "asset_params": {
                         underlying: {
+                            "futures_initial_margin": "0.05",
                             "futures_maintenance_margin": str(
                                 _maintenance_rate(underlying)
                             )
@@ -352,6 +355,13 @@ class StrictGuardClient:
         if isinstance(result, BaseException):
             raise result
         return result
+
+    async def raw(self, path: str) -> object:
+        """真实 /portfolio 只给 balance 和 upnl，不虚构可用余额。"""
+        assert path == "/portfolio"
+        if self.equity is None:
+            raise AssertionError("未配置调用：raw(/portfolio)")
+        return {"balance": str(self.equity), "upnl": "0"}
 
     async def get_balance(self) -> object:
         self.balance_calls += 1
@@ -632,7 +642,7 @@ def test_cross_leg_missing_liquidation_keeps_running_with_account_check(
         accept_script=[{}, {}],
     )
 
-    result = _run(client, tmp_path, structure=hedge_swap_carry.XAU_XAUT)
+    result = _run(client, tmp_path, structure=hedge_swap_carry.XAU_XAUT, auto_switch=False)
 
     assert result == 0
     assert client.accept_calls == []
@@ -1939,9 +1949,9 @@ def test_switch_open_failure_stays_fully_flat(
     ]
     assert all(size == 0 for size in client.sizes.values())
 
-    switch_record = json.loads(
-        _paths(tmp_path)["switch_history_path"].read_text(encoding="utf-8")
-    )
+    switch_record = [json.loads(line) for line in
+                     _paths(tmp_path)["switch_history_path"].read_text(encoding="utf-8").splitlines()
+                     if json.loads(line).get("kind") != "rehearsal"][-1]
     assert switch_record["status"] == "failed"
     assert switch_record["failure"]["stage"] == "open"
     assert switch_record["failure"]["residual_state"] == "空仓"
@@ -2149,6 +2159,8 @@ def test_successful_switch_writes_complete_ledger_and_passes_self_check(
             encoding="utf-8"
         ).splitlines()
     ]
+    assert len([r for r in records if r.get("kind") == "rehearsal"]) == 1
+    records = [r for r in records if r.get("kind") != "rehearsal"]
     assert len(records) == 1
     record = records[0]
     assert {
@@ -2232,9 +2244,9 @@ def test_switch_close_failure_records_stage_without_completion(
     result = _run(client, tmp_path, auto_switch=True)
 
     assert result != 0
-    record = json.loads(
-        _paths(tmp_path)["switch_history_path"].read_text(encoding="utf-8")
-    )
+    record = [json.loads(line) for line in
+              _paths(tmp_path)["switch_history_path"].read_text(encoding="utf-8").splitlines()
+              if json.loads(line).get("kind") != "rehearsal"][-1]
     assert record["status"] == "failed"
     assert record["failure"]["stage"] == "close"
     assert record["failure"]["error_type"] == "CloseActionError"
@@ -2280,9 +2292,9 @@ def test_post_switch_delta_failure_sets_incident_and_emits_critical(
     heartbeat = json.loads(
         _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
     )
-    record = json.loads(
-        _paths(tmp_path)["switch_history_path"].read_text(encoding="utf-8")
-    )
+    record = [json.loads(line) for line in
+              _paths(tmp_path)["switch_history_path"].read_text(encoding="utf-8").splitlines()
+              if json.loads(line).get("kind") != "rehearsal"][-1]
     assert state["switch_incident"] is True
     assert heartbeat["switch_incident"] is True
     assert record["status"] == "failed"

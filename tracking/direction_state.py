@@ -6,6 +6,8 @@ import json
 import os
 import tempfile
 from pathlib import Path
+
+from infra.data_paths import data_dir
 from typing import Any
 
 from infra.logger import get_logger
@@ -13,7 +15,7 @@ from infra.logger import get_logger
 logger = get_logger("funding_direction_state")
 
 DEFAULT_DIRECTION_STATE_FILE = (
-    Path(__file__).resolve().parent.parent / "data" / "funding_direction_state.json"
+    data_dir() / "funding_direction_state.json"
 )
 _VALID_DIRECTIONS = {"short_variational", "long_variational"}
 
@@ -21,8 +23,8 @@ _VALID_DIRECTIONS = {"short_variational", "long_variational"}
 class FundingDirectionStateStore:
     """按交易场所与市场隔离保存最近一次推荐方向。"""
 
-    def __init__(self, path: str | Path = DEFAULT_DIRECTION_STATE_FILE) -> None:
-        self.path = Path(path)
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = DEFAULT_DIRECTION_STATE_FILE if path is None else Path(path)
 
     @staticmethod
     def _keys(venue: str, market: str) -> tuple[str, str]:

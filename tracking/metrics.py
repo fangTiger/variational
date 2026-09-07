@@ -16,7 +16,9 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
 
-_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+from infra.data_paths import data_dir
+
+_DATA_DIR = data_dir()
 _DEFAULT_FILE = _DATA_DIR / "metrics.jsonl"
 
 # 一年的秒数，用于年化
@@ -68,8 +70,8 @@ class MetricsSummary:
 class MetricsTracker:
     """快照记录 + 派生指标计算。"""
 
-    def __init__(self, path: str | Path = _DEFAULT_FILE) -> None:
-        self.path = Path(path)
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = _DEFAULT_FILE if path is None else Path(path)
         self._snapshots: list[Snapshot] = []
         if self.path.exists():
             self._load()

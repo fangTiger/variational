@@ -15,7 +15,9 @@ import json  # noqa: E402
 import math  # noqa: E402
 import re  # noqa: E402
 import time  # noqa: E402
-from pathlib import Path  # noqa: E402
+from pathlib import Path
+
+from infra.data_paths import data_dir  # noqa: E402
 
 from dotenv import load_dotenv  # noqa: E402
 
@@ -34,7 +36,7 @@ from grid.attribution.store import (  # noqa: E402
 from tools.fetch_funding import fetch_funding  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parent.parent
-_DATA = _ROOT / "data"
+_DATA = data_dir()
 _DB = _DATA / "grid.db"
 _RESULT = _DATA / "attribution.json"
 _START = _DATA / "attribution_start.json"
@@ -105,15 +107,16 @@ def _observation_start_ts(fills: list[dict], start_path: Path) -> float | None:
     return min(timestamps) if timestamps else None
 
 
-def _write_result(result: dict) -> None:
+def _write_result(result: dict, *, path: Path | None = None) -> None:
     """原子替换报告，避免告警器读到只写了一半的 JSON。"""
-    _RESULT.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _RESULT.with_suffix(".tmp")
+    path = _RESULT if path is None else Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
     temporary.write_text(
         json.dumps(result, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    temporary.replace(_RESULT)
+    temporary.replace(path)
 
 
 def _undecided(reason: str, *, loops_count: int) -> dict:

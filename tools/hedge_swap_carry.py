@@ -26,7 +26,9 @@ from collections.abc import Mapping, MutableMapping, Sequence  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 from decimal import ROUND_DOWN, Decimal, InvalidOperation  # noqa: E402
-from pathlib import Path  # noqa: E402
+from pathlib import Path
+
+from infra.data_paths import data_dir  # noqa: E402
 from typing import Any  # noqa: E402
 
 from adapters.base import Position, Side  # noqa: E402
@@ -66,11 +68,11 @@ _PROXY_ENV_NAMES = (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SWAP_CARRY_KILL_SWITCH = PROJECT_ROOT / "data" / "swap_carry.kill"
+SWAP_CARRY_KILL_SWITCH = data_dir() / "swap_carry.kill"
 SWAP_CARRY_GUARD_HEARTBEAT = (
-    PROJECT_ROOT / "data" / "swap_carry_guard_heartbeat.json"
+    data_dir() / "swap_carry_guard_heartbeat.json"
 )
-SWAP_CARRY_GUARD_STATE = PROJECT_ROOT / "data" / "swap_carry_guard_state.json"
+SWAP_CARRY_GUARD_STATE = data_dir() / "swap_carry_guard_state.json"
 SWAP_CARRY_GUARD_STALE_AFTER = timedelta(minutes=15)
 _ANSI_RED = "\033[31m"
 _ANSI_RESET = "\033[0m"
@@ -549,6 +551,8 @@ async def _prepare_open_quotes(
     var: Any,
     target_notional: Decimal,
     structure: CarryStructure | str = DEFAULT_STRUCTURE,
+    *,
+    require_margin: bool = True,
 ) -> tuple[tuple[PreparedQuote, ...], Decimal]:
     """询价并按相对权重生成全部腿的计划；全程不 accept。"""
     selected = resolve_structure(structure)
@@ -606,7 +610,9 @@ async def _prepare_open_quotes(
                 f"❌ {selected.name} 权重无法按 {leg.underlying} 数量步长 {step} 精确配平"
             )
         payload = await _request_quote(var, leg, leg.open_side, qty)
-        quotes.append(_prepare_quote(leg, leg.open_side, qty, payload))
+        quotes.append(_prepare_quote(
+            leg, leg.open_side, qty, payload, require_margin=require_margin,
+        ))
 
     for quote in quotes:
         if quote.notional_usd > MAX_NOTIONAL_USD:

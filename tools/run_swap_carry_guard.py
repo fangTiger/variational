@@ -23,7 +23,9 @@ import time  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal, ROUND_CEILING  # noqa: E402
-from pathlib import Path  # noqa: E402
+from pathlib import Path
+
+from infra.data_paths import data_dir  # noqa: E402
 from typing import Any, Mapping, Sequence  # noqa: E402
 
 from adapters.base import Position, Side  # noqa: E402
@@ -41,14 +43,18 @@ from engine.swap_trading_schedule import (  # noqa: E402
 )
 from tools.alert_check import notify  # noqa: E402
 from tools import hedge_swap_carry as execution  # noqa: E402
+from tools.swap_carry_rehearsal import (  # noqa: E402
+    perform_rehearsal as _perform_rehearsal,
+    rehearsal_window,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KILL_SWITCH = execution.SWAP_CARRY_KILL_SWITCH
 DEFAULT_HEARTBEAT = execution.SWAP_CARRY_GUARD_HEARTBEAT
 DEFAULT_STATE = execution.SWAP_CARRY_GUARD_STATE
-DEFAULT_AUDIT_LOG = PROJECT_ROOT / "data" / "swap_carry_guard_audit.jsonl"
-DEFAULT_SWITCH_HISTORY = PROJECT_ROOT / "data" / "swap_carry_switch_history.jsonl"
+DEFAULT_AUDIT_LOG = data_dir() / "swap_carry_guard_audit.jsonl"
+DEFAULT_SWITCH_HISTORY = data_dir() / "swap_carry_switch_history.jsonl"
 
 TARGET_LIQUIDATION_DISTANCE = Decimal("0.08")
 MAX_ALLOCATION_USD = Decimal("600")
@@ -66,6 +72,9 @@ MIN_ENTRY_CARRY_ANNUAL = Decimal("0.05")
 MIN_TIME_TO_CLOSE = timedelta(hours=2)
 MAX_DAILY_OPEN_ATTEMPTS = 20
 SWITCH_LEAD_TIME = timedelta(minutes=60)
+REHEARSAL_LEAD = timedelta(minutes=30)
+REHEARSAL_TIMEOUT_SECONDS = 20
+REHEARSAL_SLIPPAGE_WARNING_BP = Decimal("20")
 EXIT_CARRY_ANNUAL = Decimal("0")
 EXIT_CARRY_CONSECUTIVE_ROUNDS = 3
 SESSION_WARNING_THRESHOLD = timedelta(hours=24)
@@ -1952,18 +1961,26 @@ async def run_once(
     auto_switch: bool = True,
     auto_open_notional: Decimal = AUTO_OPEN_NOTIONAL_USD,
     switch_lead_time: timedelta = SWITCH_LEAD_TIME,
+    rehearsal_lead: timedelta = REHEARSAL_LEAD,
     now: datetime | None = None,
-    kill_switch_path: Path = DEFAULT_KILL_SWITCH,
-    heartbeat_path: Path = DEFAULT_HEARTBEAT,
-    state_path: Path = DEFAULT_STATE,
-    audit_path: Path = DEFAULT_AUDIT_LOG,
-    switch_history_path: Path = DEFAULT_SWITCH_HISTORY,
+    kill_switch_path: Path | None = None,
+    heartbeat_path: Path | None = None,
+    state_path: Path | None = None,
+    audit_path: Path | None = None,
+    switch_history_path: Path | None = None,
 ) -> int:
     """先执行全部平仓风控，再按长休市边界原子切换结构。"""
+    kill_switch_path = DEFAULT_KILL_SWITCH if kill_switch_path is None else Path(kill_switch_path)
+    heartbeat_path = DEFAULT_HEARTBEAT if heartbeat_path is None else Path(heartbeat_path)
+    state_path = DEFAULT_STATE if state_path is None else Path(state_path)
+    audit_path = DEFAULT_AUDIT_LOG if audit_path is None else Path(audit_path)
+    switch_history_path = DEFAULT_SWITCH_HISTORY if switch_history_path is None else Path(switch_history_path)
     configured_structure = execution.resolve_structure(structure)
     selected = configured_structure
     if switch_lead_time < timedelta(0):
         raise ValueError("switch_lead_time 不得为负数")
+    if rehearsal_lead < timedelta(0):
+        raise ValueError("rehearsal_lead 不得为负数")
     observed_at = now or datetime.now(timezone.utc)
     if observed_at.tzinfo is None:
         raise ValueError("now 必须包含时区")
@@ -1986,6 +2003,19 @@ async def run_once(
         state_path, observed_at
     )
     switch_incident = _read_switch_incident(state_path)
+    try:
+        saved_rehearsals = json.loads(state_path.read_text(encoding="utf-8"))
+        rehearsal_windows = dict(saved_rehearsals.get("rehearsal_windows", {}))
+        last_rehearsal = saved_rehearsals.get("last_rehearsal")
+    except FileNotFoundError:
+        rehearsal_windows, last_rehearsal = {}, None
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        rehearsal_windows = {}
+        last_rehearsal = {
+            "conclusion": "blocked", "blocking_reasons": [f"预演状态读取失败：{exc}"],
+            "timestamp": observed_at.isoformat(),
+        }
+    rehearsal_blocked = bool(last_rehearsal and last_rehearsal.get("conclusion") == "blocked")
     exit_carry_rounds = _read_exit_carry_rounds(state_path)
     last_session_expiry_alert_at = _warn_session_expiry(
         session_expiry,
@@ -2045,7 +2075,7 @@ async def run_once(
         )
         _write_json(
             state_path,
-            _state_payload(
+            {**_state_payload(
                 observed_at=observed_at,
                 status=effective_status,
                 message=message,
@@ -2056,7 +2086,9 @@ async def run_once(
                 switch_incident=switch_incident,
                 exit_carry_consecutive_rounds=exit_carry_rounds,
                 last_session_expiry_alert_at=last_session_expiry_alert_at,
-            ),
+            ), "last_rehearsal": last_rehearsal,
+                "rehearsal_windows": rehearsal_windows,
+                "rehearsal_blocked": rehearsal_blocked},
         )
 
     async def finalize_switch_failure(error: BaseException) -> None:
@@ -2455,6 +2487,98 @@ async def run_once(
                 },
             )
 
+        # 所有持仓风控检查之后才预演；blocked 不得写入平仓 reason。
+        if reason is None and auto_switch and not dry_run:
+            window = None
+            try:
+                rehearsal_source = current_structure
+                # 风控平仓后仍保留窗口禁入；下一次相反方向窗口可以重新预演。
+                if rehearsal_source is None and rehearsal_blocked and last_rehearsal:
+                    previous_target = last_rehearsal.get("direction", {}).get("to")
+                    if previous_target in execution.STRUCTURES:
+                        rehearsal_source = execution.resolve_structure(previous_target)
+                if rehearsal_source is not None:
+                    window = rehearsal_window(
+                        rehearsal_source, schedule, metadata, observed_at,
+                        switch_lead_time, rehearsal_lead,
+                    )
+                if window is not None:
+                    window_id = window["window_id"]
+                    if window_id in rehearsal_windows:
+                        last_rehearsal = rehearsal_windows[window_id]
+                    else:
+                        report = {
+                            "schema_version": 1, "kind": "rehearsal", **window,
+                            "timestamp": observed_at.isoformat(),
+                            "started_at": observed_at.isoformat(),
+                            "conclusion": "blocked",
+                            "blocking_reasons": ["预演中断或尚未完成"], "warnings": [],
+                        }
+                        # 先原子占用窗口；进程中断后同窗口保持阻断，不重复询价。
+                        last_rehearsal = dict(report)
+                        rehearsal_windows[window_id] = last_rehearsal
+                        rehearsal_blocked = True
+                        persist_state("rehearsal_blocked", "预演尚未完成", consecutive_failures)
+                        report["blocking_reasons"] = []
+                        try:
+                            await asyncio.wait_for(
+                                _perform_rehearsal(
+                                    var, report=report, source=rehearsal_source,
+                                    metadata=metadata, positions_payload=account_positions_payload,
+                                    now=observed_at, notional=auto_open_notional,
+                                    history_path=switch_history_path,
+                                    slippage_warning_bp=REHEARSAL_SLIPPAGE_WARNING_BP,
+                                ), timeout=REHEARSAL_TIMEOUT_SECONDS,
+                            )
+                        except (Exception, SystemExit) as exc:
+                            report["conclusion"] = "blocked"
+                            report["blocking_reasons"].append(
+                                f"预演异常：{type(exc).__name__}: {exc}")
+                        report["level"] = {
+                            "ready": "info", "warning": "warning", "blocked": "critical",
+                        }[report["conclusion"]]
+                        _append_audit(switch_history_path, report)
+                        _append_audit(audit_path, {**report, "event": "switch_rehearsal"})
+                        last_rehearsal = {
+                            key: report[key] for key in (
+                                "timestamp", "window_id", "planned_at", "direction",
+                                "conclusion", "blocking_reasons", "warnings",
+                            )
+                        }
+                        rehearsal_windows[window_id] = last_rehearsal
+                        rehearsal_blocked = report["conclusion"] == "blocked"
+                        persist_state("rehearsal_blocked" if rehearsal_blocked else "healthy",
+                                      f"预演 {report['conclusion']}", consecutive_failures)
+                        logging.getLogger(__name__).log(
+                            {"info": logging.INFO, "warning": logging.WARNING,
+                             "critical": logging.CRITICAL}[report["level"]],
+                            "结构切换预演 %s：%s", report["conclusion"],
+                            report["blocking_reasons"] or report["warnings"] or "全部检查通过",
+                        )
+                        if rehearsal_blocked:
+                            try:
+                                notify("Swap carry 预演阻断", "；".join(report["blocking_reasons"]))
+                            except Exception:
+                                logging.getLogger(__name__).exception("预演阻断通知发送失败")
+            except Exception as exc:
+                # 包括预演落盘异常；不得跳过后面的关市平仓分支。
+                last_rehearsal = {
+                    **(window or {}), "timestamp": observed_at.isoformat(),
+                    "conclusion": "blocked", "blocking_reasons": [f"预演流程异常：{exc}"],
+                }
+                rehearsal_blocked = True
+                if window:
+                    rehearsal_windows[window["window_id"]] = last_rehearsal
+                logging.getLogger(__name__).critical("预演流程异常，禁止切换：%s", exc)
+                try:
+                    _append_audit(switch_history_path, {
+                        **last_rehearsal, "kind": "rehearsal", "level": "critical",
+                    })
+                    notify("Swap carry 预演阻断", str(exc))
+                except Exception:
+                    logging.getLogger(__name__).exception("预演异常记录或通知失败")
+            rehearsal_blocked = bool(last_rehearsal and last_rehearsal.get("conclusion") == "blocked")
+
         if (
             reason is None
             and not all_flat
@@ -2463,23 +2587,29 @@ async def run_once(
             and target_structure is not None
             and current_structure.name != target_structure.name
         ):
-            switch_ready, auto_switch_conclusion = await _switch_readiness(
-                var,
-                target=target_structure,
-                funding_availability=target_funding_availability,
-                funding_rate_overrides=target_funding_overrides,
-                schedule=schedule,
-                schedule_error=schedule_error,
-                market_status=market_status,
-                auto_open=auto_open,
-                auto_open_notional=auto_open_notional,
-                daily_attempts=daily_open_attempts,
-                incident=auto_open_incident or switch_incident,
-            )
+            if rehearsal_blocked:
+                switch_ready = False
+                auto_switch_conclusion = "本窗口预演 blocked，禁止真实切换：" + "；".join(
+                    last_rehearsal.get("blocking_reasons", []))
+            else:
+                switch_ready, auto_switch_conclusion = await _switch_readiness(
+                    var,
+                    target=target_structure,
+                    funding_availability=target_funding_availability,
+                    funding_rate_overrides=target_funding_overrides,
+                    schedule=schedule,
+                    schedule_error=schedule_error,
+                    market_status=market_status,
+                    auto_open=auto_open,
+                    auto_open_notional=auto_open_notional,
+                    daily_attempts=daily_open_attempts,
+                    incident=auto_open_incident or switch_incident,
+                )
             _append_audit(
                 audit_path,
                 {
                     "timestamp": observed_at,
+                    "rehearsal": last_rehearsal,
                     "event": "auto_switch_ready" if switch_ready else "auto_switch_deferred",
                     "current_structure": current_structure.name,
                     "target_structure": target_structure.name,
@@ -2529,6 +2659,8 @@ async def run_once(
                 "schema_version": 1,
                 "started_at": observed_at.isoformat(),
                 "status": "in_progress",
+                "kind": "switch",
+                "rehearsal": last_rehearsal,
                 "direction": {
                     "from": current_structure.name,
                     "to": target_structure.name,
@@ -2832,7 +2964,12 @@ async def run_once(
                 )
         elif reason is None and all_flat:
             exit_carry_rounds = 0
-            if switch_incident and not auto_open_incident:
+            if rehearsal_blocked:
+                open_result = AutoOpenResult(
+                    False, "本窗口预演 blocked，禁止平仓后绕过阻断重新开仓",
+                    daily_open_attempts, status="rehearsal_blocked",
+                )
+            elif switch_incident and not auto_open_incident:
                 open_result = AutoOpenResult(
                     False,
                     "自动开仓已因既有 switch_incident 停止，"
@@ -3085,6 +3222,8 @@ async def run_once(
             "daily_open_attempts": daily_open_attempts,
             "auto_open_incident": auto_open_incident,
             "switch_incident": switch_incident,
+            "last_rehearsal": last_rehearsal,
+            "rehearsal_blocked": rehearsal_blocked,
             "auto_switch": auto_switch,
             "auto_switch_attempted": auto_switch_attempted,
             "auto_switch_conclusion": auto_switch_conclusion,
@@ -3122,10 +3261,12 @@ async def _main(args: argparse.Namespace) -> int:
             auto_switch=args.auto_switch,
             auto_open_notional=args.auto_open_notional,
             switch_lead_time=timedelta(minutes=float(args.switch_lead_minutes)),
+            rehearsal_lead=timedelta(minutes=float(args.rehearsal_lead_minutes)),
             kill_switch_path=args.kill_switch,
             heartbeat_path=args.heartbeat,
             state_path=args.state,
             audit_path=args.audit_log,
+            switch_history_path=args.switch_history,
         )
     finally:
         await var.close()
@@ -3168,6 +3309,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="距 XAUS 长休市多少分钟开始切换；默认 60，可由 SWITCH_LEAD_TIME 覆盖",
     )
     parser.add_argument(
+        "--rehearsal-lead-minutes", type=Decimal,
+        default=os.environ.get("REHEARSAL_LEAD", "30"),
+        help="提前多少分钟预演计划切换，默认 30，可由 REHEARSAL_LEAD 覆盖",
+    )
+    parser.add_argument(
         "--auto-open-notional",
         type=Decimal,
         default=os.environ.get(
@@ -3183,6 +3329,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--heartbeat", type=Path, default=DEFAULT_HEARTBEAT)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--audit-log", type=Path, default=DEFAULT_AUDIT_LOG)
+    parser.add_argument("--switch-history", type=Path, default=DEFAULT_SWITCH_HISTORY,
+                        help="切换与预演共用台账路径")
     return parser
 
 

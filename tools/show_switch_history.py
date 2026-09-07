@@ -123,6 +123,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("--last 必须是正整数")
         return 2
     records, error = load_switch_history(args.path)
+    records = [record for record in records if record.get("kind") != "rehearsal"]
     if error is not None:
         print(f"切换台账不可用（文件损坏）：{error}")
         return 0

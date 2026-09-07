@@ -29,12 +29,14 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from infra.data_paths import data_dir
+
 _ROOT = Path(__file__).resolve().parent.parent
-_LIVE = _ROOT / "data" / "grid_live.json"
-_MONITOR = _ROOT / "data" / "grid_monitor.jsonl"
-_HEDGE_MONITOR = _ROOT / "data" / "lighter_hedge.jsonl"
-_MM_MONITOR = _ROOT / "data" / "lighter_mm.jsonl"
-_ALERT_STATE = _ROOT / "data" / "alert_state.json"
+_LIVE = data_dir() / "grid_live.json"
+_MONITOR = data_dir() / "grid_monitor.jsonl"
+_HEDGE_MONITOR = data_dir() / "lighter_hedge.jsonl"
+_MM_MONITOR = data_dir() / "lighter_mm.jsonl"
+_ALERT_STATE = data_dir() / "alert_state.json"
 
 # 同一条告警的静默期：避免每轮调度都弹同样的通知把人训练成无视通知
 _COOLDOWN_S = 6 * 3600
@@ -631,11 +633,12 @@ def _load_cooldown() -> dict:
     return state if isinstance(state, dict) else {}
 
 
-def _save_cooldown(state: dict) -> None:
-    _ALERT_STATE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _ALERT_STATE.with_suffix(".tmp")
+def _save_cooldown(state: dict, *, path: Path | None = None) -> None:
+    path = _ALERT_STATE if path is None else Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(_ALERT_STATE)
+    tmp.replace(path)
 
 
 def notify(title: str, body: str) -> bool:
