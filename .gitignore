@@ -1,5 +1,5 @@
 # 侦察抓取的前端打包代码（体积大、随前端更新变化，可用 fetch_bundle.py 复现）
-tools/recon/captured/
+tools/recon/captured*/
 
 # Python
 __pycache__/
