@@ -11,6 +11,10 @@ from infra.runtime import ensure_ssl_cert
 
 ensure_ssl_cert()
 
+import fcntl  # noqa: E402
+import logging  # noqa: E402
+from functools import wraps  # noqa: E402
+from engine.isolated_allocation import required_allocation  # noqa: E402
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
 import json  # noqa: E402
@@ -18,12 +22,13 @@ import os  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
-from decimal import Decimal  # noqa: E402
+from decimal import Decimal, ROUND_CEILING  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Any, Mapping, Sequence  # noqa: E402
 
 from adapters.base import Position, Side  # noqa: E402
 from adapters.variational_client import (  # noqa: E402
+    READ_ONLY_HTTP,
     SessionExpiry,
     VariationalAuthError,
     VariationalJurisdictionError,
@@ -44,6 +49,10 @@ DEFAULT_HEARTBEAT = execution.SWAP_CARRY_GUARD_HEARTBEAT
 DEFAULT_STATE = execution.SWAP_CARRY_GUARD_STATE
 DEFAULT_AUDIT_LOG = PROJECT_ROOT / "data" / "swap_carry_guard_audit.jsonl"
 DEFAULT_SWITCH_HISTORY = PROJECT_ROOT / "data" / "swap_carry_switch_history.jsonl"
+
+TARGET_LIQUIDATION_DISTANCE = Decimal("0.08")
+MAX_ALLOCATION_USD = Decimal("600")
+MAX_DAILY_ALLOCATION_ATTEMPTS = 10
 
 IMBALANCE_RATIO = Decimal("0.05")
 LIQUIDATION_ALERT_RATIO = Decimal("0.015")
@@ -1748,6 +1757,192 @@ async def _flatten(
     return FlattenResult(True, False, "平仓动作已完成" if not dry_run else "已列出平仓动作")
 
 
+def _dry_run_http_guard(function):
+    """在整个守护轮次阻止真实客户端的所有非 GET 请求，包括询价回退。"""
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        token = READ_ONLY_HTTP.set(READ_ONLY_HTTP.get() or kwargs.get("dry_run", False))
+        try:
+            return await function(*args, **kwargs)
+        finally:
+            READ_ONLY_HTTP.reset(token)
+    return wrapped
+
+
+async def _available_account_margin(var: Any) -> Decimal:
+    """按真实接口字段计算全账户可用保证金。
+
+    /portfolio 无 available_margin，必须自算：权益为 balance + upnl；
+    已占用为 /positions 每条持仓顶层 initial_margin 之和。
+    必须遍历全部持仓，包括结构外的 BTC 和隔离腿；隔离桶同样占用账户资金。
+    """
+    def read_field(record: object, field: str, source: str) -> Decimal:
+        """缺失和非法数值均报告具体接口字段，禁止默认按零处理。"""
+        label = f"{source}.{field}"
+        if not isinstance(record, Mapping) or field not in record:
+            raise ValueError(f"缺少字段 {label}")
+        return execution._decimal(record[field], label=label)
+
+    portfolio = await var.raw("/portfolio")
+    equity = read_field(portfolio, "balance", "/portfolio") + read_field(
+        portfolio, "upnl", "/portfolio"
+    )
+    occupied = Decimal("0")
+    for index, position in enumerate(_position_items(await var.get_positions())):
+        source = f"/positions[{index}]"
+        initial_margin = read_field(position, "initial_margin", source)
+        if initial_margin < 0:
+            raise ValueError(f"{source}.initial_margin 不得为负")
+        occupied += initial_margin
+    return equity - occupied
+
+
+async def _maintain_isolated_allocation(
+    var: Any, *, underlying: str, mode: MarginModeStatus, dry_run: bool,
+    observed_at: datetime, ledger_path: Path, audit_path: Path,
+) -> dict[str, object]:
+    """单腿最多发送一次目标总额请求；计数先落盘，异常不越过本分支。"""
+    result: dict[str, object] = {"underlying": underlying, "level": "info", "attempted": False}
+    lock = None
+    try:
+        if not mode.isolated:
+            result["message"] = "全仓腿无独立保证金桶，由账户级保证金率兜底"
+            return result
+        if mode.source == "保守默认":
+            result.update(level="warning", message=(
+                "保证金模式未经确认：supported_assets.isolated_only 与报价 "
+                "margin_requirements.margin_mode 均未提供有效模式证据，保守拒绝补仓"
+            ))
+            return result
+        target_distance = execution._decimal(
+            os.environ.get("TARGET_LIQUIDATION_DISTANCE", str(TARGET_LIQUIDATION_DISTANCE)),
+            label="目标强平距离", positive=True,
+        )
+        # 环境只能收紧金额与次数硬上限，不允许提高。
+        cap = min(MAX_ALLOCATION_USD, execution._decimal(
+            os.environ.get("MAX_ALLOCATION_USD", str(MAX_ALLOCATION_USD)),
+            label="目标桶上限", positive=True,
+        ))
+        limit = min(MAX_DAILY_ALLOCATION_ATTEMPTS, int(os.environ.get(
+            "MAX_DAILY_ALLOCATION_ATTEMPTS", str(MAX_DAILY_ALLOCATION_ATTEMPTS))))
+        if limit < 0:
+            raise ValueError("每日补仓次数不得为负")
+        # 锁覆盖读仓、余额检查、计数和回读，避免重叠轮次重复补同一账户。
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = ledger_path.with_suffix(ledger_path.suffix + ".lock").open("a")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        today = observed_at.date().isoformat()
+        attempts = 0
+        if ledger_path.exists():
+            saved = json.loads(ledger_path.read_text(encoding="utf-8"))
+            saved_date = datetime.strptime(saved["date"], "%Y-%m-%d").date()
+            saved_attempts = saved["attempts"]
+            if type(saved_attempts) is not int or saved_attempts < 0 or saved_date > observed_at.date():
+                raise ValueError("补仓计数台账损坏，禁止写接口")
+            if saved_date == observed_at.date():
+                attempts = saved_attempts
+        result["daily_attempts"] = attempts
+        current = await var.get_isolated_allocation(underlying)
+        target = required_allocation(current["notional"], current["maintenance_margin"], target_distance)
+        # 向上取整到美分，避免截断导致目标距离略低于阈值。
+        target = target.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        initial = execution._decimal(current["initial_margin"], label="当前桶")
+        distance = execution._decimal(current["distance"], label="当前强平距离")
+        if initial < 0:
+            raise ValueError("当前桶不得为负")
+        result.update(current_allocation=initial, target_allocation=target,
+                      distance=distance, target_distance=target_distance,
+                      before_allocation=initial, before_distance=distance)
+        if distance >= target_distance:
+            result["message"] = "强平距离已达标，无需补仓"
+        elif target > cap:
+            result.update(level="warning", message="目标桶超过 MAX_ALLOCATION_USD，拒绝补仓，保留平仓风控兜底")
+        elif target <= initial:
+            result.update(level="warning", message="公式目标不高于当前桶，禁止减保证金，等待下一轮风控")
+        elif attempts >= limit:
+            result.update(level="warning", message="当日补仓次数已达上限")
+        else:
+            available = await _available_account_margin(var)
+            result["available_margin"] = available
+            result["additional_allocation"] = target - initial
+            if available < target - initial:
+                result.update(level="warning", message="账户可用保证金不足，拒绝补仓")
+            elif dry_run:
+                result["message"] = "dry-run：仅计算目标桶，不发送 POST"
+            else:
+                # 请求失败、超时以及进程中断均消耗次数，禁止自动重试写请求。
+                _write_json(ledger_path, {"date": today, "attempts": attempts + 1})
+                result.update(attempted=True, daily_attempts=attempts + 1)
+                _append_audit(audit_path, {"timestamp": observed_at, "event": "allocation_attempt", **result})
+                result["post_succeeded"] = False
+                await var.set_isolated_allocation(underlying, target)
+                result["post_succeeded"] = True
+                # 目标总额幂等；本轮只 POST 一次，沿用成交确认的最终一致轮询。
+                for attempt in range(1, execution._FLAT_TRIES + 1):
+                    result["readback_attempts"] = attempt
+                    try:
+                        # 客户端每次调用均重新 GET /positions，无本地仓位缓存。
+                        updated = await var.get_isolated_allocation(underlying)
+                        new_distance = execution._decimal(updated["distance"], label="补仓后强平距离")
+                        new_allocation = execution._decimal(updated["initial_margin"], label="补仓后桶")
+                        result.update(distance=new_distance, current_allocation=new_allocation,
+                                      after_distance=new_distance, after_allocation=new_allocation)
+                        result.pop("readback_error", None)
+                        if new_distance >= target_distance:
+                            result["message"] = "POST 成功，补仓后回读确认强平距离达标"
+                            break
+                    except Exception as exc:  # noqa: BLE001 暂时读仓失败也允许有限重读
+                        result["readback_error"] = f"{type(exc).__name__}: {exc}"
+                    if attempt < execution._FLAT_TRIES:
+                        await asyncio.sleep(execution._POLL_DELAY_S)
+                else:
+                    result.update(level="critical", message=(
+                        "POST 成功但回读未达标，本轮不再重复 POST"
+                        if "readback_error" not in result else
+                        f"POST 成功但回读校验失败，本轮不再重复 POST：{result['readback_error']}"
+                    ))
+    except Exception as exc:  # noqa: BLE001 补仓失败不得阻断平仓风控
+        if result.get("post_succeeded"):
+            prefix = "POST 成功但回读校验失败，本轮不再重复 POST"
+        elif result.get("post_succeeded") is False:
+            prefix = "POST 失败（含超时结果未知），补仓已停止，本轮不重试"
+        else:
+            prefix = "补仓已停止，本轮不重试"
+        result.update(level="critical" if result["attempted"] else "warning",
+                      message=f"{prefix}：{type(exc).__name__}: {exc}")
+    finally:
+        if lock is not None:
+            lock.close()
+        message = str(result.get("message", "补仓未执行"))
+        detail = ""
+        if "target_allocation" in result:
+            detail = (
+                f"；当前桶 ${result['current_allocation']} / 目标桶 ${result['target_allocation']}"
+                f" / 距离 {result['distance']:.2%}"
+            )
+        if "after_allocation" in result:
+            detail += (
+                f"；补仓前后桶 ${result['before_allocation']} → ${result['after_allocation']}"
+                f" / 距离 {result['before_distance']:.2%} → {result['after_distance']:.2%}"
+            )
+        print(f"{underlying} 保证金：{message}{detail}")
+        logging.getLogger(__name__).log(
+            {"info": logging.INFO, "warning": logging.WARNING, "critical": logging.CRITICAL}[str(result["level"])],
+            "%s 保证金：%s%s", underlying, message, detail,
+        )
+        try:
+            _append_audit(audit_path, {"timestamp": observed_at, "event": "allocation_result", **result})
+        except OSError:
+            logging.getLogger(__name__).critical("保证金审计日志写入失败", exc_info=True)
+        if result["level"] == "critical":
+            try:
+                notify(f"{underlying} 保证金补仓告警", message + detail)
+            except Exception:  # noqa: BLE001 通知失败不得阻断平仓风控
+                logging.getLogger(__name__).exception("保证金补仓通知失败")
+    return result
+
+
+@_dry_run_http_guard
 async def run_once(
     var: Any,
     *,
@@ -1829,6 +2024,7 @@ async def run_once(
     exit_carry_observation = "本轮未评估退出 carry"
     margin_modes: dict[str, MarginModeStatus] = {}
     per_leg_liquidation: dict[str, dict[str, object]] = {}
+    allocation_results: dict[str, dict[str, object]] = {}
     account_margin: AccountMarginHealth | None = None
     account_margin_error: str | None = None
     quote_cache: dict[
@@ -2297,6 +2493,31 @@ async def run_once(
                 f"XAUS 长休市 {schedule.closure_duration} 将在 "
                 f"{schedule.time_until_close} 后开始，目标结构暂不可开"
             )
+
+        # 所有平仓原因确定后才补桶；临近强制长休市退出时不延后平仓或切换。
+        if reason is None and not all_flat and not long_close_due:
+            for leg in selected.legs:
+                if positions[leg.underlying].is_flat:
+                    continue
+                mode = margin_modes.get(leg.underlying)
+                if mode is None or not mode.isolated:
+                    continue
+                allocation_results[leg.underlying] = await _maintain_isolated_allocation(
+                    var, underlying=leg.underlying, mode=mode, dry_run=dry_run,
+                    observed_at=observed_at,
+                    ledger_path=state_path.with_suffix(state_path.suffix + ".allocation.json"),
+                    audit_path=audit_path,
+                )
+                allocation = allocation_results[leg.underlying]
+                if allocation.get("attempted"):
+                    # 补仓改变了余额快照；本轮不复用补仓前的切换准入结果。
+                    switch_ready = False
+                    auto_switch_conclusion = "本轮已尝试补保证金，下一轮重新检查切换条件"
+                if allocation.get("distance") is not None:
+                    per_leg_liquidation[leg.underlying] = _per_leg_liquidation_payload(
+                        mode=mode, status=str(allocation.get("message")),
+                        distance=allocation["distance"],
+                    )
 
         if reason is None and switch_ready:
             assert current_structure is not None
@@ -2813,6 +3034,7 @@ async def run_once(
             "timestamp": observed_at.isoformat(),
             "structure": selected.name,
             "conclusion": conclusion,
+            "isolated_allocation": allocation_results,
             "legs": {
                 leg.underlying: {
                     "size": str(positions[leg.underlying].signed_size)
@@ -2921,7 +3143,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=execution.DEFAULT_STRUCTURE.name,
         help=f"carry 结构，默认 {execution.DEFAULT_STRUCTURE.name}",
     )
-    parser.add_argument("--dry-run", action="store_true", help="判定并询价，但不 accept")
+    parser.add_argument("--dry-run", action="store_true", help="只读判定与计算，禁止全部 POST（含询价）")
     parser.add_argument(
         "--no-auto-open",
         dest="auto_open",

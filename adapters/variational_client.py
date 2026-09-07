@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 import base64
 import json
 import logging
@@ -195,6 +197,10 @@ class Session:
         )
 
 
+# 任务局部只读开关覆盖内部询价回退，避免 dry-run 隐式发送 POST。
+READ_ONLY_HTTP = ContextVar("variational_read_only_http", default=False)
+
+
 class VariationalClient(ExchangeAdapter):
     """基于捕获会话 Cookie 的 Omni 私有 API 客户端（异步）。"""
 
@@ -242,6 +248,8 @@ class VariationalClient(ExchangeAdapter):
     # ---- 底层请求器（对应前端 Gi/Ki/Lt，走 curl_cffi Chrome 指纹）----
 
     async def _request(self, method: str, path: str, body: dict | None = None) -> Any:
+        if READ_ONLY_HTTP.get() and method.upper() != "GET":
+            raise ValueError(f"dry-run 禁止发送 {method} {path}")
         resp = await self._http.request(method, BASE_URL + path, json=body)
         headers = resp.headers
         # 注意：x-omni-auth: r 是正常已认证响应上的头（前端用它重置重试计数），不是失效信号。
@@ -283,6 +291,89 @@ class VariationalClient(ExchangeAdapter):
     async def get_positions(self) -> Any:
         """全部持仓（原始结构）。"""
         return await self._get("/positions")
+
+    async def get_isolated_allocation(self, underlying: str) -> dict[str, Decimal]:
+        """只从 /positions 读取桶及方向相关强平距离。
+
+        initial_margin 表示当前桶；target_allocation 是目标总额非增量。
+        缺失、重复或无效仓位必须拒绝，绝不询价或用入场价代替现价。
+        """
+        payload = await self.get_positions()
+        items = payload if isinstance(payload, list) else payload["positions"]
+        matches = [p for p in items if self._position_matches_underlying(
+            p.get("position_info", p), underlying, exact=True
+        )]
+        if len(matches) != 1:
+            raise ValueError(f"{underlying} 持仓缺失或重复")
+        position = matches[0]
+        info = position.get("position_info", position)
+        price_info = position.get("price_info") or {}
+
+        def read(name: str) -> Decimal:
+            """只接受持仓响应中的明确有限数值。"""
+            for source in (position, info, price_info):
+                if source.get(name) is not None:
+                    return _finite_decimal(source[name], label=name)
+            raise ValueError(f"{underlying} 持仓缺少 {name}")
+
+        qty = _finite_decimal(info.get("qty", info.get("size")), label="持仓数量")
+        mark = (_finite_decimal(price_info["underlying_price"], label="现价")
+                if price_info.get("underlying_price") is not None else read("mark_price"))
+        initial = read("initial_margin")
+        maintenance = read("maintenance_margin")
+        liquidation = read("estimated_liquidation_price")
+        notional = abs(qty) * mark
+        if qty == 0 or mark <= 0 or initial < 0 or not 0 <= maintenance < notional or liquidation <= 0:
+            raise ValueError(f"{underlying} 保证金或价格字段无效")
+        return {
+            "initial_margin": initial, "maintenance_margin": maintenance,
+            "estimated_liquidation_price": liquidation, "mark_price": mark,
+            "notional": notional,
+            "distance": (mark - liquidation) / mark if qty > 0 else (liquidation - mark) / mark,
+        }
+
+    async def _allocation_instrument(self, underlying: str) -> dict:
+        """写接口要求权威合约元数据，缺失时禁止猜测合约类型。"""
+        resolved = await self._instrument_kind_from_metadata(underlying)
+        if resolved is None:
+            raise ValueError(f"{underlying} 缺少合约元数据，禁止保证金写操作")
+        instrument_type, kind = resolved
+        if instrument_type not in {"swap", "perpetual_future", "perpetual_rwa_future"}:
+            raise ValueError("未知合约类型，禁止保证金写操作")
+        if instrument_type == "perpetual_rwa_future" and not kind:
+            raise ValueError("RWA 合约缺少 kind")
+        return self._instrument(underlying.upper(), instrument_type=instrument_type, kind=kind)
+
+    async def set_isolated_allocation(self, underlying: str, target_allocation: Decimal) -> Any:
+        """设置隔离保证金：target_allocation 是目标总额非增量；不自动重试。"""
+        target = _finite_decimal(target_allocation, label="目标保证金总额")
+        if target <= 0:
+            raise ValueError("目标保证金总额必须大于零")
+        instrument = await self._allocation_instrument(underlying)
+        return await self._post("/sub_accounts/allocation", {
+            "instrument": instrument, "target_allocation": str(target),
+        })
+
+    async def isolate(self, underlying: str) -> Any:
+        """人工接口：将指定合约切换为隔离模式；守护进程不得调用。"""
+        return await self._post("/sub_accounts/isolate", {
+            "instrument": await self._allocation_instrument(underlying),
+        })
+
+    async def deisolate(self, underlying: str) -> Any:
+        """人工接口：解除指定合约隔离；守护进程不得调用。"""
+        return await self._post("/sub_accounts/deisolate", {
+            "instrument": await self._allocation_instrument(underlying),
+        })
+
+    async def set_leverage(self, leverage: Decimal, asset: str) -> Any:
+        """人工接口：设置结算池杠杆；守护进程不得调用。"""
+        value = _finite_decimal(leverage, label="杠杆")
+        if value <= 0 or not isinstance(asset, str) or not asset.strip():
+            raise ValueError("杠杆必须为正且 asset 不得为空")
+        return await self._post("/settlement_pools/set_leverage", {
+            "leverage": str(value), "asset": asset,
+        })
 
     async def get_balance(self) -> VariationalBalance:
         """从 portfolio 返回余额、未实现盈亏与两者之和。"""

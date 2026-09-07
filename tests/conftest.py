@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import socket
 import tempfile
+
+import pytest
 from pathlib import Path
 
 import infra.logger as logger_config
@@ -17,3 +20,19 @@ import infra.logger as logger_config
 # 顶层拿不到 tmp_path，因此用 mkdtemp 为本次 pytest 进程保留独立日志证据。
 _TEST_LOG_DIR = Path(tempfile.mkdtemp(prefix="variational-test-logs-"))
 logger_config._LOG_DIR = _TEST_LOG_DIR
+
+
+@pytest.fixture(autouse=True)
+def _block_real_network(monkeypatch):
+    """所有测试禁止真实网络；保留显式假传输及本地事件循环套接字。"""
+    def blocked(*args, **kwargs):
+        raise AssertionError("离线测试禁止真实网络请求")
+
+    monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
+    # libcurl 绕过 Python socket，必须单独封锁其真实传输入口。
+    from curl_cffi import Curl, AsyncCurl
+    monkeypatch.setattr(Curl, "perform", blocked)
+    monkeypatch.setattr(AsyncCurl, "add_handle", blocked)

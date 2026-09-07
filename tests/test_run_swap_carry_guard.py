@@ -196,6 +196,7 @@ def _position_payload(
         },
         "price_info": {"underlying_price": str(mark_price)},
         "upnl": "0",
+        "initial_margin": str(abs(qty) * mark_price * Decimal("0.1")),
     }
 
 
@@ -2469,3 +2470,43 @@ def test_non_target_negative_carry_closes_before_switch_on_third_round(tmp_path)
             assert _accepted_markets(client) == [
                 ("XAU", "sell", True), ("XAUT", "buy", True)]
             assert all(size == 0 for size in client.sizes.values())
+
+
+@pytest.mark.parametrize('trigger', ['liquidation', 'kill', 'carry', 'none'])
+def test_allocation_runs_only_after_all_close_checks(tmp_path, monkeypatch, trigger):
+    """用真实单轮编排证明平仓优先，以及成功补仓进入审计和心跳。"""
+    from unittest.mock import AsyncMock
+    from tools import run_swap_carry_guard as guard
+    client = _healthy_client(accept_script=[{},{}])
+    client.get_isolated_allocation = AsyncMock(side_effect=[
+        {'initial_margin':Decimal('199.44'),'maintenance_margin':Decimal('99.72'),
+         'notional':Decimal('1994.36'),'distance':Decimal('.05')},
+        {'initial_margin':Decimal('251.30'),'distance':Decimal('.081')},
+    ])
+    client.set_isolated_allocation = AsyncMock(return_value={})
+    client.raw = AsyncMock(return_value={'balance':'1000', 'upnl':'0'})
+    assert 'available_margin' not in client.raw.return_value
+    monkeypatch.setattr(guard,'notify',lambda *_args: True)
+    if trigger == 'liquidation':
+        client.liquidation_info = {'XAUS':(Decimal('4000'),Decimal('3960'))}
+    elif trigger == 'kill':
+        _paths(tmp_path)['kill_switch_path'].touch()
+    elif trigger == 'carry':
+        client.swap_rate = Decimal('-1')
+        client.perp_rate = Decimal('0')
+        _paths(tmp_path)['state_path'].write_text(json.dumps({'exit_carry_consecutive_rounds':2}))
+    assert _run(client,tmp_path,auto_switch=False,auto_open=False) == 0
+    if trigger != 'none':
+        client.get_isolated_allocation.assert_not_awaited()
+        client.set_isolated_allocation.assert_not_awaited()
+        assert len(client.accept_calls) == 2
+    else:
+        client.set_isolated_allocation.assert_awaited_once_with('XAUS',Decimal('251.30'))
+        heartbeat = json.loads(_paths(tmp_path)['heartbeat_path'].read_text())
+        assert heartbeat['isolated_allocation']['XAUS']['daily_attempts'] == 1
+        assert heartbeat['isolated_allocation']['XAUS']['distance'] == '0.081'
+        allocation = heartbeat['isolated_allocation']['XAUS']
+        assert allocation['before_allocation'] == '199.44'
+        assert allocation['before_distance'] == '0.05'
+        assert allocation['after_allocation'] == '251.30'
+        assert allocation['after_distance'] == '0.081'

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -365,6 +366,22 @@ def _next_switch_metric(schedule: Any | None) -> Metric:
     )
 
 
+async def _allocation_metric(client: Any, underlying: str) -> Metric:
+    """只读展示隔离腿当前桶、目标总额及强平距离，失败独立降级。"""
+    try:
+        allocation = await client.get_isolated_allocation(underlying)
+        target = guard.required_allocation(
+            allocation["notional"], allocation["maintenance_margin"],
+            Decimal(os.environ.get("TARGET_LIQUIDATION_DISTANCE", str(guard.TARGET_LIQUIDATION_DISTANCE))),
+        ).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        return Metric(
+            f"{underlying} 隔离保证金",
+            f"当前桶 ${allocation['initial_margin']:,.2f} / 目标桶 ${target:,.2f} / 距离 {allocation['distance']:.2%}",
+        )
+    except Exception:  # noqa: BLE001 保证金读数失败不阻断其他面板指标
+        return Metric(f"{underlying} 隔离保证金", "当前桶 / 目标桶 / 距离：无数据")
+
+
 async def _liquidation_metric(
     client: Any,
     *,
@@ -538,6 +555,17 @@ async def _collect(
             position=positions[leg.underlying],
         )
         liquidation_metrics.append(metric)
+        mode = guard._margin_mode_from_supported_assets(metadata, leg)
+        if mode is None:
+            # 面板不为识别模式新增 POST 询价，使用守护进程已确认的模式。
+            try:
+                saved = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+                mode_name = saved.get("legs", {}).get(leg.underlying, {}).get("margin_mode")
+                mode = guard.MarginModeStatus(str(mode_name), "守护心跳")
+            except (OSError, ValueError, AttributeError):
+                pass
+        if mode is not None and mode.isolated and not positions[leg.underlying].is_flat:
+            liquidation_metrics.append(await _allocation_metric(client, leg.underlying))
         if leg.underlying == "XAUS":
             xaus_distance = distance
     if xaus_distance is not None and xaus_distance < guard.LIQUIDATION_ALERT_RATIO:
