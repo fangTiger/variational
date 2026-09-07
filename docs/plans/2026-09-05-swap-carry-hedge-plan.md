@@ -280,3 +280,48 @@ isolated 桶 = 名义 5%，触发时余 MM 2.5%，`liquidation_penalty = 0.1`
 2. f_perp 收敛到 f_swap（5.72%）附近的地板
 3. 采样 30 天后，保守口径 R < 5%/年
 4. §6.2 证明周一追补 Sat/Sun 且 weekly_flat 下 R 转负，同时 hold_through 前置条件不满足
+
+### 2026-09-07：§6.2 自动对账证据收集
+
+守护每轮分页读取 `/transfers`，新 XAUS 结算写入
+`data/swap_carry_funding_recon.jsonl`，并进入心跳 `funding_reconciliation`
+和审计。可用 `--funding-recon`、`--funding-samples` 注入路径。
+只读查看：`.venv/bin/python tools/show_funding_recon.py --last 10`。
+
+流水采用真实字段 `reference_instrument`、`qty`、
+`ref_instrument_position_qty`。已抓取 schema 没有 `apply_time` 与结算价格：
+前者只从结算前且与 created_at 相差不超过 15 分钟的预测计提时间匹配；
+后者使用结算前两小时内采样的元数据标记价，旧采样可退回 RFQ 中价。
+来源、采样时间和估计属性全部保留；不以流水资金费率反推名义来循环证明。
+没有独立价格或对应预测时如实记录缺证据。对账记录中的日期均为 UTC，
+覆盖日期为推断；§6.2 仍须等待真实跨周末流水，不能把测试结论当实盘证据。
+
+比值和 bp 差按实际单次费率对预测年化绝对值 / 365 计算。
+周五/周一接近三天时另校验相对三倍预测的残差，默认阈值 20%，
+可通过 `--funding-deviation-threshold` 调整；因此正常三日计提不会仅因
+原始比值为 3 而误报。周一判定还要求有上一次计提且间隔至少三天，
+否则标注方向待确认。
+
+补仓心跳分别显示 `daily_regular_count` 与 `daily_abnormal_count`。
+常规成功每日最多 30 次、成功后至少间隔 15 分钟；异常每日最多 5 次，
+触顶 critical。旧版混合次数保留为常规用量，历史异常数与成功时间不猜测。
+请求前预占异常额度，回读确认达标后转为常规计数；dry-run 不消耗额度。
+
+### 2026-09-07 实际隔离桶口径修正
+
+当前桶按实际强平距离反推：`distance × (名义 − 维持保证金) + 维持保证金`。
+做多距离为 `(标记价 − 强平价) / 标记价`，做空方向相反。
+`initial_margin` 是公式要求值，不含 allocation 追加部分；达标和成功回读只检查实际距离。
+危险窗口阈值改为 5%（低于 8% 补仓目标）；补仓异常计数大于零也进入关键窗口。
+
+启动时兼容迁移旧 `swap_carry_guard_state.json.allocation.json` 至
+`swap_carry_guard_allocation_state.json`，新文件存在时不覆盖。
+修复部署后，可显式恢复被误计消耗的异常额度：
+
+```bash
+.venv/bin/python tools/run_swap_carry_guard.py --reset-allocation-counters
+```
+
+该命令只清零本地异常计数，保留常规用量、历史总次数和成功时间，并保存重置记录；
+不创建交易所客户端，执行后退出。自定义台账使用 `--state <守护状态路径>`。
+加 `--dry-run` 不修改计数、不发送 POST。占锁时拒绝重置，应在维护轮次释放锁后再执行。

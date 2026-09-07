@@ -400,7 +400,8 @@ async def _allocation_metric(client: Any, underlying: str) -> Metric:
         ).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
         return Metric(
             f"{underlying} 隔离保证金",
-            f"当前桶 ${allocation['initial_margin']:,.2f} / 目标桶 ${target:,.2f} / 距离 {allocation['distance']:.2%}",
+            f"当前桶 ${guard._actual_allocation(allocation):,.2f} / 目标桶 ${target:,.2f} / 距离 {allocation['distance']:.2%}"
+            f" / IM 公式要求值 ${allocation['initial_margin']:,.2f}（不含 allocation 追加部分）",
         )
     except Exception:  # noqa: BLE001 保证金读数失败不阻断其他面板指标
         return Metric(f"{underlying} 隔离保证金", "当前桶 / 目标桶 / 距离：无数据")

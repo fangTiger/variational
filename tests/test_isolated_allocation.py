@@ -44,7 +44,7 @@ def test_guard_allocation(tmp_path, case, expected, level):
     now = datetime(2026,9,7,tzinfo=timezone.utc)
     ledger = tmp_path / 'allocation.json'
     if case == 'limit':
-        ledger.write_text(json.dumps({'date':'2026-09-07','attempts':10}))
+        ledger.write_text(json.dumps({'date':'2026-09-07','attempts':30,'regular_count':30,'abnormal_count':0}))
     result = asyncio.run(guard._maintain_isolated_allocation(
         client, underlying='XAUS', mode=guard.MarginModeStatus('cross' if case == 'cross' else 'isolated','测试'),
         dry_run=case == 'dry_run', observed_at=now, ledger_path=ledger, audit_path=tmp_path/'audit.jsonl',
@@ -77,7 +77,7 @@ def test_client_read_and_write():
         'initial_margin':'199.44','maintenance_margin':'99.72','estimated_liquidation_price':'4189.70',
     }])
     client._instrument_kind_from_metadata = AsyncMock(return_value=('swap','commodity'))
-    client._post = AsyncMock(return_value={})
+    client._post = AsyncMock(return_value={'conversion_id': '3a63f279-test'})
     result = asyncio.run(client.get_isolated_allocation('XAUS'))
     assert result['distance'] == (D('4409.95')-D('4189.70'))/D('4409.95')
     assert abs(result['notional']-D('1994.36')) < D('.01')
@@ -102,9 +102,11 @@ def test_panel_allocation_metric():
     client = AsyncMock()
     client.get_isolated_allocation.return_value = snapshot()
     metric = asyncio.run(swap_carry._allocation_metric(client, 'XAUS'))
-    assert '当前桶 $199.44' in metric.value
+    assert '当前桶 $194.45' in metric.value
     assert '目标桶 $251.30' in metric.value
     assert '5.00%' in metric.value
+    assert '公式要求值' in metric.value
+    assert '不含 allocation 追加部分' in metric.value
 
 
 @pytest.mark.parametrize('method,path,body', [
@@ -114,7 +116,7 @@ def test_panel_allocation_metric():
 def test_manual_wrappers(method,path,body):
     client = object.__new__(VariationalClient)
     client._instrument_kind_from_metadata = AsyncMock(return_value=('swap','commodity'))
-    client._post = AsyncMock(return_value={})
+    client._post = AsyncMock(return_value={'conversion_id': '3a63f279-test'})
     args = (D('3'),'USDC') if method == 'set_leverage' else ('XAUS',)
     asyncio.run(getattr(client,method)(*args))
     assert client._post.await_args.args[0] == path
@@ -183,7 +185,7 @@ def test_daily_limit_persists_across_rounds(tmp_path):
     client.get_isolated_allocation.return_value = snapshot()
     configure_account(client)
     ledger = tmp_path/'count.json'
-    ledger.write_text(json.dumps({'date':'2026-09-07','attempts':9}))
+    ledger.write_text(json.dumps({'date':'2026-09-07','attempts':4,'regular_count':0,'abnormal_count':4}))
     async def run():
         for _ in range(2):
             await guard._maintain_isolated_allocation(
@@ -191,7 +193,7 @@ def test_daily_limit_persists_across_rounds(tmp_path):
                 observed_at=datetime(2026,9,7,tzinfo=timezone.utc),ledger_path=ledger,audit_path=tmp_path/'audit.jsonl')
     asyncio.run(run())
     client.set_isolated_allocation.assert_awaited_once()
-    assert json.loads(ledger.read_text())['attempts'] == 10
+    assert json.loads(ledger.read_text())['abnormal_count'] == 5
 
 
 def test_cap_environment_cannot_raise_hard_limit(tmp_path,monkeypatch):
@@ -217,6 +219,8 @@ def test_money_write_rejects_missing_instrument_metadata():
 
 def configure_account(client, balance='1000'):
     """仅使用真实字段：账户 balance/upnl 和全部持仓的 initial_margin。"""
+    client.set_isolated_allocation.return_value = '3a63f279-test'
+    client.wait_allocation_conversion.return_value = 'confirmed'
     client.raw.return_value = {'balance': balance, 'upnl': '20'}
     client.get_positions.return_value = [
         {'position_info': {'instrument': {'underlying': 'XAUS'}}, 'initial_margin': '199.44'},
@@ -299,7 +303,8 @@ def test_allocation_readback_polling(tmp_path, monkeypatch, caplog, case):
         assert path == '/positions'
         return [reads.pop(0)]
     client._get = AsyncMock(side_effect=get)
-    client.set_isolated_allocation = AsyncMock(
+    client.wait_allocation_conversion = AsyncMock(return_value='confirmed')
+    client.set_isolated_allocation = AsyncMock(return_value='3a63f279-test',
         side_effect=TimeoutError('请求超时') if case == 'post_failure' else None)
     notice = Mock()
     monkeypatch.setattr(guard, 'notify', notice)
@@ -317,9 +322,9 @@ def test_allocation_readback_polling(tmp_path, monkeypatch, caplog, case):
         notice.assert_not_called()
         audit = json.loads((tmp_path/'audit.jsonl').read_text().splitlines()[-1])
         for record in (result, audit):
-            assert D(record['before_allocation']) == D('200')
+            assert D(record['before_allocation']) == D('195')
             assert D(record['before_distance']) == D('.05')
-            assert D(record['after_allocation']) == D('252')
+            assert D(record['after_allocation']) == D('253.9')
             assert D(record['after_distance']) == D('.081')
         assert any(r.levelname == 'INFO' and '达标' in r.message for r in caplog.records)
     else:
@@ -333,3 +338,326 @@ def test_allocation_readback_polling(tmp_path, monkeypatch, caplog, case):
             assert position_reads == 2
             assert 'POST 失败' in result['message']
             assert '本轮不重试' in result['message']
+
+
+@pytest.mark.parametrize('case', ['cooldown', 'post_failure', 'abnormal_limit', 'regular_limit', 'success', 'calculation'])
+def test_separate_allocation_budgets(tmp_path, case):
+    """失败、成功和间隔分别计数，所有账户字段复用真实 schema。"""
+    client = AsyncMock()
+    configure_account(client)
+    client.get_isolated_allocation.side_effect = [snapshot(),snapshot('.081')]
+    if case == 'post_failure':
+        client.set_isolated_allocation.side_effect = TimeoutError('超时')
+    if case == 'calculation':
+        client.get_isolated_allocation.side_effect = [snapshot(notional='NaN')]
+    ledger = tmp_path/'counts.json'
+    ledger.write_text(json.dumps({'date':'2026-09-07', 'attempts':0,
+        'regular_count':30 if case == 'regular_limit' else 0,
+        'abnormal_count':5 if case == 'abnormal_limit' else 0,
+        'last_success_at':'2026-09-06T23:55:00+00:00' if case == 'cooldown' else None}))
+    result = asyncio.run(guard._maintain_isolated_allocation(
+        client, underlying='XAUS', mode=guard.MarginModeStatus('isolated','测试'), dry_run=False,
+        observed_at=datetime(2026,9,7,tzinfo=timezone.utc),ledger_path=ledger,audit_path=tmp_path/'audit.jsonl'))
+    saved = json.loads(ledger.read_text())
+    if case in {'cooldown','abnormal_limit','regular_limit','calculation'}:
+        client.set_isolated_allocation.assert_not_awaited()
+    else:
+        client.set_isolated_allocation.assert_awaited_once()
+    assert saved['abnormal_count'] == (5 if case == 'abnormal_limit' else 1 if case in {'post_failure','calculation'} else 0)
+    assert saved['regular_count'] == (30 if case == 'regular_limit' else 1 if case == 'success' else 0)
+    assert result['level'] == ('critical' if case in {'abnormal_limit','post_failure'} else 'warning' if case in {'regular_limit','calculation'} else 'info')
+    assert result['daily_regular_count'] == saved['regular_count']
+    assert result['daily_abnormal_count'] == saved['abnormal_count']
+
+
+def test_success_cooldown_across_rounds_then_allows_maintenance(tmp_path):
+    """连续轮次按上次实际成功时间跳过，十五分钟后恢复常规维护。"""
+    from datetime import timedelta
+    client = AsyncMock()
+    configure_account(client)
+    client.get_isolated_allocation.side_effect = [snapshot(),snapshot('.081'),snapshot(),snapshot(),snapshot('.081')]
+    now = datetime(2026,9,7,tzinfo=timezone.utc)
+    results = []
+    for minutes in (0,5,15):
+        results.append(asyncio.run(guard._maintain_isolated_allocation(
+            client,underlying='XAUS',mode=guard.MarginModeStatus('isolated','测试'),dry_run=False,
+            observed_at=now+timedelta(minutes=minutes),ledger_path=tmp_path/'count.json',audit_path=tmp_path/'audit.jsonl')))
+    assert client.set_isolated_allocation.await_count == 2
+    assert [r['daily_regular_count'] for r in results] == [1,1,2]
+    assert [r['daily_abnormal_count'] for r in results] == [0,0,0]
+
+
+def test_legacy_ten_successes_do_not_block_new_maintenance(tmp_path):
+    """旧版十次混合台账迁移后不能继续误伤正常维护。"""
+    client = AsyncMock()
+    configure_account(client)
+    client.get_isolated_allocation.side_effect = [snapshot(),snapshot('.081')]
+    ledger = tmp_path/'count.json'
+    ledger.write_text(json.dumps({'date':'2026-09-07','attempts':10}))
+    result = asyncio.run(guard._maintain_isolated_allocation(
+        client,underlying='XAUS',mode=guard.MarginModeStatus('isolated','测试'),dry_run=False,
+        observed_at=datetime(2026,9,7,tzinfo=timezone.utc),ledger_path=ledger,audit_path=tmp_path/'audit.jsonl'))
+    client.set_isolated_allocation.assert_awaited_once()
+    assert result['daily_regular_count'] == 11
+    assert result['daily_abnormal_count'] == 0
+
+
+def test_invalid_maintenance_counts_as_calculation_error(tmp_path):
+    """维持保证金大于名义属于非法输入，不能无限次计算重试。"""
+    client = AsyncMock()
+    configure_account(client)
+    client.get_isolated_allocation.return_value = {**snapshot(), 'maintenance_margin':D('3000')}
+    ledger = tmp_path/'count.json'
+    result = asyncio.run(guard._maintain_isolated_allocation(
+        client,underlying='XAUS',mode=guard.MarginModeStatus('isolated','测试'),dry_run=False,
+        observed_at=datetime(2026,9,7,tzinfo=timezone.utc),ledger_path=ledger,audit_path=tmp_path/'audit.jsonl'))
+    client.set_isolated_allocation.assert_not_awaited()
+    assert result['daily_abnormal_count'] == 1
+
+
+def test_success_ledger_write_failure_does_not_repeat_or_corrupt_counts(tmp_path,monkeypatch):
+    """成功回读后的台账写失败不能被当成暂时读仓失败而反复减异常额度。"""
+    client = AsyncMock()
+    configure_account(client)
+    client.get_isolated_allocation.side_effect = [snapshot()] + [snapshot('.081')] * guard.execution._FLAT_TRIES
+    original = guard._write_json
+    writes = []
+    def write(path, payload):
+        writes.append(payload.copy())
+        if len(writes) >= 2:
+            raise OSError('磁盘写入失败')
+        original(path,payload)
+    monkeypatch.setattr(guard,'_write_json',write)
+    ledger = tmp_path/'count.json'
+    result = asyncio.run(guard._maintain_isolated_allocation(
+        client,underlying='XAUS',mode=guard.MarginModeStatus('isolated','测试'),dry_run=False,
+        observed_at=datetime(2026,9,7,tzinfo=timezone.utc),ledger_path=ledger,audit_path=tmp_path/'audit.jsonl'))
+    assert len(writes) == 2
+    assert result['level'] == 'critical'
+    assert result['daily_abnormal_count'] == 1
+    assert json.loads(ledger.read_text())['abnormal_count'] == 1
+    client.set_isolated_allocation.assert_awaited_once()
+
+
+@pytest.mark.parametrize('qty,liquidation', [('1', '4072.19'), ('-1', '4726.27')])
+def test_actual_bucket_from_real_position_schema(qty, liquidation):
+    """IM 固定为名义的 10%，真实桶必须从强平价反推。"""
+    client = object.__new__(VariationalClient)
+    client.get_positions = AsyncMock(return_value=[{
+        'position_info': {'instrument': {'underlying': 'XAUS'},
+                          'qty': str(D(qty) * D('1989.51') / D('4399.23'))},
+        'price_info': {'underlying_price': '4399.23'},
+        'initial_margin': '198.95', 'maintenance_margin': '99.48',
+        'estimated_liquidation_price': liquidation,
+    }])
+    result = asyncio.run(client.get_isolated_allocation('XAUS'))
+    assert abs(result['current_allocation'] - D('239.98')) < D('.01')
+    assert result['distance'] == D('327.04') / D('4399.23')
+
+
+@pytest.mark.parametrize('healthy', [True, False])
+def test_fixed_im_does_not_hide_allocation_success(tmp_path, healthy):
+    """完整真实字段读仓链路中，追加 allocation 不改变公式 IM。"""
+    client = object.__new__(VariationalClient)
+    before = {'position_info': {'instrument': {'underlying': 'XAUS'}, 'qty': '1'},
+              'price_info': {'underlying_price': '2000'}, 'initial_margin': '200',
+              'maintenance_margin': '100', 'estimated_liquidation_price': '1900'}
+    after = {**before, 'estimated_liquidation_price': '1838'}
+    client.get_positions = AsyncMock(side_effect=[[after]] if healthy else [[before], [before], [after]])
+    client.raw = AsyncMock(return_value={'balance': '1000', 'upnl': '0'})
+    client.set_isolated_allocation = AsyncMock(return_value='3a63f279-test')
+    client.wait_allocation_conversion = AsyncMock(return_value='confirmed')
+    result = asyncio.run(guard._maintain_isolated_allocation(
+        client, underlying='XAUS', mode=guard.MarginModeStatus('isolated', '测试'),
+        dry_run=False, observed_at=datetime(2026,9,7,tzinfo=timezone.utc),
+        ledger_path=tmp_path/'count.json', audit_path=tmp_path/'audit.jsonl'))
+    assert result['current_allocation'] == D('253.9')
+    assert result['distance'] == D('.081')
+    assert result['daily_abnormal_count'] == 0
+    assert result['daily_regular_count'] == (0 if healthy else 1)
+    assert client.set_isolated_allocation.await_count == (0 if healthy else 1)
+
+
+def test_migrate_and_reset_allocation_state(tmp_path, monkeypatch):
+    """重置命令只处理本地台账，保留原始计数供审计。"""
+    state = tmp_path/'swap_carry_guard_state.json'
+    legacy = tmp_path/'swap_carry_guard_state.json.allocation.json'
+    saved = {'date':'2026-09-07', 'attempts':14, 'regular_count':10, 'abnormal_count':4}
+    legacy.write_text(json.dumps(saved))
+    canonical = guard._allocation_state_path(state)
+    assert canonical.name == 'swap_carry_guard_allocation_state.json'
+    assert json.loads(canonical.read_text()) == saved
+    assert not legacy.exists()
+    # 新文件优先，重复启动不能用旧计数覆盖新状态。
+    legacy.write_text(json.dumps({**saved, 'attempts':99}))
+    assert guard._allocation_state_path(state) == canonical
+    assert json.loads(canonical.read_text()) == saved
+    load = AsyncMock()
+    monkeypatch.setattr(guard.execution, '_load', load)
+    args = guard.build_parser().parse_args(['--state', str(state), '--reset-allocation-counters'])
+    assert asyncio.run(guard._main(args)) == 0
+    reset = json.loads(canonical.read_text())
+    assert reset['abnormal_count'] == 0
+    assert reset['regular_count'] == 10
+    assert reset['attempts'] == 14
+    assert reset['counter_reset']['previous_abnormal_count'] == 4
+    load.assert_not_awaited()
+
+
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_reset_respects_lock_and_dry_run(tmp_path, monkeypatch, dry_run):
+    """dry-run 不改计数；实际重置遇到占锁必须失败，不能覆盖活跃轮次。"""
+    import fcntl
+    state = tmp_path/'guard_state.json'
+    ledger = guard._allocation_state_path(state)
+    saved = {'date':'2026-09-07', 'attempts':14, 'regular_count':10, 'abnormal_count':4}
+    ledger.write_text(json.dumps(saved))
+    load = AsyncMock()
+    monkeypatch.setattr(guard.execution, '_load', load)
+    args = guard.build_parser().parse_args([
+        '--state', str(state), '--reset-allocation-counters', *(['--dry-run'] if dry_run else [])])
+    with ledger.with_suffix('.json.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if dry_run:
+            assert asyncio.run(guard._main(args)) == 0
+        else:
+            with pytest.raises(BlockingIOError):
+                asyncio.run(guard._main(args))
+    assert json.loads(ledger.read_text()) == saved
+    load.assert_not_awaited()
+
+
+def test_migration_refuses_active_legacy_lock(tmp_path):
+    """旧守护仍在维护时，迁移不跨过旧锁。"""
+    import fcntl
+    state = tmp_path/'guard_state.json'
+    legacy = tmp_path/'guard_state.json.allocation.json'
+    legacy.write_text('{"date":"2026-09-07","attempts":14}')
+    with legacy.with_suffix('.json.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(BlockingIOError):
+            guard._allocation_state_path(state)
+    assert legacy.exists()
+    assert not (tmp_path/'guard_allocation_state.json').exists()
+
+
+@pytest.mark.parametrize('status', ['rejected', 'timeout', 'confirmed'])
+def test_conversion_confirmation_before_readback(tmp_path, monkeypatch, caplog, status):
+    """真实持仓字段复现：POST 后仍旧，确认后才允许读取更新的强平价。"""
+    client = object.__new__(VariationalClient)
+    events = []
+    before = {'position_info': {'instrument': {'underlying': 'XAUS'}, 'qty': '1'},
+              'price_info': {'underlying_price': '2000'}, 'initial_margin': '200',
+              'maintenance_margin': '100', 'estimated_liquidation_price': '1900'}
+    confirmed = False
+    reads_after = 0
+
+    async def get(path):
+        nonlocal confirmed, reads_after
+        events.append(path)
+        if path == '/portfolio':
+            return {'balance': '1000', 'upnl': '0'}
+        if path.startswith('/sub_accounts/conversions/'):
+            if events.count(path) == 1:
+                return {'status': 'pending'}
+            if status == 'timeout':
+                raise TimeoutError('转换确认超时')
+            confirmed = status == 'confirmed'
+            return {'status': status}
+        assert path == '/positions'
+        if confirmed:
+            reads_after += 1
+        # 确认后的第一次读仓仍可旧，第二次才更新。
+        return [{**before, 'estimated_liquidation_price': '1838' if reads_after >= 2 else '1900'}]
+
+    async def post(path, payload):
+        events.append(path)
+        return {'conversion_id': '3a63f279-test'}
+
+    client._get = AsyncMock(side_effect=get)
+    client._post = AsyncMock(side_effect=post)
+    client._instrument_kind_from_metadata = AsyncMock(return_value=('swap', 'commodity'))
+    monkeypatch.setenv('ALLOCATION_CONVERSION_TIMEOUT_SECONDS', '7')
+    caplog.set_level('INFO', logger=guard.__name__)
+    result = asyncio.run(guard._maintain_isolated_allocation(
+        client, underlying='XAUS', mode=guard.MarginModeStatus('isolated', '测试'),
+        dry_run=False, observed_at=datetime(2026, 9, 7, tzinfo=timezone.utc),
+        ledger_path=tmp_path/'count.json', audit_path=tmp_path/'audit.jsonl'))
+    client._post.assert_awaited_once()
+    assert result['conversion_id'] == '3a63f279-test'
+    posted = events.index('/sub_accounts/allocation')
+    assert events[posted + 1:posted + 3] == ['/sub_accounts/conversions/3a63f279-test'] * 2
+    ledger = json.loads((tmp_path/'count.json').read_text())
+    assert result['daily_abnormal_count'] == ledger['abnormal_count'] == (1 if status == 'rejected' else 0)
+    if status == 'confirmed':
+        assert result['level'] == 'info'
+        assert result['distance'] == D('.081')
+        assert result['readback_attempts'] == 2
+        assert ledger['regular_count'] == 1
+    else:
+        assert reads_after == 0
+        assert '/positions' not in events[posted + 1:]
+        assert result['level'] == ('critical' if status == 'rejected' else 'warning')
+        assert ('POST 失败' if status == 'rejected' else '超时') in result['message']
+        if status == 'timeout':
+            assert any(r.levelname == 'WARNING' and '超时' in r.message for r in caplog.records)
+
+
+def test_set_allocation_returns_conversion_id():
+    client = object.__new__(VariationalClient)
+    client._instrument_kind_from_metadata = AsyncMock(return_value=('swap', 'commodity'))
+    client._post = AsyncMock(return_value={'conversion_id': 'c0a91108-test'})
+    assert asyncio.run(client.set_isolated_allocation('XAUS', D('300'))) == 'c0a91108-test'
+
+
+@pytest.mark.parametrize('terminal', ['confirmed', 'rejected'])
+def test_wait_conversion_polls_terminal_status(monkeypatch, terminal):
+    client = object.__new__(VariationalClient)
+    client._get = AsyncMock(side_effect=[{'status': 'pending'}, {'status': terminal}])
+    monkeypatch.setenv('ALLOCATION_CONVERSION_POLL_INTERVAL_SECONDS', '0.25')
+    assert asyncio.run(client.wait_allocation_conversion('c0a91108-test', timeout=30)) == terminal
+    assert client._get.await_count == 2
+    client._get.assert_awaited_with('/sub_accounts/conversions/c0a91108-test')
+    guard.asyncio.sleep.assert_awaited_once_with(0.25)
+
+
+def test_wait_conversion_bounds_stalled_request():
+    client = object.__new__(VariationalClient)
+    async def stalled(path):
+        await asyncio.Event().wait()
+    client._get = AsyncMock(side_effect=stalled)
+    with pytest.raises(TimeoutError):
+        asyncio.run(client.wait_allocation_conversion('c0a91108-test', timeout=0.01))
+
+
+def test_wait_conversion_pending_hits_total_deadline(monkeypatch):
+    """持续 pending 也必须在总截止时间停止，不能只约束单次 GET。"""
+    client = object.__new__(VariationalClient)
+    client._get = AsyncMock(return_value={'status': 'pending'})
+    # 用事件循环定时器提供离线等待，避免全局免等待夹具吞掉时钟推进。
+    async def pause(delay):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        handle = loop.call_later(delay, future.set_result, None)
+        try:
+            await future
+        finally:
+            handle.cancel()
+    monkeypatch.setattr(guard.asyncio, 'sleep', pause)
+    monkeypatch.setenv('ALLOCATION_CONVERSION_POLL_INTERVAL_SECONDS', '0.001')
+    with pytest.raises(TimeoutError):
+        asyncio.run(client.wait_allocation_conversion('c0a91108-test', timeout=0.02))
+    assert client._get.await_count > 1
+
+
+def test_guard_forwards_configured_conversion_timeout(tmp_path, monkeypatch):
+    client = AsyncMock()
+    configure_account(client)
+    client.get_isolated_allocation.side_effect = [snapshot(), snapshot('.081')]
+    monkeypatch.setenv('ALLOCATION_CONVERSION_TIMEOUT_SECONDS', '7')
+    result = asyncio.run(guard._maintain_isolated_allocation(
+        client, underlying='XAUS', mode=guard.MarginModeStatus('isolated', '测试'),
+        dry_run=False, observed_at=datetime(2026, 9, 7, tzinfo=timezone.utc),
+        ledger_path=tmp_path/'count.json', audit_path=tmp_path/'audit.jsonl'))
+    client.wait_allocation_conversion.assert_awaited_once_with('3a63f279-test', timeout=7.0)
+    assert result['daily_abnormal_count'] == 0

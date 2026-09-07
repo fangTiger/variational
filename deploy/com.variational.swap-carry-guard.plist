@@ -23,7 +23,7 @@
 	<key>StandardOutPath</key>
 	<string>/Users/captain/python/variational/logs/swap-carry-guard.log</string>
 	<key>StartInterval</key>
-	<integer>300</integer>
+	<integer>60</integer>
 	<key>WorkingDirectory</key>
 	<string>/Users/captain/python/variational</string>
 </dict>

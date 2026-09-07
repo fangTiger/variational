@@ -1131,12 +1131,12 @@ def test_dry_run_performs_decision_but_never_accepts(tmp_path: Path) -> None:
     assert state["status"] == "dry_run"
 
 
-def test_launchd_plist_runs_guard_once_every_five_minutes() -> None:
-    """部署文件只声明每五分钟单轮执行，不在测试中加载 launchd。"""
+def test_launchd_plist_runs_guard_once_every_minute() -> None:
+    """部署文件只声明每分钟单轮执行，不在测试中加载 launchd。"""
     path = Path("deploy/com.variational.swap-carry-guard.plist")
     payload = plistlib.loads(path.read_bytes())
 
-    assert payload["StartInterval"] == 300
+    assert payload["StartInterval"] == 60
     assert "tools.run_swap_carry_guard" in payload["ProgramArguments"]
     assert "--once" in payload["ProgramArguments"]
 
@@ -2493,9 +2493,11 @@ def test_allocation_runs_only_after_all_close_checks(tmp_path, monkeypatch, trig
     client.get_isolated_allocation = AsyncMock(side_effect=[
         {'initial_margin':Decimal('199.44'),'maintenance_margin':Decimal('99.72'),
          'notional':Decimal('1994.36'),'distance':Decimal('.05')},
-        {'initial_margin':Decimal('251.30'),'distance':Decimal('.081')},
+        {'initial_margin':Decimal('199.44'),'maintenance_margin':Decimal('99.72'),
+         'notional':Decimal('1994.36'),'distance':Decimal('.081')},
     ])
-    client.set_isolated_allocation = AsyncMock(return_value={})
+    client.set_isolated_allocation = AsyncMock(return_value="3a63f279-test")
+    client.wait_allocation_conversion = AsyncMock(return_value="confirmed")
     client.raw = AsyncMock(return_value={'balance':'1000', 'upnl':'0'})
     assert 'available_margin' not in client.raw.return_value
     monkeypatch.setattr(guard,'notify',lambda *_args: True)
@@ -2518,7 +2520,35 @@ def test_allocation_runs_only_after_all_close_checks(tmp_path, monkeypatch, trig
         assert heartbeat['isolated_allocation']['XAUS']['daily_attempts'] == 1
         assert heartbeat['isolated_allocation']['XAUS']['distance'] == '0.081'
         allocation = heartbeat['isolated_allocation']['XAUS']
-        assert allocation['before_allocation'] == '199.44'
+        assert allocation['before_allocation'] == '194.4520'
         assert allocation['before_distance'] == '0.05'
-        assert allocation['after_allocation'] == '251.30'
+        assert allocation['after_allocation'] == '253.18584'
         assert allocation['after_distance'] == '0.081'
+
+
+def test_funding_recon_runs_in_guard_dry_run(tmp_path, monkeypatch):
+    """真实单轮编排每轮只读流水，对账结论进入心跳和审计，dry-run 不 POST。"""
+    from tests.test_swap_carry_funding_recon import transfer, sample
+    client = _healthy_client()
+    original_raw = client.raw
+    reads = []
+    async def raw(path):
+        reads.append(path)
+        if path == '/transfers?limit=100&offset=0':
+            return {'result':[transfer(8)], 'pagination':{'object_count':1}}
+        return await original_raw(path)
+    client.raw = raw
+    samples = tmp_path/'samples.jsonl'
+    samples.write_text(json.dumps(sample(8))+'\n')
+    for _ in range(2):
+        assert _run(client,tmp_path,dry_run=True, auto_open=False,auto_switch=False,
+                    funding_samples_path=samples,funding_recon_path=tmp_path/'recon.jsonl') == 0
+    heartbeat = json.loads(_paths(tmp_path)['heartbeat_path'].read_text())
+    assert heartbeat['funding_reconciliation']['conclusion'] == '日常计提正常'
+    assert heartbeat['funding_reconciliation']['new_count'] == 0
+    audit = [json.loads(line) for line in _paths(tmp_path)['audit_path'].read_text().splitlines()]
+    records = [row for row in audit if row['event'] == 'funding_reconciliation']
+    assert len(records) == 1
+    assert records[0]['conclusion'] == '日常计提正常'
+    assert reads.count('/transfers?limit=100&offset=0') == 2
+    assert client.accept_calls == []

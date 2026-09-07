@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 
+import asyncio
 import base64
 import json
 import logging
@@ -295,7 +296,8 @@ class VariationalClient(ExchangeAdapter):
     async def get_isolated_allocation(self, underlying: str) -> dict[str, Decimal]:
         """只从 /positions 读取桶及方向相关强平距离。
 
-        initial_margin 表示当前桶；target_allocation 是目标总额非增量。
+        initial_margin 是公式要求值，不含 allocation 追加部分；实际桶从强平价反推。
+        target_allocation 是目标总额非增量。
         缺失、重复或无效仓位必须拒绝，绝不询价或用入场价代替现价。
         """
         payload = await self.get_positions()
@@ -325,11 +327,13 @@ class VariationalClient(ExchangeAdapter):
         notional = abs(qty) * mark
         if qty == 0 or mark <= 0 or initial < 0 or not 0 <= maintenance < notional or liquidation <= 0:
             raise ValueError(f"{underlying} 保证金或价格字段无效")
+        distance = (mark - liquidation) / mark if qty > 0 else (liquidation - mark) / mark
         return {
+            "current_allocation": distance * (notional - maintenance) + maintenance,
             "initial_margin": initial, "maintenance_margin": maintenance,
             "estimated_liquidation_price": liquidation, "mark_price": mark,
             "notional": notional,
-            "distance": (mark - liquidation) / mark if qty > 0 else (liquidation - mark) / mark,
+            "distance": distance,
         }
 
     async def _allocation_instrument(self, underlying: str) -> dict:
@@ -344,15 +348,38 @@ class VariationalClient(ExchangeAdapter):
             raise ValueError("RWA 合约缺少 kind")
         return self._instrument(underlying.upper(), instrument_type=instrument_type, kind=kind)
 
-    async def set_isolated_allocation(self, underlying: str, target_allocation: Decimal) -> Any:
+    async def set_isolated_allocation(self, underlying: str, target_allocation: Decimal) -> str:
         """设置隔离保证金：target_allocation 是目标总额非增量；不自动重试。"""
         target = _finite_decimal(target_allocation, label="目标保证金总额")
         if target <= 0:
             raise ValueError("目标保证金总额必须大于零")
         instrument = await self._allocation_instrument(underlying)
-        return await self._post("/sub_accounts/allocation", {
+        response = await self._post("/sub_accounts/allocation", {
             "instrument": instrument, "target_allocation": str(target),
         })
+        conversion_id = response.get("conversion_id")
+        if not isinstance(conversion_id, str) or not conversion_id.strip():
+            raise ValueError("补仓响应缺少 conversion_id")
+        return conversion_id
+
+    async def wait_allocation_conversion(self, conversion_id: str, timeout: float = 30) -> str:
+        """等待异步保证金转换终态；总超时同时约束网络请求和轮询休眠。"""
+        if not isinstance(conversion_id, str) or not conversion_id.strip():
+            raise ValueError("转换编号不能为空")
+        timeout = float(_finite_decimal(timeout, label="转换确认超时"))
+        interval = float(_finite_decimal(os.environ.get(
+            "ALLOCATION_CONVERSION_POLL_INTERVAL_SECONDS", "2"), label="转换轮询间隔"))
+        if timeout <= 0 or interval <= 0:
+            raise ValueError("转换确认超时和轮询间隔必须大于零")
+        async with asyncio.timeout(timeout):
+            while True:
+                response = await self._get(f"/sub_accounts/conversions/{conversion_id}")
+                status = response.get("status")
+                if status in {"confirmed", "rejected"}:
+                    return status
+                if status != "pending":
+                    raise ValueError(f"未知保证金转换状态：{status!r}")
+                await asyncio.sleep(interval)
 
     async def isolate(self, underlying: str) -> Any:
         """人工接口：将指定合约切换为隔离模式；守护进程不得调用。"""

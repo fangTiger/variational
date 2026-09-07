@@ -369,3 +369,97 @@ SHALL NOT 使用模块默认结构猜测腿方向或判定缺腿。面板 SHALL 
 #### Scenario: 持仓费率读取失败
 - **WHEN** API 报错或缺少必要字段且无可用降级
 - **THEN** 出场计数不增加也不清零，并记录读取失败
+
+### Requirement: XAUS 资金费自动对账
+守护程序 SHALL 每轮只读分页拉取真实 `/transfers`，按
+`reference_instrument` 识别 XAUS swap，使用 `qty` 和
+`ref_instrument_position_qty`，将新结算去重追加到可注入的 JSONL。
+对账 SHALL 保留原始流水、created_at、apply_time 及来源、结算仓位数量、
+独立价格来源及名义、实际单次费率、结算前最近一次对应 long_rate、
+实际/预测日费率比值、bp 差、上次计提间隔与推断覆盖天数。
+缺少流水计提时间时只允许匹配结算前采样的本期预测时间，并标注来源；
+缺少流水价格时使用两小时内的采样标记价或 RFQ 中价，必须标注为估计。
+不得使用扣款除以流水费率构造名义后再声称独立对账成功。
+
+#### Scenario: 普通日、周五预收与周一追补
+- **WHEN** 实际费率与预测年化费率除以 365 的比值接近 1
+- **THEN** 输出「日常计提正常」
+- **WHEN** 周五覆盖 3 天
+- **THEN** 输出「周五预收模式」，列出周五、周六、周日
+- **WHEN** 周一覆盖 3 天且与上次 apply_time 间隔至少 3 天
+- **THEN** 输出「周一追补模式」，列出周六、周日、周一
+- **AND** 上述日期属于推断结果，估计名义不能当成精确结算价格证据
+
+#### Scenario: 缺证据与偏差告警
+- **WHEN** 无对应结算前预测
+- **THEN** 输出「无预测可比」，不虚构费率、覆盖天数或 apply_time
+- **WHEN** 实际与预期单日或三日费率相对偏差超过可配置阈值（默认 20%）
+- **THEN** warning 告警「预测口径可能有问题」，同时保留未经三日调整的比值和 bp 差
+- **AND** 心跳与审计展示结论，只读 CLI 支持 `--last N`
+
+### Requirement: 补仓分类限流
+常规维护 SHALL 每日最多 30 次，成功回读达标后才计入常规次数，
+距离上次成功不足 15 分钟跳过且不增加异常次数。
+POST 失败、回读不达标及计算异常 SHALL 计入独立异常计数，每日最多 5 次。
+请求前 SHALL 持久化预占异常额度；成功回读后转为常规额度，防止中断绕过限流。
+旧混合 attempts SHALL 保留并计为常规用量，不能凭空推断历史异常或成功时间。
+
+#### Scenario: 分类触顶及单轮去重
+- **WHEN** 异常次数达到 5
+- **THEN** 停止补仓并记 critical
+- **WHEN** 常规次数达到 30
+- **THEN** 停止补仓并记 warning
+- **WHEN** 补仓成功且回读距离达标
+- **THEN** 同轮不再 POST，心跳分别展示两类计数
+- **AND** dry-run 不发送 POST，也不消耗真实补仓计数
+
+### Requirement: 实际隔离桶与危险窗口口径
+守护及面板 SHALL 从实际强平距离反推当前桶：`distance * (notional - maintenance_margin) + maintenance_margin`。
+`initial_margin` SHALL 仅标注为公式要求值、不含 allocation 追加部分，不能用于实际桶或达标判定。
+
+#### Scenario: IM 不变但实际保护已到位
+- **WHEN** 做多距离为 `(mark - liquidation) / mark`，做空距离为 `(liquidation - mark) / mark`
+- **THEN** 以该实际距离判断是否达到补仓目标；已达标不 POST，补仓后回读达标记成功且不增加异常计数
+- **AND** 名义 1989.51、MM 99.48、标记价 4399.23、做多强平价 4072.19 时当前桶约为 239.98
+
+#### Scenario: 危险窗口与补仓目标分离
+- **WHEN** 实际距离为 7.4%，其他风险与时间条件正常且异常计数为零
+- **THEN** 使用 normal 轮询，未满普通间隔可零网络早退
+- **WHEN** 距离低于 5% 或补仓异常计数大于零
+- **THEN** 使用 critical 轮询；5% 表示已经逼近危险，而非未达 8% 最优目标
+
+### Requirement: 补仓台账迁移与显式重置
+守护 SHALL 启动时将旧 `swap_carry_guard_state.json.allocation.json` 兼容迁移到 `swap_carry_guard_allocation_state.json`，保留状态；新文件存在时不得覆盖。
+
+#### Scenario: 迁移及恢复异常额度
+- **WHEN** 只有旧台账存在
+- **THEN** 持有新旧锁后原子迁移，旧锁被占用时拒绝迁移
+- **WHEN** 显式使用 `--reset-allocation-counters`
+- **THEN** 仅清零异常计数，保留常规用量、总次数、成功时间及重置审计记录，退出且不创建交易所客户端
+- **AND** dry-run 不清零，不发送 POST；占锁时拒绝实际重置
+
+### Requirement: 异步补仓转换确认
+`set_isolated_allocation` SHALL 返回响应中的 `conversion_id`，守护 SHALL 先轮询
+`GET /sub_accounts/conversions/{conversion_id}`，转换为 `confirmed` 后才回读仓位校验距离。
+轮询间隔由 `ALLOCATION_CONVERSION_POLL_INTERVAL_SECONDS` 配置，默认 2 秒；
+守护等待总超时由 `ALLOCATION_CONVERSION_TIMEOUT_SECONDS` 配置，默认 30 秒，覆盖请求与休眠。
+
+#### Scenario: 确认、拒绝与超时分别计数
+- **WHEN** 转换为 `confirmed` 且有限回读内实际距离达标
+- **THEN** 记成功并将预占异常额度转为常规额度，容忍确认后首次仓位仍旧
+- **WHEN** 转换为 `rejected`
+- **THEN** 记为 POST 失败，消耗异常额度，本轮不再发送 POST
+- **WHEN** 转换确认超时
+- **THEN** 记 warning、释放预占异常额度，不回读校验且本轮不重试
+- **AND** dry-run 不 POST、不等待转换
+
+### Requirement: 关键轮询原因可诊断
+心跳 SHALL 始终记录 `critical_reasons` 列表，由当前快照汇总状态、事件、强平距离、
+异常计数、账户保证金率及切换窗口等触发条件。正常窗口 SHALL 为空列表。
+本轮入口的旧 `polling_mode` SHALL NOT 覆盖本轮完成后的最新风险判断。
+
+#### Scenario: 从关键轮次恢复正常
+- **WHEN** 以 critical 启动但本轮确认安全，距离 7.4%、无 incident、保证金率高于 3.0x、距切换很远且无其他风险
+- **THEN** 心跳记录 normal 与空原因列表；下一次距完整轮次不足 300 秒时可早退
+- **WHEN** 隔离腿距离为 4.5%
+- **THEN** 记录 critical，原因包含该腿的 `liquidation_distance` 项

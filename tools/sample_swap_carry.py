@@ -453,10 +453,18 @@ async def sample_once(
         except Exception as exc:  # noqa: BLE001 收益失败不丢原始费率
             errors.append(_error("carry", exc))
 
+    # 保存真实元数据价格；即使休市无 RFQ，也能保留独立历史价格证据。
+    mark_price = None
+    if xaus_record is not None:
+        try:
+            mark_price = str(_price(xaus_record, "price"))
+        except Exception as exc:  # noqa: BLE001 缺价不丢失费率样本
+            errors.append(_error("xaus_mark_price", exc))
     return {
         "observed_at": _utc_iso(now),
         "xau": {"funding": xau_funding, "open_interest": xau_oi},
         "xaus": {
+            "mark_price": mark_price,
             "funding": xaus_funding,
             "open_interest": xaus_oi,
             "market": market,

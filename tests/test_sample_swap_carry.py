@@ -274,3 +274,12 @@ def test_launchd_template_runs_readonly_sampler_hourly() -> None:
     assert "tools.sample_swap_carry" in payload["ProgramArguments"]
     assert "--once" in payload["ProgramArguments"]
     assert "KeepAlive" not in payload
+
+
+def test_sample_keeps_metadata_price_when_rfq_closed():
+    """休市 RFQ 失败时仍保存真实 supported_assets.price，供结算名义估计。"""
+    client = _configured_client()
+    client.configured['quote_xaus'] = RuntimeError('休市无 RFQ')
+    record = asyncio.run(sample_swap_carry.sample_once(client, observed_at=NOW))
+    assert record['xaus']['mark_price'] == METADATA['XAUS'][0]['price']
+    assert record['rfq']['xaus'] is None

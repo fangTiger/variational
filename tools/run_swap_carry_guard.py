@@ -1,6 +1,6 @@
 """Swap carry 无人值守周循环守护进程。
 
-launchd 每五分钟以 ``--once`` 启动一轮。既有仓位始终先执行平仓与风控检查；
+launchd 每分钟以 ``--once`` 启动，普通窗口每五分钟执行完整轮次。既有仓位始终先执行平仓与风控检查；
 只有账户两腿均为空且所有入场条件明确满足时，才复用人工执行器尝试自动开仓。
 """
 
@@ -58,7 +58,9 @@ DEFAULT_SWITCH_HISTORY = data_dir() / "swap_carry_switch_history.jsonl"
 
 TARGET_LIQUIDATION_DISTANCE = Decimal("0.08")
 MAX_ALLOCATION_USD = Decimal("600")
-MAX_DAILY_ALLOCATION_ATTEMPTS = 10
+MAX_DAILY_ALLOCATION_ATTEMPTS = 30
+MAX_DAILY_ALLOCATION_ERRORS = 5
+MIN_ALLOCATION_INTERVAL_SECONDS = 900
 
 IMBALANCE_RATIO = Decimal("0.05")
 LIQUIDATION_ALERT_RATIO = Decimal("0.015")
@@ -82,6 +84,95 @@ SESSION_CRITICAL_THRESHOLD = timedelta(hours=6)
 SESSION_WARNING_COOLDOWN = timedelta(hours=2)
 SWITCH_NET_DELTA_TOLERANCE = execution.XAUS_QTY_STEP
 IGNORED_EXTERNAL_POSITIONS = frozenset({"BTC"})
+NORMAL_INTERVAL = 300
+CRITICAL_WINDOW_BEFORE_SWITCH = timedelta(minutes=45)
+# 已经逼近危险才加密轮询；低于 8% 补仓目标不代表进入关键窗口。
+CRITICAL_LIQUIDATION_DISTANCE = Decimal("0.05")
+CRITICAL_ACCOUNT_MARGIN_RATIO = Decimal("3.0")
+
+
+def _planned_switch_at(
+    heartbeat: Mapping[str, Any], switch_lead_time: timedelta,
+) -> datetime | None:
+    """从上轮绝对日程边界计算计划切换时间，不使用会随早退失真的相对秒数。"""
+    schedule = heartbeat.get("xaus_schedule") or {}
+    if not schedule.get("metadata_is_fresh"):
+        return None
+    duration = schedule.get("closure_duration_seconds")
+    if duration is None or float(duration) <= LONG_CLOSURE_THRESHOLD.total_seconds():
+        return None
+    if heartbeat.get("structure") == "XAUS_XAU":
+        close_at = execution._guard_timestamp(schedule.get("next_close_at"))
+        return close_at - switch_lead_time if close_at is not None else None
+    return execution._guard_timestamp(schedule.get("next_open_at"))
+
+
+def _polling_plan(
+    heartbeat: Mapping[str, Any] | None, *, now: datetime,
+    kill_switch_path: Path, switch_lead_time: timedelta,
+    critical_reasons: list[str] | None = None,
+) -> tuple[str, datetime]:
+    """只依赖本地快照，汇总关键条件，避免旧模式覆盖最新风险判断。"""
+    reasons = critical_reasons if critical_reasons is not None else []
+    reasons.clear()
+    critical = ("critical", now + timedelta(seconds=60))
+    if kill_switch_path.exists():
+        reasons.append("kill_switch_active")
+    if not heartbeat:
+        reasons.append("missing_heartbeat")
+        return critical
+    last_full = execution._guard_timestamp(heartbeat.get("last_full_round_at"))
+    if last_full is None or last_full > now:
+        reasons.append("invalid_last_full_round_at")
+    try:
+        status = heartbeat.get("status")
+        if status in {
+            "incident", "blocked", "flattened", "pending_xaus_close",
+            "kill_switch_active", "exit_carry_triggered", "action_failed", "session_expired",
+        }:
+            reasons.append(f"status:{status}")
+        for key in (
+            "auto_open_incident", "switch_incident", "rehearsal_blocked",
+            "close_attempted", "auto_switch_attempted", "consecutive_failures",
+        ):
+            if heartbeat.get(key):
+                reasons.append(key)
+        for word in ("incident", "blocked"):
+            if word in str(heartbeat.get("conclusion", "")).lower():
+                reasons.append(f"conclusion:{word}")
+        for underlying, leg in heartbeat.get("legs", {}).items():
+            if leg.get("margin_mode") != "isolated":
+                continue
+            distance = (leg.get("per_leg_liquidation") or {}).get("distance")
+            if distance is not None:
+                value = Decimal(str(distance))
+                if not value.is_finite() or value < CRITICAL_LIQUIDATION_DISTANCE:
+                    reasons.append(f"liquidation_distance:{underlying}")
+        for underlying, allocation in heartbeat.get("isolated_allocation", {}).items():
+            if int(allocation.get("daily_abnormal_count", 0)) > 0:
+                reasons.append(f"allocation_abnormal_count:{underlying}")
+            distance = allocation.get("distance")
+            if distance is not None:
+                value = Decimal(str(distance))
+                if not value.is_finite() or value < CRITICAL_LIQUIDATION_DISTANCE:
+                    reasons.append(f"allocation_liquidation_distance:{underlying}")
+        ratio = (heartbeat.get("account_margin") or {}).get("ratio")
+        if ratio is not None:
+            value = Decimal(str(ratio))
+            if not value.is_finite() or value < CRITICAL_ACCOUNT_MARGIN_RATIO:
+                reasons.append("account_margin_ratio")
+        planned = _planned_switch_at(heartbeat, switch_lead_time)
+        if planned is not None and planned - now <= CRITICAL_WINDOW_BEFORE_SWITCH:
+            reasons.append("switch_window")
+        if reasons:
+            return critical
+        next_full = last_full + timedelta(seconds=NORMAL_INTERVAL)
+        if planned is not None:
+            next_full = min(next_full, planned - CRITICAL_WINDOW_BEFORE_SWITCH)
+        return "normal", next_full
+    except (ValueError, TypeError, AttributeError, ArithmeticError):
+        reasons.append("invalid_risk_snapshot")
+        return critical
 
 
 @dataclass(frozen=True)
@@ -1782,8 +1873,9 @@ async def _available_account_margin(var: Any) -> Decimal:
     """按真实接口字段计算全账户可用保证金。
 
     /portfolio 无 available_margin，必须自算：权益为 balance + upnl；
-    已占用为 /positions 每条持仓顶层 initial_margin 之和。
-    必须遍历全部持仓，包括结构外的 BTC 和隔离腿；隔离桶同样占用账户资金。
+    此处扣除 /positions 全部持仓的公式要求值 initial_margin（不含 allocation 追加部分）。
+    这是基于公式要求值的可用额度估计，不能据此认定实际隔离桶金额；
+    必须遍历全部持仓，包括结构外的 BTC 和隔离腿。
     """
     def read_field(record: object, field: str, source: str) -> Decimal:
         """缺失和非法数值均报告具体接口字段，禁止默认按零处理。"""
@@ -1806,6 +1898,54 @@ async def _available_account_margin(var: Any) -> Decimal:
     return equity - occupied
 
 
+def _actual_allocation(snapshot: Mapping[str, Any]) -> Decimal:
+    """实际强平距离反推真实桶；initial_margin 是公式要求值，不含 allocation 追加部分。"""
+    distance = execution._decimal(snapshot["distance"], label="实际强平距离")
+    notional = execution._decimal(snapshot["notional"], label="名义", positive=True)
+    maintenance = execution._decimal(snapshot["maintenance_margin"], label="维持保证金")
+    if not 0 <= maintenance < notional:
+        raise ValueError("维持保证金必须在零和名义之间")
+    return distance * (notional - maintenance) + maintenance
+
+
+def _allocation_state_path(state_path: Path) -> Path:
+    """兼容旧文件名一次；同时持有新旧锁，旧进程占锁时拒绝迁移。"""
+    stem = state_path.stem
+    prefix = stem[:-6] if stem.endswith("_state") else stem
+    canonical = state_path.with_name(prefix + "_allocation_state.json")
+    legacy = state_path.with_suffix(state_path.suffix + ".allocation.json")
+    if legacy.exists() and not canonical.exists():
+        with canonical.with_suffix(".json.lock").open("a") as new_lock:
+            fcntl.flock(new_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with legacy.with_suffix(".json.lock").open("a") as old_lock:
+                fcntl.flock(old_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if legacy.exists() and not canonical.exists():
+                    # 原子改名完整保留台账，包括未识别字段；损坏台账仍由读仓分支拒绝。
+                    legacy.rename(canonical)
+    return canonical
+
+
+def _reset_allocation_counters(ledger_path: Path, now: datetime) -> None:
+    """显式修复旧口径误计的异常额度；不连接交易所，不启动完整轮次。"""
+    if not ledger_path.exists():
+        print("没有补仓台账，无需重置")
+        return
+    with ledger_path.with_suffix(".json.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        saved = json.loads(ledger_path.read_text(encoding="utf-8"))
+        previous = saved.get("abnormal_count", 0)
+        if type(previous) is not int or previous < 0:
+            raise ValueError("异常补仓计数损坏，拒绝重置")
+        if previous:
+            saved["counter_reset"] = {
+                "at": now.isoformat(), "previous_abnormal_count": previous,
+                "reason": "实际强平距离口径修正，显式重置异常计数",
+            }
+            saved["abnormal_count"] = 0
+            _write_json(ledger_path, saved)
+    print(f"异常补仓计数已重置：{previous} → 0；常规用量保留")
+
+
 async def _maintain_isolated_allocation(
     var: Any, *, underlying: str, mode: MarginModeStatus, dry_run: bool,
     observed_at: datetime, ledger_path: Path, audit_path: Path,
@@ -1813,6 +1953,19 @@ async def _maintain_isolated_allocation(
     """单腿最多发送一次目标总额请求；计数先落盘，异常不越过本分支。"""
     result: dict[str, object] = {"underlying": underlying, "level": "info", "attempted": False}
     lock = None
+    ledger_ready = False
+    charged = False
+    regular = abnormal = attempts = 0
+    last_success = None
+
+    def persist_counts():
+        """旧 attempts 仅供兼容展示；异常预占在成功回读后转为常规计数。"""
+        _write_json(ledger_path, {"date": today, "attempts": attempts,
+                    "regular_count": regular, "abnormal_count": abnormal,
+                    "last_success_at": last_success})
+        result.update(daily_attempts=attempts, daily_regular_count=regular,
+                      daily_abnormal_count=abnormal, last_success_at=last_success)
+
     try:
         if not mode.isolated:
             result["message"] = "全仓腿无独立保证金桶，由账户级保证金率兜底"
@@ -1841,7 +1994,7 @@ async def _maintain_isolated_allocation(
         lock = ledger_path.with_suffix(ledger_path.suffix + ".lock").open("a")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         today = observed_at.date().isoformat()
-        attempts = 0
+        saved = {}
         if ledger_path.exists():
             saved = json.loads(ledger_path.read_text(encoding="utf-8"))
             saved_date = datetime.strptime(saved["date"], "%Y-%m-%d").date()
@@ -1850,16 +2003,36 @@ async def _maintain_isolated_allocation(
                 raise ValueError("补仓计数台账损坏，禁止写接口")
             if saved_date == observed_at.date():
                 attempts = saved_attempts
-        result["daily_attempts"] = attempts
+        if saved:
+            # 旧版总次数无法区分成功失败，保留为常规用量，不凭空记异常。
+            for field in ("regular_count", "abnormal_count"):
+                value = saved.get(field, saved["attempts"] if field == "regular_count" else 0)
+                if type(value) is not int or value < 0:
+                    raise ValueError("补仓分类计数台账损坏，禁止写接口")
+            if saved_date == observed_at.date():
+                regular = saved.get("regular_count", attempts)
+                abnormal = saved.get("abnormal_count", 0)
+            last_success = saved.get("last_success_at")
+            if last_success is not None:
+                success_time = execution._guard_timestamp(last_success)
+                if success_time is None or success_time > observed_at:
+                    raise ValueError("上次成功补仓时间无效，禁止写接口")
+        ledger_ready = True
+        result.update(daily_attempts=attempts, daily_regular_count=regular,
+                      daily_abnormal_count=abnormal, last_success_at=last_success)
+        if abnormal >= MAX_DAILY_ALLOCATION_ERRORS:
+            result.update(level="critical", message="当日异常补仓次数已达上限，停止补仓")
+            return result
         current = await var.get_isolated_allocation(underlying)
         target = required_allocation(current["notional"], current["maintenance_margin"], target_distance)
         # 向上取整到美分，避免截断导致目标距离略低于阈值。
         target = target.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
-        initial = execution._decimal(current["initial_margin"], label="当前桶")
+        initial = _actual_allocation(current)
         distance = execution._decimal(current["distance"], label="当前强平距离")
         if initial < 0:
             raise ValueError("当前桶不得为负")
-        result.update(current_allocation=initial, target_allocation=target,
+        result.update(initial_margin=current["initial_margin"],
+                      current_allocation=initial, target_allocation=target,
                       distance=distance, target_distance=target_distance,
                       before_allocation=initial, before_distance=distance)
         if distance >= target_distance:
@@ -1867,9 +2040,11 @@ async def _maintain_isolated_allocation(
         elif target > cap:
             result.update(level="warning", message="目标桶超过 MAX_ALLOCATION_USD，拒绝补仓，保留平仓风控兜底")
         elif target <= initial:
-            result.update(level="warning", message="公式目标不高于当前桶，禁止减保证金，等待下一轮风控")
-        elif attempts >= limit:
-            result.update(level="warning", message="当日补仓次数已达上限")
+            raise ValueError("公式目标不高于当前桶，禁止减保证金，等待下一轮风控")
+        elif regular >= limit:
+            result.update(level="warning", message="当日常规补仓次数已达上限")
+        elif last_success and (observed_at - execution._guard_timestamp(last_success)).total_seconds() < MIN_ALLOCATION_INTERVAL_SECONDS:
+            result["message"] = "距离上次成功补仓不足 15 分钟，跳过常规补仓"
         else:
             available = await _available_account_margin(var)
             result["available_margin"] = available
@@ -1879,13 +2054,34 @@ async def _maintain_isolated_allocation(
             elif dry_run:
                 result["message"] = "dry-run：仅计算目标桶，不发送 POST"
             else:
-                # 请求失败、超时以及进程中断均消耗次数，禁止自动重试写请求。
-                _write_json(ledger_path, {"date": today, "attempts": attempts + 1})
-                result.update(attempted=True, daily_attempts=attempts + 1)
+                # 写请求前预占异常额度；转换等待超时单独释放，本轮不重发。
+                attempts += 1
+                abnormal += 1
+                charged = True
+                persist_counts()
+                result.update(attempted=True)
                 _append_audit(audit_path, {"timestamp": observed_at, "event": "allocation_attempt", **result})
                 result["post_succeeded"] = False
-                await var.set_isolated_allocation(underlying, target)
-                result["post_succeeded"] = True
+                conversion_id = await var.set_isolated_allocation(underlying, target)
+                result.update(post_succeeded=True, conversion_id=conversion_id)
+                try:
+                    conversion_status = await var.wait_allocation_conversion(
+                        conversion_id, timeout=float(os.environ.get(
+                            "ALLOCATION_CONVERSION_TIMEOUT_SECONDS", "30")),
+                    )
+                except TimeoutError:
+                    # 未确认不能认定失败，也不能回读旧仓位后误扣异常额度。
+                    abnormal -= 1
+                    persist_counts()
+                    result.update(level="warning", conversion_status="pending",
+                                  message="保证金转换确认超时，本轮不再重试，不计异常额度")
+                    return result
+                result["conversion_status"] = conversion_status
+                if conversion_status == "rejected":
+                    result["post_succeeded"] = False
+                    raise ValueError("保证金转换被拒绝（rejected）")
+                if conversion_status != "confirmed":
+                    raise ValueError(f"未知保证金转换状态：{conversion_status!r}")
                 # 目标总额幂等；本轮只 POST 一次，沿用成交确认的最终一致轮询。
                 for attempt in range(1, execution._FLAT_TRIES + 1):
                     result["readback_attempts"] = attempt
@@ -1893,15 +2089,27 @@ async def _maintain_isolated_allocation(
                         # 客户端每次调用均重新 GET /positions，无本地仓位缓存。
                         updated = await var.get_isolated_allocation(underlying)
                         new_distance = execution._decimal(updated["distance"], label="补仓后强平距离")
-                        new_allocation = execution._decimal(updated["initial_margin"], label="补仓后桶")
+                        new_allocation = _actual_allocation(updated)
                         result.update(distance=new_distance, current_allocation=new_allocation,
                                       after_distance=new_distance, after_allocation=new_allocation)
                         result.pop("readback_error", None)
-                        if new_distance >= target_distance:
-                            result["message"] = "POST 成功，补仓后回读确认强平距离达标"
-                            break
                     except Exception as exc:  # noqa: BLE001 暂时读仓失败也允许有限重读
                         result["readback_error"] = f"{type(exc).__name__}: {exc}"
+                    if "readback_error" not in result and new_distance >= target_distance:
+                        previous_success = last_success
+                        regular += 1
+                        abnormal -= 1
+                        last_success = observed_at.isoformat()
+                        try:
+                            persist_counts()
+                        except OSError:
+                            # 台账写失败不是读仓失败，不得重试迁移或重复扣减额度。
+                            regular -= 1
+                            abnormal += 1
+                            last_success = previous_success
+                            raise
+                        result["message"] = "POST 成功，补仓后回读确认强平距离达标"
+                        break
                     if attempt < execution._FLAT_TRIES:
                         await asyncio.sleep(execution._POLL_DELAY_S)
                 else:
@@ -1911,24 +2119,34 @@ async def _maintain_isolated_allocation(
                         f"POST 成功但回读校验失败，本轮不再重复 POST：{result['readback_error']}"
                     ))
     except Exception as exc:  # noqa: BLE001 补仓失败不得阻断平仓风控
+        if ledger_ready and not charged and not dry_run:
+            abnormal += 1
+            try:
+                persist_counts()
+            except OSError:
+                logging.getLogger(__name__).critical("异常补仓计数写入失败", exc_info=True)
         if result.get("post_succeeded"):
             prefix = "POST 成功但回读校验失败，本轮不再重复 POST"
         elif result.get("post_succeeded") is False:
             prefix = "POST 失败（含超时结果未知），补仓已停止，本轮不重试"
         else:
             prefix = "补仓已停止，本轮不重试"
-        result.update(level="critical" if result["attempted"] else "warning",
+        result.update(level="critical" if result["attempted"] or abnormal >= MAX_DAILY_ALLOCATION_ERRORS else "warning",
                       message=f"{prefix}：{type(exc).__name__}: {exc}")
     finally:
         if lock is not None:
             lock.close()
+        result.setdefault("daily_regular_count", regular)
+        result.setdefault("daily_abnormal_count", abnormal)
         message = str(result.get("message", "补仓未执行"))
-        detail = ""
+        detail = f"；今日常规 {regular}/{MAX_DAILY_ALLOCATION_ATTEMPTS}，异常 {abnormal}/{MAX_DAILY_ALLOCATION_ERRORS}"
         if "target_allocation" in result:
-            detail = (
+            detail += (
                 f"；当前桶 ${result['current_allocation']} / 目标桶 ${result['target_allocation']}"
                 f" / 距离 {result['distance']:.2%}"
             )
+        if "initial_margin" in result:
+            detail += f"；IM 公式要求值 ${result['initial_margin']}（不含 allocation 追加部分）"
         if "after_allocation" in result:
             detail += (
                 f"；补仓前后桶 ${result['before_allocation']} → ${result['after_allocation']}"
@@ -1968,6 +2186,10 @@ async def run_once(
     state_path: Path | None = None,
     audit_path: Path | None = None,
     switch_history_path: Path | None = None,
+    funding_recon_path: Path | None = None,
+    funding_samples_path: Path | None = None,
+    funding_deviation_threshold: Decimal = Decimal(".20"),
+    polling_mode: str | None = None,
 ) -> int:
     """先执行全部平仓风控，再按长休市边界原子切换结构。"""
     kill_switch_path = DEFAULT_KILL_SWITCH if kill_switch_path is None else Path(kill_switch_path)
@@ -2032,6 +2254,8 @@ async def run_once(
         "未进入自动切换判定" if auto_switch else "自动切换已由 --no-auto-switch 关闭"
     )
     result_code = 1
+    round_status = "blocked"
+    close_attempted = False
     positions: dict[str, Position] = {}
     prices: dict[str, Decimal | None] = {
         leg.underlying: None for leg in configured_structure.legs
@@ -2070,9 +2294,11 @@ async def run_once(
 
     def persist_state(status: str, message: str, failures: int) -> None:
         """写状态时始终保留每日计数和不可自动清除的 INCIDENT。"""
+        nonlocal round_status
         effective_status = (
             "incident" if auto_open_incident or switch_incident else status
         )
+        round_status = effective_status
         _write_json(
             state_path,
             {**_state_payload(
@@ -2635,7 +2861,7 @@ async def run_once(
                 allocation_results[leg.underlying] = await _maintain_isolated_allocation(
                     var, underlying=leg.underlying, mode=mode, dry_run=dry_run,
                     observed_at=observed_at,
-                    ledger_path=state_path.with_suffix(state_path.suffix + ".allocation.json"),
+                    ledger_path=_allocation_state_path(state_path),
                     audit_path=audit_path,
                 )
                 allocation = allocation_results[leg.underlying]
@@ -2722,6 +2948,7 @@ async def run_once(
             switch_recorder = _SwitchTradeRecorder(var)
             switch_stage = "close"
             switch_phase_started = time.perf_counter()
+            close_attempted = True
             flatten_result = await _flatten(
                 switch_recorder,
                 structure=current_structure,
@@ -3032,6 +3259,7 @@ async def run_once(
         else:
             auto_open_conclusion = f"平仓/风控检查优先命中：{reason}"
             print(f"守护进程命中风控：{reason}")
+            close_attempted = True
             flatten_result = await _flatten(
                 var,
                 structure=selected,
@@ -3167,8 +3395,28 @@ async def run_once(
                         status="未检查",
                     )
                 )
+        from tools.swap_carry_funding_recon import reconcile
+        try:
+            funding_recon = await reconcile(
+                var, samples_path=funding_samples_path or data_dir() / "swap_carry_samples.jsonl",
+                output_path=funding_recon_path or data_dir() / "swap_carry_funding_recon.jsonl",
+                deviation_threshold=funding_deviation_threshold,
+            )
+            for record in funding_recon["records"]:
+                _append_audit(audit_path, {"timestamp": observed_at, "event": "funding_reconciliation", **record})
+                if record["level"] == "warning":
+                    logging.getLogger(__name__).warning("XAUS 资金费对账：%s", record["conclusion"])
+                    notify("XAUS 资金费对账告警", record["conclusion"])
+        except Exception as exc:  # noqa: BLE001 对账失败不能阻断平仓风控或心跳
+            funding_recon = {"level": "warning", "conclusion": f"资金费对账读取失败：{type(exc).__name__}: {exc}"}
+        print(f"XAUS 资金费对账：{funding_recon['conclusion']}")
         heartbeat = {
             "timestamp": observed_at.isoformat(),
+            "last_seen": observed_at.isoformat(),
+            "last_full_round_at": observed_at.isoformat(),
+            "status": round_status,
+            "close_attempted": close_attempted,
+            "funding_reconciliation": funding_recon,
             "structure": selected.name,
             "conclusion": conclusion,
             "isolated_allocation": allocation_results,
@@ -3236,6 +3484,15 @@ async def run_once(
             "session_expires_at": session_expires_at,
             "session_hours_left": session_hours_left,
         }
+        critical_reasons: list[str] = []
+        next_mode, next_full = _polling_plan(
+            heartbeat, now=observed_at, kill_switch_path=kill_switch_path,
+            switch_lead_time=switch_lead_time, critical_reasons=critical_reasons,
+        )
+        heartbeat.update(
+            polling_mode=next_mode, critical_reasons=critical_reasons, skipped_reason=None,
+            next_full_round_at=next_full.isoformat(),
+        )
         _write_json(heartbeat_path, heartbeat)
         _append_audit(
             audit_path,
@@ -3250,11 +3507,35 @@ async def run_once(
 
 
 async def _main(args: argparse.Namespace) -> int:
-    """构造真实客户端，执行一轮并始终释放 HTTP 会话。"""
+    """先做零网络的本地轮询判定，需要完整轮次才创建交易所客户端。"""
+    now = datetime.now(timezone.utc)
+    ledger_path = _allocation_state_path(args.state)
+    if args.reset_allocation_counters:
+        if args.dry_run:
+            print("dry-run：不重置异常补仓计数，不发送 POST")
+            return 0
+        _reset_allocation_counters(ledger_path, now)
+        return 0
+    heartbeat = execution._read_guard_json(args.heartbeat)
+    critical_reasons: list[str] = []
+    mode, next_full = _polling_plan(
+        heartbeat, now=now, kill_switch_path=args.kill_switch,
+        switch_lead_time=timedelta(minutes=float(args.switch_lead_minutes)),
+        critical_reasons=critical_reasons,
+    )
+    if mode == "normal" and now < next_full:
+        # 保留上轮风险快照与完整轮次时间，旧面板继续用 timestamp 判断存活。
+        _write_json(args.heartbeat, {
+            **heartbeat, "timestamp": now.isoformat(), "last_seen": now.isoformat(),
+            "polling_mode": mode, "critical_reasons": critical_reasons, "skipped_reason": "距上次完整轮次不足普通轮询间隔",
+            "next_full_round_at": next_full.isoformat(),
+        })
+        return 0
     var = await execution._load()
     try:
         return await run_once(
             var,
+            polling_mode=mode,
             structure=args.structure,
             dry_run=args.dry_run,
             auto_open=args.auto_open,
@@ -3267,6 +3548,9 @@ async def _main(args: argparse.Namespace) -> int:
             state_path=args.state,
             audit_path=args.audit_log,
             switch_history_path=args.switch_history,
+            funding_recon_path=args.funding_recon,
+            funding_samples_path=args.funding_samples,
+            funding_deviation_threshold=args.funding_deviation_threshold,
         )
     finally:
         await var.close()
@@ -3327,6 +3611,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--kill-switch", type=Path, default=DEFAULT_KILL_SWITCH)
     parser.add_argument("--heartbeat", type=Path, default=DEFAULT_HEARTBEAT)
+    parser.add_argument("--funding-recon", type=Path, help="资金费对账 JSONL 路径")
+    parser.add_argument("--funding-samples", type=Path, help="资金费采样 JSONL 路径")
+    parser.add_argument("--funding-deviation-threshold", type=Decimal, default=Decimal(".20"),
+                        help="偏差比例告警阈值，默认 0.20；周五/周一三日模式按三倍预测校验")
+    parser.add_argument("--reset-allocation-counters", action="store_true",
+                        help="仅本地重置异常补仓计数并退出，保留常规用量和重置记录")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--audit-log", type=Path, default=DEFAULT_AUDIT_LOG)
     parser.add_argument("--switch-history", type=Path, default=DEFAULT_SWITCH_HISTORY,
