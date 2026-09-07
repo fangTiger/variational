@@ -19,6 +19,9 @@ from tools import run_swap_carry_guard as guard
 from tools.show_switch_history import load_switch_history
 
 
+from engine import swap_carry_cost as cost
+
+
 NAME = "Swap Carry（XAUS/XAU）"
 UNKNOWN_STRUCTURE = "结构未知（守护心跳不可用）"
 IGNORED_EXTERNAL_POSITIONS = frozenset({"BTC"})
@@ -709,6 +712,34 @@ async def _collect(
     )
 
 
+def _cost_metrics(path: Path, reconciliation_path: Path):
+    """只读成本区块独立降级，不拖垮仓位卡片。"""
+    rows, error = cost.load(path)
+    if error:
+        return [Metric("成本明细", error, "warn"), Metric("未解释残差", "不可用", "warn")], []
+    totals = cost.summarize(rows)
+    metrics = [Metric("成本明细 " + label, f"{totals[kind]:+.2f} USD")
+               for kind, label in cost.LABELS.items()]
+    metrics.append(Metric("成本合计", f"{totals['total']:+.2f} USD"))
+    report, error = cost.read_report(rows, reconciliation_path)
+    if error:
+        metrics.append(Metric("未解释残差", error, "warn"))
+        return metrics, []
+    metrics.extend([
+        Metric("成本口径", report["basis_note"]),
+        Metric("成本对账区间", f"{report['start_ts']} → {report['end_ts']}"),
+        Metric("区间成本合计", f"{report['total']:+.2f} USD"),
+        Metric("其它策略（含 BTC）", f"{report['other_strategies']:+.2f} USD"),
+        Metric("平台盈亏滑点抵销", f"{report['spread_embedded_adjustment']:+.2f} USD"),
+        Metric("未解释残差", f"{report['residual']:+.2f} USD", "warn" if report['warning'] else "normal"),
+    ])
+    alerts = [PanelAlert(key="swap_carry_cost_residual", level="warning",
+                         title=f"Swap carry 未解释残差 {report['residual']:+.2f} USD 超过阈值",
+                         action="核对流水覆盖、成交滑点、其它策略及权益快照口径")
+              ] if report['warning'] else []
+    return metrics, alerts
+
+
 def collect(
     *,
     client: Any | None = None,
@@ -716,10 +747,14 @@ def collect(
     state_path: Path = carry.SWAP_CARRY_GUARD_STATE,
     switch_history_path: Path = guard.DEFAULT_SWITCH_HISTORY,
     now: datetime | None = None,
+    cost_ledger_path: Path = cost.DEFAULT_PATH,
+    cost_reconciliation_path: Path | None = None,
 ) -> SystemStatus:
     """同步 provider 入口；任何整轮失败都返回 error 卡片。"""
     observed_at = now or datetime.now(timezone.utc)
     owned_client = client is None
+    cost_metrics, cost_alerts = _cost_metrics(
+        cost_ledger_path, cost_reconciliation_path or Path(cost_ledger_path).with_name(cost.DEFAULT_RECON_PATH.name))
 
     async def run() -> SystemStatus:
         nonlocal client
@@ -746,6 +781,8 @@ def collect(
             raise ValueError("now 必须包含时区")
         status = asyncio.run(run())
         metric, alert = _rehearsal_metric(heartbeat_path)
+        status.metrics.extend(cost_metrics)
+        status.alerts.extend(cost_alerts)
         status.metrics.append(metric)
         if alert:
             status.alerts.append(alert)
@@ -768,11 +805,12 @@ def collect(
             alive=None,
             summary="采集失败",
             metrics=[
+                *cost_metrics,
                 session_metric,
                 rehearsal_metric,
                 _last_switch_metric(switch_history_path),
                 _next_switch_metric(None),
             ],
             error=str(exc),
-            alerts=alerts,
+            alerts=[*alerts, *cost_alerts],
         )

@@ -671,12 +671,30 @@ async def _accept_quote(var: Any, quote: PreparedQuote, *, reduce_only: bool) ->
     quote_id = quote.payload.get("quote_id")
     if not isinstance(quote_id, str) or not quote_id:
         raise ValueError(f"{quote.leg.underlying} 报价缺少 quote_id，拒绝 accept")
-    return await var.accept_quote(
+    result = await var.accept_quote(
         quote_id=quote_id,
         side=quote.side.value.lower(),
         max_slippage=float(getattr(var, "_max_slippage", 0.01)),
         is_reduce_only=reduce_only,
     )
+    # 记账失败不得把已成交误报成下单失败，从而触发错误的重试或回滚。
+    from engine import swap_carry_cost as cost
+    import logging
+    try:
+        rfq_id = result.get("rfq_id") if isinstance(result, Mapping) else getattr(result, "rfq_id", None)
+        parent = getattr(var, "cost_parent_id", None)
+        fill = dict(status="succeeded", market=quote.leg.underlying,
+                    side=quote.side.value.lower(), rfq_id=rfq_id,
+                    filled_quantity=str(quote.qty), reduce_only=reduce_only,
+                    execution_price=str(_quote_price(quote.payload, quote.side)),
+                    quote_mid=str((_decimal(quote.payload.get("bid"), label="bid", positive=True)
+                                  + _decimal(quote.payload.get("ask"), label="ask", positive=True)) / 2))
+        cost.append(cost.ACTIVE_PATH.get(), cost.fill_events(
+            fill, datetime.now(timezone.utc).isoformat(),
+            parent_id=parent if isinstance(parent, str) else None))
+    except Exception as exc:  # noqa: BLE001 成交结果优先，成本缺口必须留告警
+        logging.getLogger(__name__).warning("成交已成功，但成本台账写入失败：%s", exc)
+    return result
 
 
 async def _confirm_first_leg_qty(
@@ -1415,7 +1433,9 @@ async def cmd_close(
 
 async def _main(args: argparse.Namespace) -> int:
     """构造客户端并分发命令，始终释放 HTTP 会话。"""
+    from engine import swap_carry_cost as cost
     var = await _load()
+    token = cost.ACTIVE_PATH.set(getattr(args, "cost_ledger", None) or cost.DEFAULT_PATH)
     try:
         if args.cmd == "status":
             await cmd_status(var, structure=args.structure)
@@ -1436,11 +1456,13 @@ async def _main(args: argparse.Namespace) -> int:
             )
         return 0
     finally:
+        cost.ACTIVE_PATH.reset(token)
         await var.close()
 
 
 def _add_execution_flags(parser: argparse.ArgumentParser) -> None:
     """为可能成交的子命令添加统一人工确认参数。"""
+    parser.add_argument("--cost-ledger", type=Path, help="逐笔成本台账路径")
     parser.add_argument(
         "--yes",
         action="store_true",

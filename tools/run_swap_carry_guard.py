@@ -14,6 +14,7 @@ ensure_ssl_cert()
 import fcntl  # noqa: E402
 import logging  # noqa: E402
 from functools import wraps  # noqa: E402
+from engine import swap_carry_cost as cost
 from engine.isolated_allocation import required_allocation  # noqa: E402
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
@@ -449,6 +450,11 @@ def _append_audit(path: Path, payload: Mapping[str, object]) -> None:
         handle.write(
             json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n"
         )
+    if "close_phase" in payload and "started_at" in payload and payload.get("kind") != "rehearsal":
+        try:
+            cost.record_switch(cost.ACTIVE_PATH.get(), payload)
+        except Exception as exc:  # noqa: BLE001 审计原件已保存，后续扫描可重试
+            logging.getLogger(__name__).warning("切换成本记账失败：%s", exc)
 
 
 def _account_quantities(payload: object) -> dict[str, Decimal]:
@@ -2082,6 +2088,10 @@ async def _maintain_isolated_allocation(
                     raise ValueError("保证金转换被拒绝（rejected）")
                 if conversion_status != "confirmed":
                     raise ValueError(f"未知保证金转换状态：{conversion_status!r}")
+                try:
+                    cost.record_allocation(cost.ACTIVE_PATH.get(), observed_at.isoformat(), underlying, result)
+                except Exception as exc:  # noqa: BLE001 不干扰已确认转换的读回检查
+                    logging.getLogger(__name__).warning("保证金转换成本记账失败：%s", exc)
                 # 目标总额幂等；本轮只 POST 一次，沿用成交确认的最终一致轮询。
                 for attempt in range(1, execution._FLAT_TRIES + 1):
                     result["readback_attempts"] = attempt
@@ -2169,6 +2179,7 @@ async def _maintain_isolated_allocation(
     return result
 
 
+@cost.ledger_session
 @_dry_run_http_guard
 async def run_once(
     var: Any,
@@ -2186,6 +2197,8 @@ async def run_once(
     state_path: Path | None = None,
     audit_path: Path | None = None,
     switch_history_path: Path | None = None,
+    cost_ledger_path: Path | None = None,
+    cost_reconciliation_path: Path | None = None,
     funding_recon_path: Path | None = None,
     funding_samples_path: Path | None = None,
     funding_deviation_threshold: Decimal = Decimal(".20"),
@@ -2946,6 +2959,7 @@ async def run_once(
                 metadata=metadata,
             )
             switch_recorder = _SwitchTradeRecorder(var)
+            switch_recorder.cost_parent_id = "switch:" + str(switch_record["started_at"])
             switch_stage = "close"
             switch_phase_started = time.perf_counter()
             close_attempted = True
@@ -3395,6 +3409,27 @@ async def run_once(
                         status="未检查",
                     )
                 )
+        # 成本采集失败只降级，绝不阻断平仓风控。只读面板不会触发这些写入。
+        cost_status = "dry-run：不写成本台账"
+        if not dry_run:
+            try:
+                ledger_path = cost.ACTIVE_PATH.get()
+                await cost.scan_transfers(var, ledger_path)
+                from tools.show_switch_history import load_switch_history
+                history, history_error = load_switch_history(switch_history_path)
+                if history_error:
+                    raise ValueError(history_error)
+                for item in history:
+                    cost.record_switch(ledger_path, item)
+                report_path = cost_reconciliation_path or ledger_path.with_name(cost.DEFAULT_RECON_PATH.name)
+                await cost.capture_reconciliation(var, ledger_path, report_path)
+                report, report_error = cost.read_report(cost.load(ledger_path)[0], report_path)
+                cost_status = report_error or f"未解释残差 {report['residual']:+.2f} USD"
+                if report and report["warning"]:
+                    logging.getLogger(__name__).warning("成本对账告警：%s", cost_status)
+            except Exception as exc:  # noqa: BLE001 缺失来源不能补零造平账
+                cost_status = f"成本对账不可用：{type(exc).__name__}: {exc}"
+                logging.getLogger(__name__).warning("%s", cost_status)
         from tools.swap_carry_funding_recon import reconcile
         try:
             funding_recon = await reconcile(
@@ -3417,6 +3452,7 @@ async def run_once(
             "status": round_status,
             "close_attempted": close_attempted,
             "funding_reconciliation": funding_recon,
+            "cost_reconciliation": cost_status,
             "structure": selected.name,
             "conclusion": conclusion,
             "isolated_allocation": allocation_results,
@@ -3548,6 +3584,8 @@ async def _main(args: argparse.Namespace) -> int:
             state_path=args.state,
             audit_path=args.audit_log,
             switch_history_path=args.switch_history,
+            cost_ledger_path=args.cost_ledger,
+            cost_reconciliation_path=args.cost_reconciliation,
             funding_recon_path=args.funding_recon,
             funding_samples_path=args.funding_samples,
             funding_deviation_threshold=args.funding_deviation_threshold,
@@ -3611,6 +3649,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--kill-switch", type=Path, default=DEFAULT_KILL_SWITCH)
     parser.add_argument("--heartbeat", type=Path, default=DEFAULT_HEARTBEAT)
+    parser.add_argument("--cost-ledger", type=Path, help="逐笔成本台账路径")
+    parser.add_argument("--cost-reconciliation", type=Path, help="成本对账证据路径")
     parser.add_argument("--funding-recon", type=Path, help="资金费对账 JSONL 路径")
     parser.add_argument("--funding-samples", type=Path, help="资金费采样 JSONL 路径")
     parser.add_argument("--funding-deviation-threshold", type=Decimal, default=Decimal(".20"),
