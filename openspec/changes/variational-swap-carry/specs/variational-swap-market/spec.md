@@ -127,3 +127,18 @@ SHALL NOT 使用子串匹配。
 - **WHEN** 账户同时持有 XAU 永续与 XAUS swap，查询 `underlying = "XAU"`
 - **THEN** 只返回 XAU 永续持仓
 - **AND** 不返回也不合并 XAUS 持仓
+
+### Requirement: 下一次资金费缺失时有界降级
+当 `upcoming` 为 null 或缺失时，系统 SHALL 使用 `latest_applied`，前提是
+其 `apply_time` 不在未来且距观察时点不超过 `SWAP_FUNDING_MAX_STALENESS`
+（默认四天）。返回快照 SHALL 标注 `is_stale=true`、`stale_reason` 与
+`source=latest_applied`，保留历史计提时间，覆盖天数保持未知。
+
+#### Scenario: 开市后尚未发布下一次计提
+- **WHEN** `upcoming` 缺失且最近计提在四天内（含边界）
+- **THEN** 返回可用于 carry 与切换决策的降级费率
+- **AND** 正常 upcoming 返回 `is_stale=false`、`source=upcoming`
+
+#### Scenario: 无可用历史数据
+- **WHEN** 历史数据缺失、必要字段非法、计提时间在未来或超过四天
+- **THEN** 抛出异常，不把读取失败解释为零费率

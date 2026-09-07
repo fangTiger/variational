@@ -29,6 +29,8 @@ from adapters.base import ExchangeAdapter, MarketPrice, Position, PositionPnl, S
 
 BASE_URL = "https://omni.variational.io/api"
 DEFAULT_TIMEOUT = 30.0
+# 未发布下一次计提时，最多使用四天内的最近结算费率。
+SWAP_FUNDING_MAX_STALENESS = timedelta(days=4)
 # TLS 指纹伪装目标（curl_cffi）。"chrome" 取最新 Chrome 指纹；可用 VARIATIONAL_IMPERSONATE 覆盖。
 DEFAULT_IMPERSONATE = "chrome"
 # 默认 UA 对齐常见 Chrome。⚠️ Cloudflare 的 cf_clearance 绑定「获取它时的 UA」，
@@ -131,12 +133,19 @@ class SwapFundingPeriod:
 
 @dataclass(frozen=True)
 class SwapFundingSnapshot:
-    """Swap 下一次与最近一次资金费观测。"""
+    """Swap 下一次与最近一次资金费观测。
+
+    未发布 upcoming 时，该字段承载有界降级的最近计提费率；调用方须通过
+    source、is_stale 和 stale_reason 区分来源，不能把它当作新的计提预告。
+    """
 
     upcoming: SwapFundingPeriod
     latest_applied: SwapFundingPeriod
     observed_at: datetime
     warnings: tuple[str, ...]
+    is_stale: bool = False
+    stale_reason: str | None = None
+    source: str = "upcoming"
 
 
 @dataclass
@@ -339,30 +348,49 @@ class VariationalClient(ExchangeAdapter):
             raise ValueError("Variational swap 资金费响应不是对象")
         upcoming_raw = payload.get("upcoming")
         latest_raw = payload.get("latest_applied")
-        if not isinstance(upcoming_raw, dict):
-            raise ValueError("Variational swap 资金费响应缺少 upcoming")
+        if upcoming_raw is not None and not isinstance(upcoming_raw, dict):
+            raise ValueError("Variational swap upcoming 不是对象")
         if not isinstance(latest_raw, dict):
             raise ValueError("Variational swap 资金费响应缺少 latest_applied")
 
         observed_at = datetime.now(timezone.utc)
-        upcoming_time = _parse_utc_datetime(
-            upcoming_raw.get("apply_time"),
-            label="upcoming.apply_time",
-        )
         latest_time = _parse_utc_datetime(
             latest_raw.get("apply_time"),
             label="latest_applied.apply_time",
         )
-        coverage_days = (upcoming_time.date() - latest_time.date()).days
-        if coverage_days <= 0:
-            raise ValueError("swap apply_time 必须晚于上一次 apply_time 的日历日期")
-
         latest = _parse_swap_funding_period(
             latest_raw,
             apply_time=latest_time,
             coverage_days=None,
             observed_at=observed_at,
         )
+        if upcoming_raw is None:
+            age = observed_at - latest_time
+            if age < timedelta(0) or age > SWAP_FUNDING_MAX_STALENESS:
+                raise ValueError(
+                    "Variational swap latest_applied.apply_time 超过陈旧上限"
+                    "或位于未来，费率不可用"
+                )
+            stale_reason = "upcoming 未发布，降级使用陈旧上限内的 latest_applied"
+            # 兼容现有费率消费路径；保留历史计提时间且不推断覆盖天数。
+            return SwapFundingSnapshot(
+                upcoming=latest,
+                latest_applied=latest,
+                observed_at=observed_at,
+                warnings=(stale_reason,),
+                is_stale=True,
+                stale_reason=stale_reason,
+                source="latest_applied",
+            )
+
+        upcoming_time = _parse_utc_datetime(
+            upcoming_raw.get("apply_time"),
+            label="upcoming.apply_time",
+        )
+        coverage_days = (upcoming_time.date() - latest_time.date()).days
+        if coverage_days <= 0:
+            raise ValueError("swap apply_time 必须晚于上一次 apply_time 的日历日期")
+
         upcoming = _parse_swap_funding_period(
             upcoming_raw,
             apply_time=upcoming_time,

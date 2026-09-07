@@ -1099,13 +1099,26 @@ async def _settled_funding_by_leg(
 async def cmd_status(
     var: Any,
     *,
-    structure: CarryStructure | str = DEFAULT_STRUCTURE,
+    structure: CarryStructure | str | None = None,
     now: datetime | None = None,
 ) -> None:
     """输出结构、仓位、强平、carry 与实际已结算资金费快照。"""
-    selected = resolve_structure(structure)
+    selected = _current_structure(structure)
     observed_at = now or datetime.now(timezone.utc)
     _print_guard_status(observed_at)
+    if selected is None:
+        print("swap carry 状态：结构未知（守护心跳不可用）")
+        print("请检查守护进程是否在运行；可用 --structure 显式指定结构。")
+        payload = await var.get_positions()
+        items = payload.get("positions") if isinstance(payload, Mapping) else payload
+        if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+            raise ValueError("/positions 响应缺少持仓列表")
+        print("全部实际持仓（/positions 原始记录）：")
+        for item in items:
+            print(json.dumps(item, ensure_ascii=False, default=str))
+        if not items:
+            print("无持仓")
+        return
     positions = await _get_positions(var, selected)
     net = _positions_net_delta(selected, positions)
     print(f"swap carry 状态：结构={selected.name}")
@@ -1211,6 +1224,22 @@ def _read_guard_json(path: Path) -> Mapping[str, Any] | None:
     return payload if isinstance(payload, Mapping) else None
 
 
+def _current_structure(
+    explicit: CarryStructure | str | None,
+) -> CarryStructure | None:
+    """人工指定优先，否则只接受心跳中的合法结构，不推测默认结构。"""
+    if explicit is not None:
+        return resolve_structure(explicit)
+    heartbeat = _read_guard_json(SWAP_CARRY_GUARD_HEARTBEAT)
+    value = heartbeat.get("structure") if heartbeat is not None else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return resolve_structure(value)
+    except ValueError:
+        return None
+
+
 def _guard_timestamp(value: object) -> datetime | None:
     """解析守护心跳 UTC 时间戳。"""
     if not isinstance(value, str) or not value.strip():
@@ -1286,13 +1315,18 @@ async def _await_flat(
 async def cmd_close(
     var: Any,
     *,
-    structure: CarryStructure | str = DEFAULT_STRUCTURE,
+    structure: CarryStructure | str | None = None,
     yes: bool = False,
     dry_run: bool = False,
     now: datetime | None = None,
 ) -> None:
     """按结构顺序平全部腿；XAUS 时段元数据异常不阻挡减仓尝试。"""
-    selected = resolve_structure(structure)
+    selected = _current_structure(structure)
+    if selected is None:
+        raise SystemExit(
+            "拒绝平仓：结构未知（守护心跳不可用）。"
+            "请检查守护进程是否在运行，或显式指定 --structure 后重试。"
+        )
     schedule: SwapTradingSchedule | None = None
     market_status: str | None = None
     if selected.has_xaus:
@@ -1413,13 +1447,21 @@ def _add_execution_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_structure_flag(parser: argparse.ArgumentParser) -> None:
+def _add_structure_flag(
+    parser: argparse.ArgumentParser,
+    *,
+    default: str | None = None,
+) -> None:
     """为命令添加统一具名结构选择。"""
     parser.add_argument(
         "--structure",
         choices=tuple(STRUCTURES),
-        default=DEFAULT_STRUCTURE.name,
-        help=f"carry 结构，默认 {DEFAULT_STRUCTURE.name}",
+        default=default,
+        help=(
+            f"carry 结构，默认 {default}"
+            if default
+            else "carry 结构，缺省读取守护心跳；显式指定优先"
+        ),
     )
 
 
@@ -1434,7 +1476,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_structure_flag(status_parser)
     open_parser = subparsers.add_parser("open", help="按结构顺序开仓")
-    _add_structure_flag(open_parser)
+    _add_structure_flag(open_parser, default=DEFAULT_STRUCTURE.name)
     open_parser.add_argument(
         "--notional",
         type=Decimal,

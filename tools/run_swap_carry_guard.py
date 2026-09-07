@@ -739,7 +739,7 @@ def _funding_availability_by_leg(
     target_structure: execution.CarryStructure | None,
     target_reason: str,
 ) -> dict[str, FundingAvailability]:
-    """按结构的预期持有期判定费率；合法零值仍由 API 原样读取。"""
+    """仅用于入场和切换目标校验；不得用于已持仓的出场评估。"""
     if target_structure is None:
         usable = False
         detail = f"无法判定当前时段目标结构：{target_reason}"
@@ -2219,40 +2219,33 @@ async def run_once(
                             f"{schedule.time_until_close} 后开始"
                         )
 
-        # 优先级 5：只有全部腿费率在当前时段有效时才更新退出连续计数。
+        # 优先级 5：持仓出场只要求费率可读，与入场的时段目标校验独立。
         if reason is None and not all_flat:
-            unavailable_reason = _unusable_funding_reason(funding_availability)
-            if unavailable_reason is not None:
+            try:
+                rates = await execution._load_funding_rates(var, selected)
+                net_carry = execution._weighted_net_carry(selected, rates)
+            except Exception as exc:  # noqa: BLE001 读取失败必须保持原计数
                 exit_carry_observation = (
-                    f"费率不可用，本轮退出 carry 不计数也不清零："
-                    f"{unavailable_reason}"
+                    "退出 carry 读取失败，本轮不计数也不清零："
+                    f"{type(exc).__name__}: {exc}"
                 )
             else:
-                try:
-                    rates = await execution._load_funding_rates(var, selected)
-                    net_carry = execution._weighted_net_carry(selected, rates)
-                except Exception as exc:  # noqa: BLE001 读取失败必须保持原计数
+                if net_carry <= EXIT_CARRY_ANNUAL:
+                    exit_carry_rounds += 1
                     exit_carry_observation = (
-                        "退出 carry 读取失败，本轮不计数也不清零："
-                        f"{type(exc).__name__}: {exc}"
+                        f"净 carry {net_carry:.4%} 不高于退出阈值 "
+                        f"{EXIT_CARRY_ANNUAL:.4%}，连续第 "
+                        f"{exit_carry_rounds}/{EXIT_CARRY_CONSECUTIVE_ROUNDS} 轮"
                     )
+                    if exit_carry_rounds >= EXIT_CARRY_CONSECUTIVE_ROUNDS:
+                        reason = exit_carry_observation
+                        state_status = "exit_carry_triggered"
                 else:
-                    if net_carry <= EXIT_CARRY_ANNUAL:
-                        exit_carry_rounds += 1
-                        exit_carry_observation = (
-                            f"净 carry {net_carry:.4%} 不高于退出阈值 "
-                            f"{EXIT_CARRY_ANNUAL:.4%}，连续第 "
-                            f"{exit_carry_rounds}/{EXIT_CARRY_CONSECUTIVE_ROUNDS} 轮"
-                        )
-                        if exit_carry_rounds >= EXIT_CARRY_CONSECUTIVE_ROUNDS:
-                            reason = exit_carry_observation
-                            state_status = "exit_carry_triggered"
-                    else:
-                        exit_carry_rounds = 0
-                        exit_carry_observation = (
-                            f"净 carry {net_carry:.4%} 高于退出阈值 "
-                            f"{EXIT_CARRY_ANNUAL:.4%}，连续计数已清零"
-                        )
+                    exit_carry_rounds = 0
+                    exit_carry_observation = (
+                        f"净 carry {net_carry:.4%} 高于退出阈值 "
+                        f"{EXIT_CARRY_ANNUAL:.4%}，连续计数已清零"
+                    )
             _append_audit(
                 audit_path,
                 {

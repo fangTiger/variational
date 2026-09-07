@@ -317,3 +317,82 @@ def test_coverage_days_is_backward_looking_and_cannot_settle_weekend_question() 
         "周五的 1 天只说明距上次结算过了 1 个日历天，"
         "不能据此断定周末两天不由周五这次承担"
     )
+
+
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("age_seconds", [2 * 86400, 4 * 86400])
+def test_missing_upcoming_uses_bounded_latest(monkeypatch, missing, age_seconds):
+    """未发布下次费率时可使用上限内旧值，且不得伪造计提时间。"""
+    from datetime import timedelta
+    from adapters import variational_client as module
+
+    now = datetime(2026, 9, 7, 0, 33, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(module, "datetime", Clock)
+    latest = {**SWAP_FUNDING["latest_applied"],
+              "apply_time": (now - timedelta(seconds=age_seconds)).isoformat()}
+    payload = {"latest_applied": latest}
+    if not missing:
+        payload["upcoming"] = None
+    client, _ = _strict_client(gets={"/funding/swap?underlying=XAUS": payload})
+    result = asyncio.run(client.get_swap_funding("XAUS"))
+    assert result.is_stale is True
+    assert result.source == "latest_applied"
+    assert result.stale_reason
+    assert result.upcoming == result.latest_applied
+    assert result.upcoming.long_rate.coverage_days is None
+    assert result.upcoming.long_rate.apply_time == now - timedelta(seconds=age_seconds)
+    assert result.upcoming.long_rate.normalized_annual_rate == Decimal("-0.056914")
+
+
+@pytest.mark.parametrize("latest", [None, {}, {**SWAP_FUNDING["latest_applied"],
+                                               "apply_time": "2000-01-01T00:00:00Z"}])
+def test_missing_upcoming_without_usable_latest_raises(latest):
+    """无数据、字段残缺或历史值过期均不可用于决策。"""
+    client, _ = _strict_client(gets={"/funding/swap?underlying=XAUS": {
+        "upcoming": None, "latest_applied": latest}})
+    with pytest.raises(ValueError):
+        asyncio.run(client.get_swap_funding("XAUS"))
+
+
+def test_normal_upcoming_is_not_stale():
+    """正常预测费率必须明确区分于降级数据。"""
+    client, _ = _strict_client(gets={"/funding/swap?underlying=XAUS": SWAP_FUNDING})
+    result = asyncio.run(client.get_swap_funding("XAUS"))
+    assert result.is_stale is False
+    assert result.source == "upcoming"
+    assert result.stale_reason is None
+
+
+@pytest.mark.parametrize("offset_seconds", [-1, 4 * 86400 + 1])
+def test_latest_fallback_rejects_future_or_one_second_over_limit(monkeypatch, offset_seconds):
+    """严格检查四天边界，未来时间也不能伪装成新鲜历史值。"""
+    from datetime import timedelta
+    from adapters import variational_client as module
+
+    now = datetime(2026, 9, 7, 0, 33, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(module, "datetime", Clock)
+    client, _ = _strict_client(gets={"/funding/swap?underlying=XAUS": {
+        "upcoming": None,
+        "latest_applied": {**SWAP_FUNDING["latest_applied"],
+                           "apply_time": (now - timedelta(seconds=offset_seconds)).isoformat()}}})
+    with pytest.raises(ValueError, match="陈旧上限"):
+        asyncio.run(client.get_swap_funding("XAUS"))
+
+
+def test_swap_funding_both_periods_absent_raises():
+    """两个字段均未返回时必须明确失败。"""
+    client, _ = _strict_client(gets={"/funding/swap?underlying=XAUS": {}})
+    with pytest.raises(ValueError, match="latest_applied"):
+        asyncio.run(client.get_swap_funding("XAUS"))

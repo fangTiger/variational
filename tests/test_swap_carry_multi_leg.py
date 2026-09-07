@@ -365,8 +365,8 @@ def test_named_structures_and_cli_defaults() -> None:
         Decimal("2"),
     ]
     assert carry.build_parser().parse_args(["open"]).structure == "XAU_XAUT"
-    assert carry.build_parser().parse_args(["status"]).structure == "XAU_XAUT"
-    assert carry.build_parser().parse_args(["close"]).structure == "XAU_XAUT"
+    assert carry.build_parser().parse_args(["status"]).structure is None
+    assert carry.build_parser().parse_args(["close"]).structure is None
     assert guard.build_parser().parse_args(["--once"]).structure == "XAU_XAUT"
 
 
@@ -590,8 +590,9 @@ def test_guard_rejects_entry_when_market_status_conflicts_with_sessions(
     ].read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("readable", [False, True])
 def test_guard_xau_xaut_open_position_has_no_weekend_close_logic(
-    tmp_path: Path,
+    tmp_path: Path, readable: bool,
 ) -> None:
     """无 XAUS 的现有持仓不得触发 pre-close 或周末平仓检查。"""
     from tools import hedge_swap_carry as carry
@@ -610,6 +611,7 @@ def test_guard_xau_xaut_open_position_has_no_weekend_close_logic(
             "XAUT": (Decimal("4000"), Decimal("4200")),
         },
         equity=Decimal("1000"),
+        rates={"XAU": Decimal("0"), "XAUT": Decimal("0.10")} if readable else None,
     )
 
     result = asyncio.run(
@@ -624,10 +626,17 @@ def test_guard_xau_xaut_open_position_has_no_weekend_close_logic(
 
     assert result == 0
     assert client.metadata_calls == 1
-    assert client.funding_calls == []
+    assert client.funding_calls == (["XAU", "XAUT"] if readable else ["XAU"])
     assert client.accept_calls == []
     state = json.loads(paths["state_path"].read_text(encoding="utf-8"))
-    assert state["exit_carry_consecutive_rounds"] == 2
+    assert state["exit_carry_consecutive_rounds"] == (0 if readable else 2)
+    records = [json.loads(line) for line in paths["audit_path"].read_text().splitlines()]
+    observation = next(row for row in records if row["event"] == "exit_carry_observed")
+    if readable:
+        assert Decimal(observation["net_carry_annual"]) == Decimal("0.10")
+        assert "连续计数已清零" in observation["message"]
+    else:
+        assert "读取失败，本轮不计数也不清零" in observation["message"]
 
 
 def test_guard_records_cross_liquidation_without_using_it_to_exit(

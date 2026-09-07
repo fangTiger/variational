@@ -2397,3 +2397,75 @@ def test_switch_incident_blocks_later_auto_open_and_switch(tmp_path: Path) -> No
     assert "switch_incident" in json.loads(
         flat_paths["heartbeat_path"].read_text(encoding="utf-8")
     )["auto_open_conclusion"]
+
+
+@pytest.mark.parametrize("unreadable", [False, True])
+def test_non_target_holding_exit_uses_readability_only(tmp_path, unreadable):
+    """复现开市后负 carry 旧结构：只有读取失败才能暂停计数。"""
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(json.dumps({"exit_carry_consecutive_rounds": 1}))
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        perp_rate={"XAU": RuntimeError("读取失败") if unreadable else Decimal("0.1120"),
+                   "XAUT": Decimal("0.0036")},
+        swap_rate=RuntimeError("目标费率暂不可用"),
+    )
+    assert _run(client, tmp_path, auto_switch=True) == 0
+    state = json.loads(paths["state_path"].read_text())
+    assert state["exit_carry_consecutive_rounds"] == (1 if unreadable else 2)
+    records = [json.loads(line) for line in paths["audit_path"].read_text().splitlines()]
+    observed = next(row for row in records if row["event"] == "exit_carry_observed")
+    assert ("不计数也不清零" in observed["message"]) is unreadable
+    if unreadable:
+        assert "读取失败" in observed["message"]
+    else:
+        assert Decimal(observed["net_carry_annual"]) == Decimal("-0.1084")
+
+
+def test_switch_accepts_latest_applied_fallback(tmp_path):
+    """真实适配器解析降级响应后，守护应完成先平后开的切换。"""
+    from adapters.variational_client import VariationalClient
+
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        perp_rate={"XAU": Decimal("0.1120"), "XAUT": Decimal("0.0036")},
+        accept_script=[{}, {}, {}, {}],
+    )
+    adapter = object.__new__(VariationalClient)
+
+    async def offline_get(path):
+        assert path == "/funding/swap?underlying=XAUS"
+        return {"upcoming": None, "latest_applied": {
+            "trade_date": "2026-09-04", "basis": "rates",
+            "apply_time": (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),
+            "long_rate": "-0.057214", "short_rate": "0.025031"}}
+
+    adapter._get = offline_get
+    client.get_swap_funding = adapter.get_swap_funding
+    assert _run(client, tmp_path, auto_switch=True) == 0
+    assert _accepted_markets(client) == [
+        ("XAU", "sell", True), ("XAUT", "buy", True),
+        ("XAUS", "buy", False), ("XAU", "sell", False)]
+
+
+def test_non_target_negative_carry_closes_before_switch_on_third_round(tmp_path):
+    """旧结构退出计数达阈值时必须只减仓，不能被切换抢先或重新开仓。"""
+    for expected in (1, 2, 3):
+        client = _switch_client(
+            positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+            perp_rate={"XAU": Decimal("0.1120"), "XAUT": Decimal("0.0036")},
+            swap_rate=RuntimeError("目标费率不可用"),
+            accept_script=[{}, {}] if expected == 3 else None,
+        )
+        assert _run(client, tmp_path, auto_switch=True) == 0
+        state = json.loads(_paths(tmp_path)["state_path"].read_text())
+        assert state["exit_carry_consecutive_rounds"] == (expected if expected < 3 else 0)
+        records = [json.loads(line) for line in _paths(tmp_path)["audit_path"].read_text().splitlines()]
+        observations = [row for row in records if row["event"] == "exit_carry_observed"]
+        assert observations[-1]["consecutive_rounds"] == expected
+        if expected < 3:
+            assert client.accept_calls == []
+        else:
+            assert _accepted_markets(client) == [
+                ("XAU", "sell", True), ("XAUT", "buy", True)]
+            assert all(size == 0 for size in client.sizes.values())

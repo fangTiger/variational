@@ -258,8 +258,8 @@ def _accepted_markets(client: StrictFakeVariational) -> list[tuple[str, str, boo
     ]
 
 
-def test_all_structure_parameter_defaults_use_default_structure() -> None:
-    """所有可省略 structure 的 Python 调用入口必须与 CLI 默认结构一致。"""
+def test_structure_defaults_require_heartbeat_for_status_and_close() -> None:
+    """状态和平仓缺省读取心跳，其余入口保留默认开仓结构。"""
     from tools import hedge_swap_carry
 
     functions = {
@@ -275,7 +275,10 @@ def test_all_structure_parameter_defaults_use_default_structure() -> None:
     assert {
         name: inspect.signature(value).parameters["structure"].default
         for name, value in functions.items()
-    } == {name: hedge_swap_carry.DEFAULT_STRUCTURE for name in functions}
+    } == {
+        name: None if name in {"cmd_status", "cmd_close"} else hedge_swap_carry.DEFAULT_STRUCTURE
+        for name in functions
+    }
 
 
 def test_open_rejects_notional_over_hard_cap_without_any_order() -> None:
