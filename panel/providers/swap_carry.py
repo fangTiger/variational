@@ -393,6 +393,26 @@ def _next_switch_metric(schedule: Any | None) -> Metric:
     )
 
 
+def _selection_metrics(path: Path, current: str) -> list[Metric]:
+    """展示守护轮次的最优结构，并解释尚未采用该结构的原因。"""
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        best = saved.get("best_structure") or "无可用候选"
+        decision = saved.get("selection_decision") or {}
+        reason = decision.get("reason") or "尚无结构择优记录"
+        action_reason = saved.get("auto_switch_conclusion")
+        if current == "空仓":
+            action_reason = saved.get("auto_open_conclusion")
+        if action_reason and action_reason != reason:
+            reason += "；" + action_reason
+    except (OSError, ValueError, TypeError, AttributeError):
+        best, reason = "无数据", "无法读取守护进程的结构择优记录"
+    metrics = [Metric("最优结构", best)]
+    if best != current:
+        metrics.append(Metric("结构选择依据", reason, "warn"))
+    return metrics
+
+
 async def _allocation_metric(client: Any, underlying: str) -> Metric:
     """只读展示隔离腿当前桶、目标总额及强平距离，失败独立降级。"""
     try:
@@ -645,7 +665,8 @@ async def _collect(
     else:
         carry_value = f"{net_carry:+.1%}"
 
-    metrics = [Metric("当前结构", selected.name)]
+    current_name = "空仓" if all(position.is_flat for position in positions.values()) else selected.name
+    metrics = [Metric("当前结构", current_name), *_selection_metrics(heartbeat_path, current_name)]
     metrics.extend(
         Metric(
             f"{leg.underlying} {'多腿' if leg.open_side is carry.Side.BUY else '空腿'}",

@@ -24,7 +24,7 @@ def client_for_rehearsal():
         positions={"XAUS": Decimal("0.01"), "XAU": Decimal("-0.01")},
         metadata=_metadata(closure_duration=timedelta(hours=49),
                            time_until_close=timedelta(minutes=85)),
-        swap_rate=Decimal("0.04"),
+        swap_rate=Decimal("0.10"),
         perp_rate={"XAU": Decimal("0"), "XAUT": Decimal("0.1095")},
         accept_script=[{}, {}, {}, {}],
     )
@@ -68,7 +68,8 @@ def test_insufficient_margin_blocks_switch_and_notifies(tmp_path, monkeypatch):
     assert heartbeat(tmp_path)["rehearsal_blocked"] is True
     assert notices
     run(client, tmp_path, NOW + timedelta(minutes=25))
-    assert client.accept_calls == []
+    assert len(client.accept_calls) == 2
+    assert all(call[2] for call in client.accept_calls)
     assert not heartbeat(tmp_path)["auto_switch_attempted"]
     assert len(rehearsals(tmp_path)) == 1
     assert rehearsals(tmp_path)[0]["level"] == "critical"
