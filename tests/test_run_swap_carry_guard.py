@@ -471,10 +471,10 @@ def _flat_open_client(
     metadata: object | None = None,
     swap_rate: object = Decimal("-0.04"),
     perp_rate: object = Decimal("0.10"),
-    equity: Decimal = Decimal("1000"),
+    equity: Decimal = Decimal("1500"),
     accept_script: list[object] | None = None,
 ) -> StrictGuardClient:
-    """构造完整的空仓自动开仓场景。"""
+    """余额允许两腿目标桶，但不足以让三腿通过 60% 预算。"""
     return StrictGuardClient(
         positions={"XAUS": Decimal("0"), "XAU": Decimal("0")},
         metadata=metadata if metadata is not None else _metadata(),
@@ -493,11 +493,11 @@ def _switch_client(
     swap_rate: object = Decimal("-0.04"),
     perp_rate: object = None,
 ) -> StrictGuardClient:
-    """构造三标的切换场景，所有可能调用均显式配置。"""
+    """构造三标的切换场景：两腿预算充足，默认 carry 令 XAUS_XAU 胜出。"""
     if perp_rate is None:
         perp_rate = {
             "XAU": Decimal("0.10"),
-            "XAUT": Decimal("0.1095"),
+            "XAUT": Decimal("0.09"),
         }
     configured_positions = {
         "XAUS": Decimal("0"),
@@ -516,7 +516,7 @@ def _switch_client(
         accept_script=accept_script,
         swap_rate=swap_rate,
         perp_rate=perp_rate,
-        equity=Decimal("1000"),
+        equity=Decimal("1500"),
     )
 
 
@@ -1145,7 +1145,7 @@ def test_launchd_plist_runs_guard_once_every_minute() -> None:
 
 
 def test_auto_open_skips_when_net_carry_is_below_threshold(tmp_path: Path) -> None:
-    """净 carry 低于 2% 时不得询价或开仓。"""
+    """净 carry 低于 2% 时不得开仓。"""
     client = _flat_open_client(
         swap_rate=Decimal("-0.04"),
         perp_rate=Decimal("0.0599"),
@@ -1154,7 +1154,7 @@ def test_auto_open_skips_when_net_carry_is_below_threshold(tmp_path: Path) -> No
     result = _run(client, tmp_path)
 
     assert result == 0
-    assert client.quote_calls == []
+    # 候选保证金询价允许，实际成交必须被阻止。
     assert client.accept_calls == []
     heartbeat = json.loads(
         _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
@@ -1170,13 +1170,13 @@ def test_auto_open_skips_when_carry_cannot_be_read(tmp_path: Path) -> None:
     result = _run(client, tmp_path)
 
     assert result == 0
-    assert client.quote_calls == []
+    # 候选保证金询价允许，实际成交必须被阻止。
     assert client.accept_calls == []
     heartbeat = json.loads(
         _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
     )
     assert "读取失败" in heartbeat["candidate_structures"]["XAUS_XAU"]["reason"]
-    assert heartbeat["best_structure"] == "XAU_XAUT"
+    assert heartbeat["best_structure"] is None
 
 
 def test_auto_open_skips_when_xaus_is_not_tradable(tmp_path: Path) -> None:
@@ -1187,7 +1187,7 @@ def test_auto_open_skips_when_xaus_is_not_tradable(tmp_path: Path) -> None:
 
     assert result == 0
     assert {call[0] for call in client.funding_calls} == {"XAUS", "XAU", "XAUT"}
-    assert client.quote_calls == []
+    # 候选保证金询价允许，实际成交必须被阻止。
     assert client.accept_calls == []
 
 
@@ -1201,7 +1201,7 @@ def test_auto_open_skips_with_two_hours_or_less_to_close(tmp_path: Path) -> None
 
     assert result == 0
     assert {call[0] for call in client.funding_calls} == {"XAUS", "XAU", "XAUT"}
-    assert client.quote_calls == []
+    # 候选保证金询价允许，实际成交必须被阻止。
     assert client.accept_calls == []
 
 
@@ -1309,7 +1309,7 @@ def test_auto_open_skips_when_available_margin_is_insufficient(
     heartbeat = json.loads(
         _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
     )
-    assert "保证金不足" in heartbeat["auto_open_conclusion"]
+    assert "保证金" in heartbeat["auto_open_conclusion"]
 
 
 def test_flat_kill_switch_takes_priority_over_auto_open(tmp_path: Path) -> None:
@@ -1417,7 +1417,7 @@ def test_daily_open_attempt_limit_stops_further_attempts(tmp_path: Path) -> None
 
     assert result == 0
     assert {call[0] for call in client.funding_calls} == {"XAUS", "XAU", "XAUT"}
-    assert client.quote_calls == []
+    # 候选保证金询价允许，实际成交必须被阻止。
     assert client.accept_calls == []
     heartbeat = json.loads(paths["heartbeat_path"].read_text(encoding="utf-8"))
     assert heartbeat["daily_open_attempts"] == run_swap_carry_guard.MAX_DAILY_OPEN_ATTEMPTS
@@ -1524,7 +1524,7 @@ def test_auto_open_rejects_notional_over_execution_hard_cap(tmp_path: Path) -> N
 
     assert result == 0
     assert {call[0] for call in client.funding_calls} == {"XAUS", "XAU", "XAUT"}
-    assert client.quote_calls == []
+    # 候选保证金询价允许，实际成交必须被阻止。
     assert client.accept_calls == []
 
 
@@ -1560,7 +1560,7 @@ def test_auto_open_dry_run_checks_and_quotes_but_never_accepts(
     result = _run(client, tmp_path, dry_run=True)
 
     assert result == 0
-    assert {call[0] for call in client.quote_calls} == {"XAUS", "XAU"}
+    assert {call[0] for call in client.quote_calls} == {"XAUS", "XAU", "XAUT"}
     assert client.accept_calls == []
     heartbeat = json.loads(
         _paths(tmp_path)["heartbeat_path"].read_text(encoding="utf-8")
@@ -1956,10 +1956,9 @@ def test_switch_open_failure_stays_fully_flat(
     retry = _run(client, tmp_path, auto_switch=True)
 
     assert retry == 0
-    # 切换失败前确实平旧仓并回滚，立即重试应冷却；到期后仍可恢复开仓。
-    assert len(client.accept_calls) == 5
-    assert json.loads(_paths(tmp_path)["state_path"].read_text())["last_closed_at"] == NOW.isoformat()
-    assert _run(client, tmp_path, auto_switch=True, now=NOW + timedelta(hours=2.5)) == 0
+    # 切换回滚成功后，下一轮直接重试原目标。
+    assert len(client.accept_calls) == 7
+    assert json.loads(_paths(tmp_path)["state_path"].read_text())["last_closed_at"] is None
     assert _accepted_markets(client)[-2:] == [
         ("XAUS", "buy", False),
         ("XAU", "sell", False),
@@ -1972,7 +1971,7 @@ def test_simultaneous_structures_are_flattened_without_switching(
 ) -> None:
     """发现两结构同时存在时必须先清空全部受管腿，绝不继续开仓。"""
     client = _switch_client(
-        positions={"XAUS": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        positions={"XAUS": Decimal("0.01"), "XAUT": Decimal("0.01")},
         accept_script=[{}, {}],
     )
 
@@ -1981,7 +1980,7 @@ def test_simultaneous_structures_are_flattened_without_switching(
     assert result == 0
     assert _accepted_markets(client) == [
         ("XAUS", "sell", True),
-        ("XAUT", "buy", True),
+        ("XAUT", "sell", True),
     ]
     assert all(size == 0 for size in client.sizes.values())
 
@@ -2186,7 +2185,7 @@ def test_successful_switch_writes_complete_ledger_and_passes_self_check(
     assert record["before"]["legs"]["XAU"]["quantity"] == "0.01"
     assert record["before"]["legs"]["XAUT"]["notional_usd"] == "40.00"
     assert record["before"]["net_delta"] == "0.00"
-    assert record["before"]["equity"] == "1000"
+    assert record["before"]["equity"] == "1500"
     assert record["flat_confirmation"]["all_flat"] is True
     assert record["flat_confirmation"]["poll_count"] >= 1
     assert record["flat_confirmation"]["confirmed_at"]
@@ -2198,7 +2197,7 @@ def test_successful_switch_writes_complete_ledger_and_passes_self_check(
     assert record["after"]["legs"]["XAUS"]["quantity"] == str(expected_quantity)
     assert record["after"]["legs"]["XAU"]["quantity"] == str(-expected_quantity)
     assert record["after"]["net_delta"] == str(expected_quantity - expected_quantity)
-    assert record["after"]["equity"] == "1000"
+    assert record["after"]["equity"] == "1500"
     assert record["measured_wear_usd"] == "0"
     assert record["self_check"]["performed"] is True
     assert record["self_check"]["passed"] is True
@@ -2672,8 +2671,8 @@ def test_reset_reopen_cooldown_refuses_missing_or_invalid_state(tmp_path, conten
     assert state_path.read_text() == contents if contents is not None else not state_path.exists()
 
 
-def test_forced_switch_records_real_close_despite_active_cooldown(tmp_path):
-    """长休市强制切换绕过冷却，但真实平旧仓仍应更新平仓时间。"""
+def test_forced_switch_preserves_cooldown_and_opens_same_round(tmp_path):
+    """长休市强制切换绕过冷却，平旧仓不得更新风控平仓时间。"""
     paths = _paths(tmp_path)
     paths["state_path"].write_text(json.dumps({
         "last_closed_at": (NOW - timedelta(hours=1)).isoformat()}))
@@ -2685,4 +2684,181 @@ def test_forced_switch_records_real_close_despite_active_cooldown(tmp_path):
     )
     assert _run(client, tmp_path, auto_switch=True) == 0
     assert [reduce_only for _, _, reduce_only in client.accept_calls] == [True, True, False, False]
-    assert json.loads(paths["state_path"].read_text())["last_closed_at"] == NOW.isoformat()
+    assert json.loads(paths["state_path"].read_text())["last_closed_at"] == (NOW - timedelta(hours=1)).isoformat()
+
+
+@pytest.mark.parametrize("auto_switch", [False, True])
+def test_scheduled_close_does_not_start_reopen_cooldown(tmp_path, auto_switch):
+    """长休市计划平仓不是风控退出，不能锁住下一次开仓。"""
+    client = _healthy_client(metadata=_metadata(
+        closure_duration=timedelta(hours=49), time_until_close=timedelta(minutes=10)),
+        accept_script=[{}, {}])
+    assert _run(client, tmp_path, auto_switch=auto_switch, auto_open=False) == 0
+    assert len(client.accept_calls) == 2
+    assert json.loads(_paths(tmp_path)["state_path"].read_text())["last_closed_at"] is None
+
+
+@pytest.mark.parametrize("failure", ["margin", "skew", "quote"])
+def test_switch_open_failure_alerts_and_retries_committed_target(tmp_path, monkeypatch, failure):
+    """真实开仓失败后继续原切换，忽略旧冷却和新一轮择优滞回。"""
+    guard = run_swap_carry_guard
+    notifications = []
+    monkeypatch.setattr(guard, "notify", lambda *args: notifications.append(args))
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[{}, {}, {}, {}])
+    original_open = guard.execution.cmd_open
+    async def fail_open(*args, **kwargs):
+        if failure == "margin":
+            raise SystemExit("保证金不足")
+        if failure == "skew":
+            raise VariationalRequestError(422, "skew")
+        raise RuntimeError("报价失败")
+    monkeypatch.setattr(guard.execution, "cmd_open", fail_open)
+    assert _run(client, tmp_path, auto_switch=True) == 1
+    paths = _paths(tmp_path)
+    state = json.loads(paths["state_path"].read_text())
+    assert state["last_closed_at"] is None
+    assert state["pending_switch"]["to"] == "XAUS_XAU"
+    assert not state["switch_incident"]
+    assert any("切换" in title for title, _ in notifications)
+    history = [json.loads(line) for line in paths["switch_history_path"].read_text().splitlines()]
+    assert history[-1]["status"] == "failed"
+    assert history[-1]["failure"]["stage"] == "open"
+    state.update(last_closed_at=NOW.isoformat(), last_switch_at=NOW.isoformat())
+    paths["state_path"].write_text(json.dumps(state))
+    monkeypatch.setattr(guard.execution, "cmd_open", original_open)
+    def disallow_selection(*args, **kwargs):
+        return {"allowed": False, "reason": "切换滞回阻挡"}
+    monkeypatch.setattr(guard, "_carry_switch_decision", disallow_selection)
+    assert _run(client, tmp_path, auto_switch=True, now=NOW + timedelta(minutes=1)) == 0
+    assert [call[2] for call in client.accept_calls] == [True, True, False, False]
+    state = json.loads(paths["state_path"].read_text())
+    assert state["pending_switch"] is None
+    assert state["last_switch_at"] == (NOW + timedelta(minutes=1)).isoformat()
+
+
+def test_reset_cooldown_forces_full_round_despite_stale_heartbeat(tmp_path, monkeypatch):
+    """CLI 重置后下一次调用必须重新判定，不能轻量复制旧心跳结论。"""
+    guard = run_swap_carry_guard
+    current = datetime.now(timezone.utc)
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(json.dumps({"last_closed_at": current.isoformat()}))
+    paths["heartbeat_path"].write_text(json.dumps({
+        "last_full_round_at": current.isoformat(), "status": "reopen_cooldown",
+        "last_closed_at": current.isoformat(), "conclusion": "平仓后重开冷却中"}))
+    args = guard.build_parser().parse_args([
+        "--state", str(paths["state_path"]), "--heartbeat", str(paths["heartbeat_path"]),
+        "--kill-switch", str(paths["kill_switch_path"]), "--reset-reopen-cooldown"])
+    assert asyncio.run(guard._main(args)) == 0
+    args.reset_reopen_cooldown = False
+    client = _flat_open_client(accept_script=[{}, {}])
+    async def load():
+        return client
+    async def close():
+        pass
+    client.close = close
+    monkeypatch.setattr(guard.execution, "_load", load)
+    original_run = guard.run_once
+    async def run(var, **kwargs):
+        return await original_run(var, now=NOW, **paths)
+    monkeypatch.setattr(guard, "run_once", run)
+    assert asyncio.run(guard._main(args)) == 0
+    assert len(client.accept_calls) == 2
+    assert "冷却中" not in json.loads(paths["heartbeat_path"].read_text())["conclusion"]
+
+
+def test_cooldown_uses_state_only_not_heartbeat(tmp_path):
+    """心跳带新平仓时间也不能替代状态文件参与冷却判定。"""
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(json.dumps({"last_closed_at": None}))
+    paths["heartbeat_path"].write_text(json.dumps({"last_closed_at": NOW.isoformat(),
+        "status": "reopen_cooldown"}))
+    client = _flat_open_client(accept_script=[{}, {}])
+    assert _run(client, tmp_path) == 0
+    assert len(client.accept_calls) == 2
+
+
+def test_incident_switch_xau_xaut_to_xaus_xaut_opens_without_cooldown(tmp_path):
+    """复现本次实盘方向：平掉 XAU/XAUT 后同轮开 XAUS/XAUT。"""
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        perp_rate={"XAU": Decimal("0.08"), "XAUT": Decimal("0.12")},
+        accept_script=[{}, {}, {}, {}])
+    assert _run(client, tmp_path, auto_switch=True) == 0
+    assert _accepted_markets(client) == [
+        ("XAU", "sell", True), ("XAUT", "buy", True),
+        ("XAUS", "buy", False), ("XAUT", "sell", False)]
+    assert json.loads(_paths(tmp_path)["state_path"].read_text())["last_closed_at"] is None
+
+
+def test_real_margin_rejection_during_switch_is_retryable(tmp_path, monkeypatch):
+    """平仓后余额变低时，走真实保证金校验而不是仅模拟返回码。"""
+    guard = run_swap_carry_guard
+    client = _switch_client(
+        positions={"XAU": Decimal("0.01"), "XAUT": Decimal("-0.01")},
+        accept_script=[{}, {}, {}, {}])
+    original = guard.execution.cmd_open
+    async def low_margin(var, *args, **kwargs):
+        client.equity = Decimal("1")
+        return await original(var, *args, **kwargs)
+    monkeypatch.setattr(guard.execution, "cmd_open", low_margin)
+    assert _run(client, tmp_path, auto_switch=True) == 1
+    assert len(client.accept_calls) == 2
+    state = json.loads(_paths(tmp_path)["state_path"].read_text())
+    assert state["pending_switch"]
+    assert not state["switch_incident"]
+    assert state["last_closed_at"] is None
+    client.equity = Decimal("1500")
+    monkeypatch.setattr(guard.execution, "cmd_open", original)
+    assert _run(client, tmp_path, auto_switch=True) == 0
+    assert len(client.accept_calls) == 4
+
+
+def test_reset_during_running_round_is_not_overwritten(tmp_path, monkeypatch):
+    """运行中的轮次不能把重置前的内存时间戳写回状态。"""
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(json.dumps({"last_closed_at": NOW.isoformat()}))
+    client = _flat_open_client(accept_script=[{}, {}])
+    original = client.get_supported_assets
+    async def reset_then_read():
+        args = run_swap_carry_guard.build_parser().parse_args([
+            "--reset-reopen-cooldown", "--state", str(paths["state_path"])])
+        assert await run_swap_carry_guard._main(args) == 0
+        return await original()
+    monkeypatch.setattr(client, "get_supported_assets", reset_then_read)
+    assert _run(client, tmp_path) == 0
+    assert len(client.accept_calls) == 2
+    state = json.loads(paths["state_path"].read_text())
+    assert state["last_closed_at"] is None
+    assert state["reopen_cooldown_reset"]
+
+
+def test_pending_switch_retries_after_daily_limit_without_reselection(tmp_path, monkeypatch):
+    """已发起的切换不能因每日新开仓次数上限或新择优失败而悬空。"""
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(json.dumps({
+        "pending_switch": {"from": "XAU_XAUT", "to": "XAUS_XAU", "started_at": NOW.isoformat()},
+        "open_attempt_date": NOW.date().isoformat(),
+        "daily_open_attempts": run_swap_carry_guard.MAX_DAILY_OPEN_ATTEMPTS,
+        "last_closed_at": NOW.isoformat(), "last_switch_at": NOW.isoformat()}))
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("已发起切换不应再次择优")
+    monkeypatch.setattr(run_swap_carry_guard, "_evaluate_carry_candidates", forbidden)
+    client = _switch_client(positions={}, accept_script=[{}, {}])
+    assert _run(client, tmp_path, auto_switch=True) == 0
+    assert len(client.accept_calls) == 2
+
+
+def test_restart_after_target_open_clears_pending_switch(tmp_path):
+    """目标已成交但进程未写完成状态时，重启核对持仓后收敛切换状态。"""
+    paths = _paths(tmp_path)
+    paths["state_path"].write_text(json.dumps({
+        "pending_switch": {"from": "XAU_XAUT", "to": "XAUS_XAU", "started_at": NOW.isoformat()}}))
+    client = _switch_client(positions={"XAUS": Decimal("0.01"), "XAU": Decimal("-0.01")},
+                            accept_script=[])
+    assert _run(client, tmp_path, auto_switch=True) == 0
+    state = json.loads(paths["state_path"].read_text())
+    assert state["pending_switch"] is None
+    assert state["last_switch_at"] == NOW.isoformat()
+    assert client.accept_calls == []

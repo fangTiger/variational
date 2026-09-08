@@ -395,6 +395,7 @@ def _next_switch_metric(schedule: Any | None) -> Metric:
 
 def _selection_metrics(path: Path, current: str) -> list[Metric]:
     """展示守护轮次的最优结构，并解释尚未采用该结构的原因。"""
+    saved = {}
     try:
         saved = json.loads(path.read_text(encoding="utf-8"))
         best = saved.get("best_structure") or "无可用候选"
@@ -408,6 +409,18 @@ def _selection_metrics(path: Path, current: str) -> list[Metric]:
     except (OSError, ValueError, TypeError, AttributeError):
         best, reason = "无数据", "无法读取守护进程的结构择优记录"
     metrics = [Metric("最优结构", best)]
+    try:
+        candidates = saved.get("candidate_structures") or {}
+        current_points = candidates.get(current, {}).get("points_oi")
+        best_points = candidates.get(best, {}).get("points_oi")
+        current_text = f"{Decimal(current_points):,.0f}" if current_points is not None else "无数据"
+        best_text = f"{Decimal(best_points):,.0f}" if best_points is not None else "无数据"
+        metrics.append(Metric("积分 OI（同规模）", f"当前结构 {current_text} / 最优结构 {best_text}"))
+        actual = saved.get("current_points_oi")
+        if actual is not None:
+            metrics.append(Metric("当前持仓积分 OI", f"{Decimal(actual):,.0f}"))
+    except (ValueError, TypeError, ArithmeticError, AttributeError):
+        metrics.append(Metric("积分 OI（同规模）", "无数据"))
     if best != current:
         metrics.append(Metric("结构选择依据", reason, "warn"))
     return metrics

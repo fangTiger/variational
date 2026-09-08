@@ -75,6 +75,10 @@ MIN_ENTRY_CARRY_ANNUAL = Decimal("0.02")
 MIN_TIME_TO_CLOSE = timedelta(hours=2)
 MAX_DAILY_OPEN_ATTEMPTS = 20
 SWITCH_LEAD_TIME = timedelta(minutes=60)
+# 该倍率来自官方公告，API 无法验证；若规则变化改这里。
+POINTS_WEIGHTS = {"XAUS": Decimal("2.0"), "XAU": Decimal("1.0"), "XAUT": Decimal("1.0")}
+MAX_MARGIN_UTILIZATION = Decimal("0.60")
+SWITCH_MIN_POINTS_GAIN = Decimal("0.20")
 SWITCH_MIN_ADVANTAGE = Decimal("0.025")
 MIN_HOLD_AFTER_SWITCH = timedelta(hours=4)
 REHEARSAL_LEAD = timedelta(minutes=30)
@@ -200,6 +204,7 @@ class AutoOpenResult:
     incident: bool = False
     # 仅表示本轮成功执行过 reduce_only，不表示账户当前为空仓。
     did_close_this_round: bool = False
+    opened: bool = False
 
 
 @dataclass(frozen=True)
@@ -1107,7 +1112,7 @@ def _carry_positions_from_payload(payload: object) -> dict[str, Position]:
 def _detect_carry_structure(
     positions: Mapping[str, Position],
 ) -> StructureDetection:
-    """按三标的实际方向识别三种结构；权重与缺腿交由失衡检查。"""
+    """按三标的实际方向识别四种结构；权重与缺腿交由失衡检查。"""
     xaus = positions["XAUS"].signed_size
     xau = positions["XAU"].signed_size
     xaut = positions["XAUT"].signed_size
@@ -1121,6 +1126,9 @@ def _detect_carry_structure(
     if xau_xaut_compatible and (xau > 0 or xaut < 0):
         return StructureDetection(execution.XAU_XAUT)
 
+    if xaus > 0 and xau == 0 and xaut < 0:
+        return StructureDetection(execution.XAUS_XAUT)
+
     if xaus > 0 and xau > 0 and xaut < 0:
         return StructureDetection(execution.TRIPLE)
 
@@ -1131,12 +1139,49 @@ def _detect_carry_structure(
     )
 
 
+async def _candidate_margin(
+    var: Any, structure: execution.CarryStructure, notional: Decimal,
+) -> Decimal:
+    """只询价，按真实方向读取 IM；XAUS 桶取 IM 与目标强平距离要求的较大值。"""
+    total = Decimal("0")
+    for leg in structure.legs:
+        minimum = execution.XAUS_MIN_QTY if leg.underlying == "XAUS" else execution.XAU_PROBE_QTY
+        fallback_step = execution.XAUS_QTY_STEP if leg.underlying == "XAUS" else execution.XAU_FALLBACK_QTY_STEP
+        probe = await execution._request_quote(var, leg, leg.open_side, minimum)
+        price = execution._decimal(probe.get("mark_price"), label="标记价", positive=True)
+        minimum, step = execution._quantity_constraints(
+            probe, leg.open_side, fallback_minimum=minimum, fallback_step=fallback_step,
+        )
+        planned = notional * leg.weight / structure.legs[0].weight
+        quantity = execution._round_qty(planned / price, step)
+        if quantity < minimum:
+            raise ValueError(f"{leg.underlying} 目标数量低于最小询价数量")
+        payload = await execution._request_quote(var, leg, leg.open_side, quantity)
+        key = "ask_margin_delta" if leg.open_side is Side.BUY else "bid_margin_delta"
+        delta = payload["margin_requirements"][key]
+        # 步长向下取整后按目标名义保守还原，避免低估所需保证金。
+        scale = planned / (quantity * price)
+        initial = execution._decimal(delta.get("initial_margin"), label="初始保证金") * scale
+        if initial < 0:
+            raise ValueError("开仓初始保证金不得为负")
+        if leg.underlying == "XAUS":
+            maintenance = execution._decimal(delta.get("maintenance_margin"), label="维持保证金") * scale
+            target = execution._decimal(
+                os.environ.get("TARGET_LIQUIDATION_DISTANCE", str(TARGET_LIQUIDATION_DISTANCE)),
+                label="目标强平距离", positive=True,
+            )
+            initial = max(initial, required_allocation(planned, maintenance, target))
+        total += initial
+    return total
+
+
 async def _evaluate_carry_candidates(
     var: Any,
     schedule: SwapTradingSchedule | None,
     market_status: str | None,
+    *, notional: Decimal = AUTO_OPEN_NOTIONAL_USD,
 ) -> tuple[dict[str, dict[str, Any]], execution.CarryStructure | None]:
-    """每腿独立读取一次，合法零值有效，失败只排除受影响的结构。"""
+    """先过滤费率、时段、carry 和保证金，再按积分 OI、carry 降序。"""
     rates: dict[str, Decimal] = {}
     errors: dict[str, str] = {}
     for leg in execution.TRIPLE.legs:
@@ -1147,9 +1192,14 @@ async def _evaluate_carry_candidates(
             rates[leg.underlying] = rate
         except Exception as exc:  # 单腿读取失败不得中断其他候选的评估
             errors[leg.underlying] = f"{leg.underlying} 费率读取失败：{type(exc).__name__}: {exc}"
+    budget = None
+    margin_error = None
+    try:
+        budget = await _available_account_margin(var) * MAX_MARGIN_UTILIZATION
+    except Exception as exc:
+        margin_error = f"可用保证金读取失败：{exc}"
     candidates: dict[str, dict[str, Any]] = {}
-    best = None
-    best_carry = None
+    ranked = []
     for structure in execution.STRUCTURES.values():
         reasons = [errors[leg.underlying] for leg in structure.legs if leg.underlying in errors]
         carry = None if reasons else execution._weighted_net_carry(structure, rates)
@@ -1160,13 +1210,40 @@ async def _evaluate_carry_candidates(
                 reasons.append("XAUS 当前不可交易")
             elif schedule.time_until_close is None or schedule.time_until_close <= MIN_TIME_TO_CLOSE:
                 reasons.append(f"XAUS 距收市未超过最短开仓窗口 {MIN_TIME_TO_CLOSE}")
+        tradable = not reasons
+        if carry is not None and carry < MIN_ENTRY_CARRY_ANNUAL:
+            reasons.append(f"净 carry {carry:.4%} 低于入场阈值 {MIN_ENTRY_CARRY_ANNUAL:.4%}")
+        required = None
+        try:
+            # 不可交易的 XAUS 不询价，避免休市接口阻塞安全切换。
+            if tradable:
+                required = await _candidate_margin(var, structure, notional)
+        except Exception as exc:
+            reasons.append(f"所需保证金读取失败：{exc}")
+        if margin_error:
+            reasons.append(margin_error)
+        elif required is not None and required > budget:
+            reasons.append(f"所需保证金 {required} 超过可用保证金预算 {budget}")
+        points = sum((notional * leg.weight / structure.legs[0].weight * Decimal(str(POINTS_WEIGHTS[leg.underlying])) for leg in structure.legs), Decimal("0"))
         candidates[structure.name] = {
             "carry_annual": str(carry) if carry is not None else None,
-            "available": not reasons,
-            "reason": "；".join(reasons) if reasons else "费率有效且可交易",
+            "carry_usd_annual": str(carry * notional * structure.neutral_weight / structure.legs[0].weight) if carry is not None else None,
+            "points_oi": str(points), "required_margin_usd": str(required) if required is not None else None,
+            "margin_budget_usd": str(budget) if budget is not None else None,
+            "tradable": tradable, "available": not reasons, "selected": False,
+            "ranking_basis": "未入选", "filter_reasons": reasons,
+            "reason": "；".join(reasons) if reasons else "通过全部过滤",
         }
-        if not reasons and (best_carry is None or carry > best_carry):
-            best, best_carry = structure, carry
+        if not reasons:
+            ranked.append((points, carry, structure))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    best = ranked[0][2] if ranked else None
+    if best:
+        basis = "唯一合格候选" if len(ranked) == 1 else ("积分胜出" if ranked[0][0] > ranked[1][0] else "carry 胜出")
+        for rank, (_, _, structure) in enumerate(ranked, 1):
+            candidates[structure.name]["rank"] = rank
+            candidates[structure.name]["ranking_basis"] = basis
+        candidates[best.name]["selected"] = True
     return candidates, best
 
 
@@ -1176,27 +1253,34 @@ def _carry_switch_decision(
     current: execution.CarryStructure | None,
     *, now: datetime, last_switch_at: datetime | None, forced: bool,
 ) -> dict[str, Any]:
-    """收益切换同时满足入场阈值、优势和持有期，安全退出跳过收益限制。"""
+    """同规模比较积分增益或 carry 优势，并满足持有期；长休市退出跳过限制。"""
     best_rate = candidates[best.name]["carry_annual"] if best else None
     current_rate = candidates[current.name]["carry_annual"] if current else None
     advantage = (Decimal(best_rate) - Decimal(current_rate)
                  if best_rate is not None and current_rate is not None else None)
-    threshold_blocked = best_rate is not None and Decimal(best_rate) < MIN_ENTRY_CARRY_ANNUAL and not forced
+    current_points = Decimal(candidates[current.name]["points_oi"]) if current else None
+    best_points = Decimal(candidates[best.name]["points_oi"]) if best else None
+    points_gain = best_points / current_points - 1 if current_points and best_points is not None else None
+    threshold_blocked = not forced and (best_rate is not None and Decimal(best_rate) < MIN_ENTRY_CARRY_ANNUAL
+        or best is None and any("carry" in item["reason"] for item in candidates.values()))
     elapsed = (now - last_switch_at).total_seconds() if last_switch_at else None
     hysteresis_blocked = bool(current and best and current != best and not forced and (
-        advantage is None or advantage < SWITCH_MIN_ADVANTAGE
-        or (elapsed is not None and elapsed <= MIN_HOLD_AFTER_SWITCH.total_seconds())))
+        not ((points_gain is not None and points_gain >= SWITCH_MIN_POINTS_GAIN)
+             or (advantage is not None and advantage >= SWITCH_MIN_ADVANTAGE))
+        or (elapsed is not None and elapsed < MIN_HOLD_AFTER_SWITCH.total_seconds())))
     if forced:
-        reason = "长休市强制退出 XAUS，忽略收益阈值、优势与切换持有期"
+        reason = "长休市强制退出 XAUS，忽略积分、收益阈值、保证金择优上限与切换持有期"
     elif best is None:
         reason = "所有候选不可评估或不可交易：" + "；".join(f"{name}: {item['reason']}" for name, item in candidates.items())
     elif threshold_blocked:
         reason = f"最优 carry {Decimal(best_rate):.4%} 低于入场阈值 {MIN_ENTRY_CARRY_ANNUAL:.4%}，保持现状"
     elif hysteresis_blocked:
-        reason = f"切换滞回阻挡：优势 {advantage if advantage is not None else '未知'}，要求 {SWITCH_MIN_ADVANTAGE}；距上次切换 {elapsed} 秒，要求超过 {MIN_HOLD_AFTER_SWITCH}"
+        reason = f"切换滞回阻挡：积分增益 {points_gain}，要求 {SWITCH_MIN_POINTS_GAIN} 或 carry 优势 {advantage if advantage is not None else '未知'}，要求 {SWITCH_MIN_ADVANTAGE}；距上次切换 {elapsed} 秒，要求至少 {MIN_HOLD_AFTER_SWITCH}"
     else:
-        reason = f"按净 carry 择优 {best.name}，年化 {Decimal(best_rate):.4%}，优势 {format(advantage, '.4%') if advantage is not None else '无当前持仓对比'}"
+        reason = f"{candidates[best.name]['ranking_basis']}：择优 {best.name}，年化 {Decimal(best_rate):.4%}，优势 {format(advantage, '.4%') if advantage is not None else '无当前持仓对比'}"
     return {"allowed": best is not None and not threshold_blocked and not hysteresis_blocked,
+            "points_gain": str(points_gain) if points_gain is not None else None,
+            "ranking_basis": "长休市安全切换" if forced else (candidates[best.name]["ranking_basis"] if best else "无合格候选"),
             "advantage_annual": str(advantage) if advantage is not None else None,
             "hysteresis_blocked": hysteresis_blocked, "entry_threshold_blocked": threshold_blocked,
             "forced_long_closure": forced, "hold_elapsed_seconds": elapsed, "reason": reason}
@@ -1599,6 +1683,7 @@ async def _try_auto_open(
     observed_at: datetime,
     funding_rate_overrides: Mapping[str, Decimal] | None = None,
     enforce_min_carry: bool = True,
+    completing_switch: bool = False,
 ) -> AutoOpenResult:
     """逐项失败关闭地判定入场，并把成交委托给人工执行器。"""
     selected = execution.resolve_structure(structure)
@@ -1656,7 +1741,7 @@ async def _try_auto_open(
             result_code=1,
             incident_state=True,
         )
-    if daily_attempts >= MAX_DAILY_OPEN_ATTEMPTS:
+    if not completing_switch and daily_attempts >= MAX_DAILY_OPEN_ATTEMPTS:
         return skip(
             f"当日自动开仓尝试已达上限 {MAX_DAILY_OPEN_ATTEMPTS} 次"
         )
@@ -1824,6 +1909,7 @@ async def _try_auto_open(
             conclusion,
             attempt_number,
             status="dry_run" if dry_run else "healthy",
+            opened=not dry_run,
         )
 
     _append_audit(
@@ -2344,6 +2430,10 @@ async def run_once(
         state_path, observed_at
     )
     switch_incident = _read_switch_incident(state_path)
+    saved_state = execution._read_guard_json(state_path) or {}
+    pending_switch = saved_state.get("pending_switch")
+    cooldown_reset = saved_state.get("reopen_cooldown_reset")
+    risk_closed_this_round = False
     try:
         saved_rehearsals = json.loads(state_path.read_text(encoding="utf-8"))
         rehearsal_windows = dict(saved_rehearsals.get("rehearsal_windows", {}))
@@ -2416,9 +2506,20 @@ async def run_once(
     switch_phase_started = 0.0
     switch_record_written = False
 
+    def refresh_cooldown_reset() -> None:
+        """识别本轮运行期间的本地重置，禁止旧内存快照覆盖重置结果。"""
+        nonlocal last_closed_at, cooldown_reset
+        latest = execution._read_guard_json(state_path) or {}
+        reset = latest.get("reopen_cooldown_reset")
+        if reset != cooldown_reset:
+            cooldown_reset = reset
+            if not risk_closed_this_round:
+                last_closed_at = _read_state_timestamp(state_path, "last_closed_at")
+
     def persist_state(status: str, message: str, failures: int) -> None:
         """写状态时始终保留每日计数和不可自动清除的 INCIDENT。"""
         nonlocal round_status
+        refresh_cooldown_reset()
         effective_status = (
             "incident" if auto_open_incident or switch_incident else status
         )
@@ -2439,7 +2540,9 @@ async def run_once(
                 last_session_expiry_alert_at=last_session_expiry_alert_at,
             ), "last_switch_at": last_switch_at, "last_rehearsal": last_rehearsal,
                 "rehearsal_windows": rehearsal_windows,
-                "rehearsal_blocked": rehearsal_blocked},
+                "rehearsal_blocked": rehearsal_blocked,
+                "pending_switch": pending_switch,
+                "reopen_cooldown_reset": cooldown_reset},
         )
 
     async def finalize_switch_failure(error: BaseException) -> None:
@@ -2531,6 +2634,7 @@ async def run_once(
             )
         else:
             switch_record_written = True
+        notify("Swap carry 切换失败", f"{switch_record['direction']}；阶段 {switch_stage}：{error}；{residual_state}")
 
     _append_audit(
         audit_path,
@@ -2641,6 +2745,8 @@ async def run_once(
 
         reason: str | None = None
         state_status = "healthy"
+        close_source = "risk"
+        resuming_switch = False
         long_close_due = False
         switch_ready = False
 
@@ -2777,6 +2883,7 @@ async def run_once(
             elif schedule.closure_duration > LONG_CLOSURE_THRESHOLD:
                 if not schedule.is_tradable:
                     reason = "XAUS 已进入长休市且仍有持仓"
+                    close_source = "scheduled"
                 elif schedule.time_until_close is None:
                     reason = "XAUS 长休市前缺少剩余时间"
                 elif schedule.time_until_close <= timedelta(
@@ -2784,6 +2891,7 @@ async def run_once(
                 ):
                     long_close_due = True
                     if not (auto_switch and auto_open):
+                        close_source = "scheduled"
                         reason = (
                             f"XAUS 长休市 {schedule.closure_duration} 将在 "
                             f"{schedule.time_until_close} 后开始"
@@ -2831,6 +2939,20 @@ async def run_once(
                 },
             )
 
+        if (reason is None and pending_switch and current_structure is not None
+                and current_structure.name == pending_switch["to"]):
+            # 成交后落盘前重启：以真实仓位自检收敛未完成意图，避免重复开仓。
+            recovered_check = _switch_self_check(
+                current_structure, account_positions_payload=account_positions_payload,
+                old_structure_was_flat=True,
+            )
+            if recovered_check["passed"] is True:
+                _append_audit(audit_path, {"timestamp": observed_at,
+                    "event": "auto_switch_recovered", "direction": pending_switch,
+                    "self_check": recovered_check})
+                pending_switch = None
+                last_switch_at = observed_at
+
         # 收益优化必须排在所有平仓风控之后，不能延误 kill switch 或缺腿退出。
         if reason is not None:
             selection_decision["reason"] = f"优先平仓，跳过结构选择：{reason}"
@@ -2842,8 +2964,8 @@ async def run_once(
         if reason is None and auto_switch and not selection_metadata_safe:
             auto_switch_conclusion = f"XAUS 时段元数据不安全，暂不选择结构：{schedule_error or (schedule.reason if schedule else '无解析结果')}"
             selection_decision["reason"] = auto_switch_conclusion
-        if reason is None and auto_switch and selection_metadata_safe:
-            candidate_structures, best_structure = await _evaluate_carry_candidates(var, schedule, market_status)
+        if reason is None and auto_switch and selection_metadata_safe and not (pending_switch and all_flat):
+            candidate_structures, best_structure = await _evaluate_carry_candidates(var, schedule, market_status, notional=auto_open_notional)
             forced = bool(current_structure and current_structure.has_xaus and schedule
                           and schedule.metadata_is_fresh and schedule.is_tradable
                           and schedule.closure_duration is not None
@@ -2857,8 +2979,8 @@ async def run_once(
             )
             if forced:
                 long_close_due = True
-                # 无法建立安全结构时仍须在 lead time 内平掉 XAUS。
-                selection_decision["allowed"] = candidate_structures["XAU_XAUT"]["available"]
+                # 跳过择优过滤；执行准备失败时仍须在 lead time 内平掉 XAUS。
+                selection_decision["allowed"] = True
             target_structure_reason = selection_decision["reason"]
             auto_switch_conclusion = target_structure_reason
             if target_structure is not None:
@@ -2883,7 +3005,7 @@ async def run_once(
                                       "selection_decision": selection_decision})
 
         # 所有持仓风控检查之后才预演；blocked 不得写入平仓 reason。
-        if reason is None and auto_switch and not dry_run:
+        if reason is None and auto_switch and not dry_run and not (pending_switch and all_flat):
             window = None
             try:
                 rehearsal_source = current_structure
@@ -3017,6 +3139,7 @@ async def run_once(
             )
 
         if reason is None and long_close_due and not switch_ready:
+            close_source = "scheduled"
             reason = (
                 f"XAUS 长休市 {schedule.closure_duration} 将在 "
                 f"{schedule.time_until_close} 后开始，目标结构暂不可开"
@@ -3046,6 +3169,17 @@ async def run_once(
                         mode=mode, status=str(allocation.get("message")),
                         distance=allocation["distance"],
                     )
+
+        if (reason is None and all_flat and auto_switch and pending_switch
+                and not auto_open_incident and not switch_incident):
+            current_structure = execution.resolve_structure(pending_switch["from"])
+            target_structure = execution.resolve_structure(pending_switch["to"])
+            target_structure_reason = "继续已发起切换的开仓阶段"
+            target_funding_availability, target_funding_overrides = _target_funding_context(
+                target_structure, target_reason=target_structure_reason,
+            )
+            switch_ready = True
+            resuming_switch = True
 
         if reason is None and switch_ready:
             assert current_structure is not None
@@ -3097,11 +3231,21 @@ async def run_once(
                 },
                 "failure": None,
             }
+            if not dry_run:
+                if not resuming_switch:
+                    pending_switch = {
+                        "from": current_structure.name, "to": target_structure.name,
+                        "started_at": observed_at.isoformat(),
+                    }
+                # 平仓前落盘切换意图，进程重启后也能继续开仓。
+                persist_state("switch_in_progress", "切换意图已保存", consecutive_failures)
+            switch_record["resumed"] = resuming_switch
             _append_audit(
                 audit_path,
                 {
                     "timestamp": observed_at,
                     "event": "auto_switch_started",
+                    "close_source": "switch",
                     "current_structure": current_structure.name,
                     "target_structure": target_structure.name,
                     "dry_run": dry_run,
@@ -3121,16 +3265,19 @@ async def run_once(
             switch_recorder.cost_parent_id = "switch:" + str(switch_record["started_at"])
             switch_stage = "close"
             switch_phase_started = time.perf_counter()
-            close_attempted = True
-            flatten_result = await _flatten(
-                switch_recorder,
-                structure=current_structure,
-                positions=positions,
-                xaus_known_closed=False,
-                dry_run=dry_run,
-                audit_path=audit_path,
-                observed_at=observed_at,
-            )
+            if resuming_switch:
+                flatten_result = FlattenResult(True, False, "旧结构已全平，继续目标开仓")
+            else:
+                close_attempted = True
+                flatten_result = await _flatten(
+                    switch_recorder,
+                    structure=current_structure,
+                    positions=positions,
+                    xaus_known_closed=False,
+                    dry_run=dry_run,
+                    audit_path=audit_path,
+                    observed_at=observed_at,
+                )
             switch_record["close_phase"] = _phase_payload(
                 switch_recorder,
                 "close",
@@ -3173,8 +3320,7 @@ async def run_once(
                         "切换平仓 accept 已返回，但旧结构仍未归零："
                         f"{detail} 净 delta={old_net_delta}"
                     )
-                # 旧结构确实从有仓变为空仓；强制切换仍在本分支直接开目标结构。
-                last_closed_at = observed_at
+                # 切换平仓不是风控退出，不得启动或延长重开冷却。
                 switch_record["flat_confirmation"] = {
                     "all_flat": True,
                     "confirmed_at": datetime.now(timezone.utc).isoformat(),
@@ -3222,19 +3368,20 @@ async def run_once(
                     audit_path=audit_path,
                     observed_at=observed_at,
                     funding_rate_overrides=target_funding_overrides,
-                    enforce_min_carry=not selection_decision.get("forced_long_closure", False),
+                    enforce_min_carry=False,
+                    completing_switch=True,
                 )
                 switch_record["open_phase"] = _phase_payload(
                     switch_recorder,
                     "open",
                     started=switch_phase_started,
-                    status="completed" if open_result.result_code == 0 else "failed",
+                    status="completed" if open_result.opened else "failed",
                 )
                 auto_open_attempted = open_result.attempted
                 auto_open_conclusion = open_result.conclusion
                 daily_open_attempts = open_result.daily_attempts
                 auto_open_incident = open_result.incident
-                result_code = open_result.result_code
+                result_code = 0 if open_result.opened else 1
                 consecutive_failures = (
                     previous_failures + 1 if result_code != 0 else 0
                 )
@@ -3275,6 +3422,7 @@ async def run_once(
                     switch_record["self_check"] = self_check
                     if self_check["passed"] is True:
                         last_switch_at = observed_at
+                        pending_switch = None
                         auto_switch_conclusion = (
                             f"已从 {current_structure.name} 切换为 "
                             f"{target_structure.name}，切换后自检通过"
@@ -3361,11 +3509,12 @@ async def run_once(
                     _append_audit(switch_history_path, switch_record)
                     switch_record_written = True
                 persist_state(
-                    "incident" if switch_incident else open_result.status,
+                    "incident" if switch_incident else (open_result.status if result_code == 0 else "switch_open_failed"),
                     conclusion,
                     consecutive_failures,
                 )
         elif reason is None and all_flat:
+            refresh_cooldown_reset()
             exit_carry_since = None
             if rehearsal_blocked:
                 open_result = AutoOpenResult(
@@ -3414,6 +3563,7 @@ async def run_once(
                     funding_rate_overrides=target_funding_overrides,
                 )
             if open_result.did_close_this_round:
+                risk_closed_this_round = True
                 last_closed_at = observed_at
             auto_open_attempted = open_result.attempted
             auto_open_conclusion = open_result.conclusion
@@ -3442,7 +3592,10 @@ async def run_once(
             persist_state("healthy", conclusion, 0)
             result_code = 0
         else:
+            pending_switch = None
             auto_open_conclusion = f"平仓/风控检查优先命中：{reason}"
+            _append_audit(audit_path, {"timestamp": observed_at, "event": "close_triggered",
+                                       "close_source": close_source, "reason": reason})
             print(f"守护进程命中风控：{reason}")
             close_attempted = True
             flatten_result = await _flatten(
@@ -3498,7 +3651,8 @@ async def run_once(
                     )
                     exit_carry_since = None
                     # 仅真实持仓平仓确认后开始冷却，空仓风控轮次不延长。
-                    if not all_flat:
+                    if not all_flat and close_source == "risk":
+                        risk_closed_this_round = True
                         last_closed_at = observed_at
                 consecutive_failures = 0
                 completed_status = (
@@ -3687,6 +3841,7 @@ async def run_once(
             "auto_switch": auto_switch,
             "auto_switch_attempted": auto_switch_attempted,
             "auto_switch_conclusion": auto_switch_conclusion,
+            "current_points_oi": str(sum((value * Decimal(str(POINTS_WEIGHTS[name])) for name, value in notionals.items() if value is not None), Decimal("0"))) if all(value is not None for value in notionals.values()) else None,
             "candidate_structures": candidate_structures,
             "best_structure": best_structure.name if best_structure else None,
             "selection_decision": selection_decision,
@@ -3755,6 +3910,14 @@ async def _main(args: argparse.Namespace) -> int:
         switch_lead_time=timedelta(minutes=float(args.switch_lead_minutes)),
         critical_reasons=critical_reasons,
     )
+    # 心跳只用于调度；状态文件中的重置或未完成切换要求立即完整判定。
+    state = execution._read_guard_json(args.state) or {}
+    reset = state.get("reopen_cooldown_reset") or {}
+    reset_at = execution._guard_timestamp(reset.get("timestamp"))
+    last_full = execution._guard_timestamp((heartbeat or {}).get("last_full_round_at"))
+    if state.get("pending_switch") or (reset_at and (last_full is None or reset_at >= last_full)):
+        mode, next_full = "critical", now
+        critical_reasons.append("state_requires_full_round")
     if mode == "normal" and now < next_full:
         # 保留上轮风险快照与完整轮次时间，旧面板继续用 timestamp 判断存活。
         _write_json(args.heartbeat, {
@@ -3852,7 +4015,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--funding-deviation-threshold", type=Decimal, default=Decimal(".20"),
                         help="偏差比例告警阈值，默认 0.20；周五/周一三日模式按三倍预测校验")
     parser.add_argument("--reset-reopen-cooldown", action="store_true",
-                        help="暂停守护进程后使用：仅本地清空 last_closed_at 并退出，保留其它状态和重置记录")
+                        help="仅本地清空 last_closed_at 并退出；下一轮立即重新判定，保留其它状态和重置记录")
     parser.add_argument("--reset-allocation-counters", action="store_true",
                         help="仅本地重置异常补仓计数并退出，保留常规用量和重置记录")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)

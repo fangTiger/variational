@@ -203,9 +203,10 @@ XAUT_DOUBLE_LEG = CarryLeg(
 
 XAUS_XAU = CarryStructure("XAUS_XAU", (XAUS_LEG, XAU_LEG))
 XAU_XAUT = CarryStructure("XAU_XAUT", (XAU_LONG_LEG, XAUT_LEG))
+XAUS_XAUT = CarryStructure("XAUS_XAUT", (XAUS_LEG, XAUT_LEG))
 TRIPLE = CarryStructure("TRIPLE", (XAUS_LEG, XAU_LONG_LEG, XAUT_DOUBLE_LEG))
 STRUCTURES = {
-    structure.name: structure for structure in (XAUS_XAU, XAU_XAUT, TRIPLE)
+    structure.name: structure for structure in (XAUS_XAU, XAU_XAUT, XAUS_XAUT, TRIPLE)
 }
 DEFAULT_STRUCTURE = XAU_XAUT
 
